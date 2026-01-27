@@ -1,0 +1,8 @@
+{
+  "enabledPlugins": {
+    "csharp-lsp@claude-plugins-official": true,
+    "superpowers@superpowers-marketplace": true,
+    "rust-analyzer-lsp@claude-plugins-official": true
+  },
+  "model": "opus"
+}
