@@ -15,3 +15,9 @@ todos/
 .credentials.json
 history.jsonl
 stats-cache.json
+backups/
+security/
+security_warnings*
+.last-cleanup
+.last-update-result.json
+mcp-needs-auth-cache.json

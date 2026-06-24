@@ -1,8 +1,143 @@
 {
+  "editorMode": "vim",
   "enabledPlugins": {
+    "claude-hud@claude-hud": true,
+    "code-simplifier@claude-plugins-official": true,
+    "context7@claude-plugins-official": true,
     "csharp-lsp@claude-plugins-official": true,
-    "superpowers@superpowers-marketplace": true,
-    "rust-analyzer-lsp@claude-plugins-official": true
+    "frontend-design@claude-plugins-official": true,
+    "gopls-lsp@claude-plugins-official": true,
+    "playwright@claude-plugins-official": true,
+    "product-management@knowledge-work-plugins": true,
+    "rust-analyzer-lsp@claude-plugins-official": true,
+    "security-guidance@claude-plugins-official": true,
+    "serena@claude-plugins-official": true,
+    "superpowers@claude-plugins-official": true
   },
-  "model": "opus"
+  "extraKnownMarketplaces": {
+    "claude-hud": {
+      "source": {
+        "repo": "jarrodwatts/claude-hud",
+        "source": "github"
+      }
+    },
+    "knowledge-work-plugins": {
+      "source": {
+        "repo": "anthropics/knowledge-work-plugins",
+        "source": "github"
+      }
+    }
+  },
+  "hooks": {
+    "Notification": [
+      {
+        "hooks": [
+          {
+            "async": true,
+            "command": "python3 /home/emily/Development/ai/claude-voice/claude_voice.py",
+            "timeout": 60,
+            "type": "command"
+          }
+        ],
+        "matcher": ""
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "command": "bd prime",
+            "type": "command"
+          }
+        ],
+        "matcher": ""
+      }
+    ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "async": true,
+            "command": "python3 /home/emily/Development/ai/claude-voice/claude_voice.py",
+            "timeout": 60,
+            "type": "command"
+          }
+        ],
+        "matcher": "AskUserQuestion|ExitPlanMode"
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "command": "bd prime",
+            "type": "command"
+          }
+        ],
+        "matcher": ""
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "async": true,
+            "command": "python3 /home/emily/Development/ai/claude-voice/speak.py",
+            "timeout": 60,
+            "type": "command"
+          }
+        ],
+        "matcher": ""
+      }
+    ]
+  },
+  "model": "opus[1m]",
+  "permissions": {
+    "allow": [
+      "Bash(.specify/scripts/bash/setup-plan.sh:*)",
+      "Bash(git checkout:*)",
+      "Bash(.specify/scripts/bash/update-agent-context.sh:*)",
+      "Bash(.specify/scripts/bash/check-prerequisites.sh:*)",
+      "Bash(test:*)",
+      "Bash(git rev-parse:*)",
+      "Bash(dotnet new:*)",
+      "Bash(dotnet sln:*)",
+      "Bash(ls:*)",
+      "Bash(dotnet restore:*)",
+      "Bash(dotnet build:*)",
+      "Bash(dotnet test:*)",
+      "Bash(do test:*)",
+      "Bash(echo:*)",
+      "Bash(done)",
+      "Bash(dotnet list:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git fetch:*)",
+      "Bash(.specify/scripts/bash/create-new-feature.sh:*)",
+      "WebSearch",
+      "Bash(bash:*)",
+      "Bash(fi)",
+      "Bash(dotnet tool install:*)",
+      "Bash(dotnet tool restore:*)",
+      "Bash(dotnet fantomas:*)",
+      "Bash(dotnet fsharplint:*)",
+      "Bash(chmod:*)",
+      "Bash(git config:*)",
+      "mcp__serena__initial_instructions",
+      "mcp__serena__get_symbols_overview"
+    ],
+    "defaultMode": "acceptEdits"
+  },
+  "skipAutoPermissionPrompt": true,
+  "skipDangerousModePermissionPrompt": true,
+  "statusLine": {
+    "command": "bash /home/emily/.claude/statusline-command.sh",
+    "type": "command"
+  },
+  "theme": "dark",
+  "voice": {
+    "enabled": true,
+    "mode": "hold"
+  },
+  "voiceEnabled": true
 }
