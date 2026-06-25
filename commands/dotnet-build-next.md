@@ -8,9 +8,9 @@ allowed-tools: Read, Grep, Glob, Bash(git diff:*), Bash(git status:*), Bash(git 
 ---
 
 You are the orchestrator for building one backlog task. Coordinate the
-`csharp-developer` and the specialist reviewers (`security-reviewer`,
-`quality-reviewer`, `performance-reviewer`); **do not write or review code
-yourself.** Drive the whole flow from this (main) session — the loop count and
+language-specialist developers (`csharp-developer`, `rust-developer`, …) and the
+specialist reviewers (`security-reviewer`, `quality-reviewer`,
+`performance-reviewer`); **do not write or review code yourself.** Drive the whole flow from this (main) session — the loop count and
 any user questions live here, not inside a subagent. The only channel into a
 subagent is its prompt, so pass the task id, changed files, and any findings
 explicitly each time.
@@ -36,14 +36,25 @@ each question give context and a recommendation, recommended option first,
 labelled "(Recommended)". Resolving ambiguity here is far cheaper than having the
 developer stop and restart mid-implementation.
 
-## Step 2 — Implement
+## Step 2 — Route and implement
 
-Invoke the `csharp-developer` subagent with: the bead id, the `bd show` details
-plus any clarified requirements, and an instruction to **complete only this one
-task and stop**. Tell it to use its skills and Serena tools as needed. As a fallback only, if it still
-hits a blocking unknown, it should stop and return a `NEEDS-INPUT` block (question
-+ context + recommendation) rather than guess — you answer via AskUserQuestion and
-re-invoke. Capture from its final message: **task id, change summary, files touched.**
+Pick the developer for this bead's language. The code isn't written yet, so infer
+the language from the **bead itself** — its target component/area, or a language
+label if your beads workflow tags one — not from file extensions:
+
+  - C# / .NET   → `csharp-developer`
+  - Rust        → `rust-developer`
+
+If a bead spans languages, take the dominant one and file the rest as follow-up
+beads in Step 4. If you genuinely can't tell, ask via `AskUserQuestion`.
+
+Invoke the chosen developer with: the bead id, the `bd show` details plus any
+clarified requirements, and an instruction to **complete only this one task and
+stop**. Tell it to use its skills and Serena tools as needed. As a fallback only,
+if it hits a blocking unknown, it should stop and return a `NEEDS-INPUT` block
+(question + context + recommendation) rather than guess — you answer via
+AskUserQuestion and re-invoke. Capture from its final message: **bead id, change
+summary, files touched** (and which developer handled it, for the react steps).
 
 ## Step 3 — Review cycles (at most two; the second is conditional)
 
@@ -61,16 +72,17 @@ working-tree changes. Scope it to this task's changes.
    overlap keep the higher severity and the clearer fix.
 3. **If there are no blocking findings → go to Step 4.** The change is clean; do
    not spend a second cycle.
-4. Otherwise invoke `csharp-developer` with the task id, the changed files, and
-   the blocking findings verbatim. Tell it to address **those findings and only
-   those**, then report what changed. (Same NEEDS-INPUT escalation applies.)
+4. Otherwise invoke **the same developer that implemented the bead** with the
+   bead id, the changed files, and the blocking findings verbatim. Tell it to
+   address **those findings and only those**, then report what changed. (Same
+   NEEDS-INPUT escalation applies.)
 
 **Round 2** (only reached if Round 1 had blocking findings)
 1. Re-resolve the diff and dispatch the same three reviewers in parallel on the
    updated changes.
 2. Merge and filter to blocking findings as before.
-3. If blocking findings remain, invoke `csharp-developer` once more to address
-   them. Then **stop — do not run a third review.**
+3. If blocking findings remain, invoke **the same developer** once more to
+   address them. Then **stop — do not run a third review.**
 
 ## Step 4 — Close out and report
 
