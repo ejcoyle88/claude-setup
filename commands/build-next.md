@@ -44,6 +44,7 @@ label if your beads workflow tags one — not from file extensions:
 
   - C# / .NET   → `csharp-developer`
   - Rust        → `rust-developer`
+  - Angular     → `angular-developer`
 
 If a bead spans languages, take the dominant one and file the rest as follow-up
 beads in Step 4. If you genuinely can't tell, ask via `AskUserQuestion`.

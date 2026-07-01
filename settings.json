@@ -1,97 +1,4 @@
 {
-  "editorMode": "vim",
-  "enabledPlugins": {
-    "claude-hud@claude-hud": true,
-    "code-simplifier@claude-plugins-official": true,
-    "context7@claude-plugins-official": true,
-    "csharp-lsp@claude-plugins-official": true,
-    "frontend-design@claude-plugins-official": true,
-    "gopls-lsp@claude-plugins-official": true,
-    "playwright@claude-plugins-official": true,
-    "product-management@knowledge-work-plugins": true,
-    "rust-analyzer-lsp@claude-plugins-official": true,
-    "security-guidance@claude-plugins-official": true,
-    "serena@claude-plugins-official": true,
-    "superpowers@claude-plugins-official": true
-  },
-  "extraKnownMarketplaces": {
-    "claude-hud": {
-      "source": {
-        "repo": "jarrodwatts/claude-hud",
-        "source": "github"
-      }
-    },
-    "knowledge-work-plugins": {
-      "source": {
-        "repo": "anthropics/knowledge-work-plugins",
-        "source": "github"
-      }
-    }
-  },
-  "hooks": {
-    "Notification": [
-      {
-        "hooks": [
-          {
-            "async": true,
-            "command": "python3 /home/emily/Development/ai/claude-voice/claude_voice.py",
-            "timeout": 60,
-            "type": "command"
-          }
-        ],
-        "matcher": ""
-      }
-    ],
-    "PreCompact": [
-      {
-        "hooks": [
-          {
-            "command": "bd prime",
-            "type": "command"
-          }
-        ],
-        "matcher": ""
-      }
-    ],
-    "PreToolUse": [
-      {
-        "hooks": [
-          {
-            "async": true,
-            "command": "python3 /home/emily/Development/ai/claude-voice/claude_voice.py",
-            "timeout": 60,
-            "type": "command"
-          }
-        ],
-        "matcher": "AskUserQuestion|ExitPlanMode"
-      }
-    ],
-    "SessionStart": [
-      {
-        "hooks": [
-          {
-            "command": "bd prime",
-            "type": "command"
-          }
-        ],
-        "matcher": ""
-      }
-    ],
-    "Stop": [
-      {
-        "hooks": [
-          {
-            "async": true,
-            "command": "python3 /home/emily/Development/ai/claude-voice/speak.py",
-            "timeout": 60,
-            "type": "command"
-          }
-        ],
-        "matcher": ""
-      }
-    ]
-  },
-  "model": "opus[1m]",
   "permissions": {
     "allow": [
       "Bash(.specify/scripts/bash/setup-plan.sh:*)",
@@ -128,16 +35,130 @@
     ],
     "defaultMode": "acceptEdits"
   },
-  "skipAutoPermissionPrompt": true,
-  "skipDangerousModePermissionPrompt": true,
-  "statusLine": {
-    "command": "bash /home/emily/.claude/statusline-command.sh",
-    "type": "command"
+  "model": "opus[1m]",
+  "hooks": {
+    "Notification": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 /home/emily/Development/ai/claude-voice/claude_voice.py",
+            "timeout": 60,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bd prime"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "AskUserQuestion|ExitPlanMode",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 /home/emily/Development/ai/claude-voice/claude_voice.py",
+            "timeout": 60,
+            "async": true
+          }
+        ]
+      },
+      {
+        "matcher": "Grep",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$HOME/.claude/hooks/lsp-first-guard.py\""
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bd prime"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$HOME/.claude/hooks/lsp-first-guard.py\""
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 /home/emily/Development/ai/claude-voice/speak.py",
+            "timeout": 60,
+            "async": true
+          }
+        ]
+      }
+    ]
   },
-  "theme": "dark",
+  "statusLine": {
+    "type": "command",
+    "command": "bash /home/emily/.claude/statusline-command.sh"
+  },
+  "enabledPlugins": {
+    "claude-hud@claude-hud": true,
+    "code-simplifier@claude-plugins-official": true,
+    "context7@claude-plugins-official": true,
+    "csharp-lsp@claude-plugins-official": true,
+    "frontend-design@claude-plugins-official": true,
+    "gopls-lsp@claude-plugins-official": true,
+    "playwright@claude-plugins-official": true,
+    "product-management@knowledge-work-plugins": true,
+    "rust-analyzer-lsp@claude-plugins-official": true,
+    "security-guidance@claude-plugins-official": true,
+    "serena@claude-plugins-official": true,
+    "superpowers@claude-plugins-official": true
+  },
+  "extraKnownMarketplaces": {
+    "claude-hud": {
+      "source": {
+        "source": "github",
+        "repo": "jarrodwatts/claude-hud"
+      }
+    },
+    "knowledge-work-plugins": {
+      "source": {
+        "source": "github",
+        "repo": "anthropics/knowledge-work-plugins"
+      }
+    }
+  },
   "voice": {
     "enabled": true,
     "mode": "hold"
   },
-  "voiceEnabled": true
+  "skipDangerousModePermissionPrompt": true,
+  "theme": "dark",
+  "editorMode": "vim",
+  "skipAutoPermissionPrompt": true,
+  "voiceEnabled": true,
+  "tui": "fullscreen",
+  "env": {
+    "ENABLE_LSP_TOOL": "1"
+  }
 }
