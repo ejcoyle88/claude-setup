@@ -43,12 +43,12 @@ LANGUAGES = {
         "tools": "csharp-lsp / Serena symbol tools "
                  "(find_symbol, find_referencing_symbols, get_symbols_overview)",
     },
+    "TypeScript": {
+        "types": {"ts", "typescript", "tsx"},
+        "exts": {".ts", ".tsx"},
+        "tools": "typescript-language-server / Serena symbol tools",
+    },
     # Add more as you add language specialists, e.g.:
-    # "TypeScript": {
-    #     "types": {"ts", "typescript", "tsx"},
-    #     "exts": {".ts", ".tsx"},
-    #     "tools": "typescript-language-server / Serena symbol tools",
-    # },
 }
 
 POLICY = (
