@@ -95,6 +95,7 @@ test_correct_existing_symlink_is_left_alone() {
   bash "$INSTALL" >/dev/null
   local after
   after="$(stat_inode_mtime "$CLAUDE_DIR/skills/angular-a11y.md")"
+  assert "stat probe returned a value" "[ -n '$before' ] && [ -n '$after' ]"
   assert "symlink unchanged on second install" "[ '$before' = '$after' ]"
 }
 
@@ -150,6 +151,7 @@ EOF
   bash "$INSTALL" >/dev/null
   local second_mtime
   second_mtime="$(stat_mtime "$CLAUDE_DIR/settings.json")"
+  assert "stat probe returned a value" "[ -n '$first_mtime' ] && [ -n '$second_mtime' ]"
   assert "settings.json mtime unchanged on second install" "[ '$first_mtime' = '$second_mtime' ]"
 }
 
