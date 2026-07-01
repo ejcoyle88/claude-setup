@@ -21,6 +21,15 @@ assert() {
   fi
 }
 
+# Portable stat helpers: GNU coreutils (Linux, Git Bash on Windows) first,
+# then BSD stat (macOS) as a fallback.
+stat_inode_mtime() {
+  stat -c '%i %Y' "$1" 2>/dev/null || stat -f '%i %m' "$1"
+}
+stat_mtime() {
+  stat -c '%Y' "$1" 2>/dev/null || stat -f '%m' "$1"
+}
+
 setup() {
   TMPDIR_TEST="$(mktemp -d)"
   export CLAUDE_DIR="$TMPDIR_TEST/.claude"
@@ -81,11 +90,12 @@ test_correct_existing_symlink_is_left_alone() {
   bash "$INSTALL" >/dev/null
   # Capture the symlink's inode and mtime, then run again and check unchanged
   local before
-  before="$(stat -f '%i %m' "$CLAUDE_DIR/skills/angular-a11y.md")"
+  before="$(stat_inode_mtime "$CLAUDE_DIR/skills/angular-a11y.md")"
   sleep 1
   bash "$INSTALL" >/dev/null
   local after
-  after="$(stat -f '%i %m' "$CLAUDE_DIR/skills/angular-a11y.md")"
+  after="$(stat_inode_mtime "$CLAUDE_DIR/skills/angular-a11y.md")"
+  assert "stat probe returned a value" "[ -n '$before' ] && [ -n '$after' ]"
   assert "symlink unchanged on second install" "[ '$before' = '$after' ]"
 }
 
@@ -136,11 +146,12 @@ test_settings_merge_is_idempotent() {
 EOF
   bash "$INSTALL" >/dev/null
   local first_mtime
-  first_mtime="$(stat -f '%m' "$CLAUDE_DIR/settings.json")"
+  first_mtime="$(stat_mtime "$CLAUDE_DIR/settings.json")"
   sleep 1
   bash "$INSTALL" >/dev/null
   local second_mtime
-  second_mtime="$(stat -f '%m' "$CLAUDE_DIR/settings.json")"
+  second_mtime="$(stat_mtime "$CLAUDE_DIR/settings.json")"
+  assert "stat probe returned a value" "[ -n '$first_mtime' ] && [ -n '$second_mtime' ]"
   assert "settings.json mtime unchanged on second install" "[ '$first_mtime' = '$second_mtime' ]"
 }
 
