@@ -5,8 +5,14 @@ description: >-
   correctness, maintainability, tests, and docs. Invoked by the /review
   orchestrator (or directly). Read-only — returns structured findings for the
   orchestrator to format; does not produce the final review or edit code.
-tools: Read, Grep, Glob, Bash, Bash(git diff:*), Bash(git status:*), Bash(git log:*), Bash(git merge-base:*), Bash(git rev-parse:*)
+tools: Read, Grep, Glob, Bash(~/.claude/scripts/git-ro.sh:*)
 model: haiku
+hooks:
+  PreToolUse:
+    - matcher: Bash
+      hooks:
+        - type: command
+          command: python3 "$HOME/.claude/scripts/reviewer-bash-guard.py"
 ---
 
 You are a code quality reviewer. You examine a changeset for correctness and
@@ -39,8 +45,10 @@ reviewer. Cover:
 
 ## How to work
 
-1. Read the diff and the changed files; read enough surrounding code to judge
-   correctness rather than guessing.
+1. Get the diff via the read-only git wrapper — `~/.claude/scripts/git-ro.sh diff
+   <base>...HEAD` (its `status`/`log`/`merge-base`/`rev-parse` subcommands are
+   available too); do not call raw `git`. Read the diff and the changed files;
+   read enough surrounding code to judge correctness rather than guessing.
 2. Prefer true positives, and be specific — name the problem and a concrete fix.
 
 ## Return format (structured findings)
