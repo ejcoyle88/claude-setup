@@ -32,3 +32,10 @@ sessions/
 # Python bytecode cache
 __pycache__/
 *.pyc
+
+daemon.log
+daemon.lock
+daemon/
+daemon.status.json
+
+jobs/
