@@ -1,0 +1,27 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  install-tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      # Make Git Bash's `ln -s` create real Windows symlinks (fail if it can't),
+      # matching the symlinking behaviour the installer relies on. GitHub's
+      # Windows runners are elevated, so native symlinks are permitted.
+      MSYS: winsymlinks:nativestrict
+    steps:
+      - uses: actions/checkout@v4
+
+      # jq is preinstalled on all three GitHub-hosted runner images; the
+      # installer exits early with a clear message if it is ever missing.
+      - name: Run installer tests
+        shell: bash
+        run: bash tests/test_install.sh
