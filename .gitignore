@@ -22,3 +22,4 @@ security_warnings*
 .last-update-result.json
 mcp-needs-auth-cache.json
 .serena/
+sessions/
