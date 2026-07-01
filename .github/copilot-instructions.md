@@ -33,7 +33,7 @@ invalid, and do **not** suggest "correcting" them to older names (e.g. `claude-3
 
 ## File formats you'll see (and must not "correct")
 
-### Agents (`agents/*.md`), skills (`skills/**/SKILL.md`), commands (`commands/*.md`)
+### Agents (`agents/*.md`), skills (`skills/*.md` and `skills/**/SKILL.md`), commands (`commands/*.md`)
 
 Each begins with a **YAML frontmatter block** delimited by `---`. Valid, expected fields:
 
