@@ -58,8 +58,8 @@ unavailable. Feature → minimum C# version (some also need the matching runtime
 - **C# 12** (net8): primary constructors (classes/structs), collection expressions
   `[...]` + spreads, default lambda parameters, `using` alias for any type,
   inline arrays (runtime: net8+).
-- **C# 13** (net9): `params` collections, `System.Threading.Lock` (runtime type is
-  net9+), partial properties/indexers, `ref`/`unsafe` in iterators & async,
+- **C# 13** (net9): `params` collections, partial properties/indexers, `ref`/`unsafe` in iterators & async,
+  implicit index (`^`) in initializers, overload-resolution priority. (Runtime: net9+ adds `System.Threading.Lock`.)
   implicit index (`^`) in initializers, overload-resolution priority.
 - **C# 14** (net10): the `field` keyword, extension members (`extension` blocks),
   null-conditional assignment (`obj?.Prop = …`), partial constructors & events,
