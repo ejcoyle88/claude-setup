@@ -23,3 +23,12 @@ security_warnings*
 mcp-needs-auth-cache.json
 .serena/
 sessions/
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
+
+# Python bytecode cache
+__pycache__/
+*.pyc
