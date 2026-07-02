@@ -44,7 +44,10 @@ label if your beads workflow tags one — not from file extensions:
 
   - C# / .NET   → `csharp-developer`
   - Rust        → `rust-developer`
-  - Angular     → `angular-developer`
+  - Angular / front-end (TypeScript) → `angular-developer`
+  - Claude Code setup / config (a bead about the `.claude/` suite itself —
+    agents, skills, commands, hooks, settings, CLAUDE.md) → `agent-improvement-developer`
+  - (add a row as you add each language specialist)
 
 If a bead spans languages, take the dominant one and file the rest as follow-up
 beads in Step 4. If you genuinely can't tell, ask via `AskUserQuestion`.
@@ -63,6 +66,13 @@ Resolve the review diff yourself with Bash — prefer the branch diff
 `git diff <base>...HEAD` (resolve `<base>` as `git merge-base HEAD` against
 `origin/main`, then `main`, then `origin/master`); fall back to staged, then
 working-tree changes. Scope it to this task's changes.
+
+**Config beads** (`agent-improvement-developer`) change files under `~/.claude/`,
+outside the working repo. If `~/.claude` is itself a git repo (or symlinked from
+a dotfiles repo), resolve the diff there (`git -C ~/.claude diff`). If it isn't
+version-controlled, hand the reviewers the touched-file list and their full
+contents instead of a diff — and file a follow-up bead suggesting `~/.claude` be
+put under git, since diff-based review and rollback both depend on it.
 
 **Round 1**
 1. In a **single message**, dispatch all three reviewers **in parallel** via Task,
