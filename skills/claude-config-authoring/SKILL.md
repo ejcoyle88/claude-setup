@@ -57,7 +57,11 @@ delegation trigger.
 - Read the event JSON from stdin; dispatch on `hook_event_name`. `PreToolUse`
   responds with `hookSpecificOutput.permissionDecision` (`deny`/`ask`/`allow`)
   plus a reason; `SessionStart` stdout is injected as context.
-- Exit 0 on any parse error — a hook must never break the session.
+- Exit 0 on any parse error — an *observational* hook must never break the
+  session. **Exception: security-boundary hooks fail closed** — a guard whose job
+  is to block unsafe calls (e.g. `reviewer-bash-guard.py`) must treat an
+  unparseable payload as a denial (exit 2), never let it through. Pick the
+  failure mode from the hook's purpose, and say which in a comment.
 - Keep triggers minimal (`matcher` scoped to the specific tool) and denials
   conservative: under-block, and always name the alternative in the reason.
 - Ship smoke tests: representative payloads piped on stdin with expected output,

@@ -122,6 +122,7 @@ link_kind skills
 link_kind agents
 link_kind commands
 link_kind hooks
+link_kind scripts
 link_file statusline-command.sh
 merge_settings
 

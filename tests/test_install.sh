@@ -60,6 +60,10 @@ test_fresh_install_creates_symlinks() {
     "[ \"\$(readlink '$CLAUDE_DIR/skills/angular-a11y.md')\" = '$REPO_ROOT/skills/angular-a11y.md' ]"
   assert "agents/csharp-developer.md is a symlink" \
     "[ -L '$CLAUDE_DIR/agents/csharp-developer.md' ]"
+  assert "scripts/git-ro.sh is a symlink" \
+    "[ -L '$CLAUDE_DIR/scripts/git-ro.sh' ]"
+  assert "scripts symlink points into the repo" \
+    "[ \"\$(readlink '$CLAUDE_DIR/scripts/git-ro.sh')\" = '$REPO_ROOT/scripts/git-ro.sh' ]"
   assert ".gitkeep is NOT linked" \
     "[ ! -e '$CLAUDE_DIR/skills/.gitkeep' ]"
 }
