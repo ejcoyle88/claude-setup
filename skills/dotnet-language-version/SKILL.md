@@ -55,7 +55,7 @@ unavailable. Feature → minimum C# version (some also need the matching runtime
   extended property patterns.
 - **C# 11** (net7): raw string literals, list patterns, `required` members, UTF-8
   string literals, static abstract interface members / generic math (runtime: net7+).
-- **C# 12** (net8): primary constructors (all types), collection expressions
+- **C# 12** (net8): primary constructors (classes/structs), collection expressions
   `[...]` + spreads, default lambda parameters, `using` alias for any type,
   inline arrays (runtime: net8+).
 - **C# 13** (net9): `params` collections, `System.Threading.Lock` (runtime type is
