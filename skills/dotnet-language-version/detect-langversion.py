@@ -107,10 +107,12 @@ CSHARP_LABEL = {14.0: "C# 14", 13.0: "C# 13", 12.0: "C# 12", 11.0: "C# 11",
 def main():
     root = sys.argv[1] if len(sys.argv) > 1 else "."
     csprojs, props_index = [], {}
-    for dirpath, _dirs, files in os.walk(root):
-        if any(seg in dirpath for seg in (os.sep + "bin", os.sep + "obj",
-                                          os.sep + "node_modules", os.sep + ".git")):
-            continue
+    skip_dirs = {"bin", "obj", "node_modules", ".git"}
+    for dirpath, dirs, files in os.walk(root):
+        # Prune by exact directory name so we don't traverse build output — and
+        # don't accidentally skip dirs that merely contain "bin"/"obj" as a
+        # substring (e.g. "bindings", "objstore").
+        dirs[:] = [d for d in dirs if d not in skip_dirs]
         for f in files:
             full = os.path.join(dirpath, f)
             if f.endswith(".csproj"):
@@ -158,6 +160,15 @@ def main():
 
         results.append((proj, ";".join(tfms), lang or "(default)", ceiling))
         floor = ceiling if floor is None else min(floor, ceiling)
+
+    if floor is None:
+        print("No analyzable projects found (every .csproj was skipped — no "
+              "target framework resolved). Cannot determine a C# floor.")
+        if warnings:
+            print("\nNotes:")
+            for w in warnings:
+                print("  - " + w)
+        sys.exit(1)
 
     print("=" * 60)
     print(f"C# FLOOR: {CSHARP_LABEL.get(floor, floor)}")

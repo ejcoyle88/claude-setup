@@ -15,9 +15,12 @@ description: >-
 
 Goal: write the most modern, idiomatic C# the project can actually compile, and
 nothing above that line. The floor is set by the **lowest target framework**
-across the solution (plus any `<LangVersion>` pin), because C# 14 needs .NET 10,
-C# 13 needs .NET 9, and so on — a newer language version than the TFM is
-unsupported.
+across the solution (plus any `<LangVersion>` pin): each TFM sets the *default*
+`LangVersion` (net10 → C# 14, net9 → C# 13, and so on). You can raise it with an
+explicit `<LangVersion>` for pure-compiler features, but anything needing newer
+runtime/BCL support (e.g. `System.Threading.Lock`, `params` collections) still
+won't work below its TFM — so this skill caps at the TFM default for code that
+must compile everywhere.
 
 ## Step 1 — Detect the floor
 
@@ -55,12 +58,12 @@ unavailable. Feature → minimum C# version (some also need the matching runtime
   extended property patterns.
 - **C# 11** (net7): raw string literals, list patterns, `required` members, UTF-8
   string literals, static abstract interface members / generic math (runtime: net7+).
-- **C# 12** (net8): primary constructors (classes/structs), collection expressions
+- **C# 12** (net8): primary constructors (classes & structs — records had
+  positional parameters since C# 9), collection expressions
   `[...]` + spreads, default lambda parameters, `using` alias for any type,
   inline arrays (runtime: net8+).
 - **C# 13** (net9): `params` collections, partial properties/indexers, `ref`/`unsafe` in iterators & async,
   implicit index (`^`) in initializers, overload-resolution priority. (Runtime: net9+ adds `System.Threading.Lock`.)
-  implicit index (`^`) in initializers, overload-resolution priority.
 - **C# 14** (net10): the `field` keyword, extension members (`extension` blocks),
   null-conditional assignment (`obj?.Prop = …`), partial constructors & events,
   user-defined compound assignment, first-class `Span<T>`/`ReadOnlySpan<T>`
