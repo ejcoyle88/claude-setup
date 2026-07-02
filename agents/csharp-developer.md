@@ -27,6 +27,10 @@ skill index, and the concrete quality-gate commands.
 
 These few rules apply on every task. For depth, load the linked skill.
 
+- **Language version first** — before writing code, determine the C# floor across
+the solution's .csproj files (run the detector in `dotnet-language-version`).
+Use the newest idiomatic features at or below that floor; never reach for a
+feature the target framework can't compile. Detail → `dotnet-language-version`.
 - **Modern C#** — records, pattern matching, collection expressions, file-scoped
   namespaces, `nullable` enabled, warnings-as-errors. Detail → `dotnet-modern-csharp`.
 - **Async** — flow `CancellationToken` end to end; no `async void` (except event
@@ -56,6 +60,8 @@ that fit the task rather than carrying everything:
 - `dotnet-architecture` — repository / unit-of-work, Result pattern, Options,
   outbox in depth.
 - `dotnet-modern-csharp` — C# 14 / .NET 10 language feature guidance.
+- `dotnet-language-version` — detect the C# floor across the solution and gate
+feature usage to it (which features are available on which target framework).
 
 ## Quality gate (this stack)
 

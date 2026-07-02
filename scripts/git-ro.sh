@@ -115,7 +115,7 @@ for arg in "$@"; do
         # --- status / rev-parse display options (no file I/O) ---
         --short | --porcelain | --porcelain=* | --branch | --no-renames | \
         --verify | --quiet | -q | --abbrev-ref | --abbrev-ref=* | \
-        --symbolic | --symbolic-full-name | --show-toplevel | --git-dir | \
+        --symbolic | --symbolic-full-name | --show-toplevel | \
         --is-inside-work-tree | --is-bare-repository | --show-prefix)
             ;;
 

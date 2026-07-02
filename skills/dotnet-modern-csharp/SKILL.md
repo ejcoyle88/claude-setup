@@ -14,18 +14,26 @@ description: >-
 
 Reach for current features where they improve clarity, not for their own sake.
 
+**Availability is gated by the project's C# floor** — run the detector in
+`dotnet-language-version` first and use only features at or below it. The
+`(C# N+)` tags below are the minimum version each feature needs; on an older
+floor, use the newest tagged at or below it and skip the rest.
+
 ## Language features
 
 - Records / `readonly record struct` for immutable data; `with` for
-  non-destructive mutation.
-- Collection expressions (`[..]`, spreads) and `params` collections.
+  non-destructive mutation. (C# 9+; record struct C# 10+)
+- Collection expressions (`[..]`, spreads) and `params` collections. (collection
+  expressions C# 12+; `params` collections C# 13+)
 - Pattern matching (list, relational, logical) over branching `if` chains.
+  (relational/logical C# 9+; list patterns C# 11+)
 - Primary constructors — but note captured parameters are **mutable private
   fields, not readonly**; don't use them where you'd expect record-like immutability.
-- `field` keyword and extension members (C# 14) where they cut boilerplate.
-- `System.Threading.Lock` over `lock(object)` for new code.
-- File-scoped namespaces, global usings, `nullable` enabled, and a warning-clean
-  build (treat warnings as errors).
+  (C# 12+ for classes/structs)
+- `field` keyword and extension members where they cut boilerplate. (C# 14+)
+- `System.Threading.Lock` over `lock(object)` for new code. (.NET 9+)
+- File-scoped namespaces (C# 10+), global usings (C# 10+), `nullable` enabled, and
+  a warning-clean build (treat warnings as errors).
 
 ## Async
 

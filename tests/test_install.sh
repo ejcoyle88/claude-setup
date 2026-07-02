@@ -54,10 +54,10 @@ run_test() {
 test_fresh_install_creates_symlinks() {
   bash "$INSTALL" >/dev/null
 
-  assert "skills/angular-a11y.md is a symlink" \
-    "[ -L '$CLAUDE_DIR/skills/angular-a11y.md' ]"
+  assert "skills/angular-a11y is a symlink" \
+    "[ -L '$CLAUDE_DIR/skills/angular-a11y' ]"
   assert "skills symlink points into the repo" \
-    "[ \"\$(readlink '$CLAUDE_DIR/skills/angular-a11y.md')\" = '$REPO_ROOT/skills/angular-a11y.md' ]"
+    "[ \"\$(readlink '$CLAUDE_DIR/skills/angular-a11y')\" = '$REPO_ROOT/skills/angular-a11y' ]"
   assert "agents/csharp-developer.md is a symlink" \
     "[ -L '$CLAUDE_DIR/agents/csharp-developer.md' ]"
   assert "scripts/git-ro.sh is a symlink" \
@@ -79,26 +79,26 @@ test_idempotent_no_backups_on_second_run() {
 
 test_real_file_is_backed_up() {
   mkdir -p "$CLAUDE_DIR/skills"
-  echo "user's own content" > "$CLAUDE_DIR/skills/angular-a11y.md"
+  echo "user's own content" > "$CLAUDE_DIR/skills/angular-a11y"
 
   bash "$INSTALL" >/dev/null
 
   local backup_count
-  backup_count="$(find "$CLAUDE_DIR/skills" -name 'angular-a11y.md.backup-*' | wc -l | tr -d ' ')"
+  backup_count="$(find "$CLAUDE_DIR/skills" -name 'angular-a11y.backup-*' | wc -l | tr -d ' ')"
   assert "backup file was created" "[ '$backup_count' = '1' ]"
   assert "target is now a symlink into the repo" \
-    "[ -L '$CLAUDE_DIR/skills/angular-a11y.md' ]"
+    "[ -L '$CLAUDE_DIR/skills/angular-a11y' ]"
 }
 
 test_correct_existing_symlink_is_left_alone() {
   bash "$INSTALL" >/dev/null
   # Capture the symlink's inode and mtime, then run again and check unchanged
   local before
-  before="$(stat_inode_mtime "$CLAUDE_DIR/skills/angular-a11y.md")"
+  before="$(stat_inode_mtime "$CLAUDE_DIR/skills/angular-a11y")"
   sleep 1
   bash "$INSTALL" >/dev/null
   local after
-  after="$(stat_inode_mtime "$CLAUDE_DIR/skills/angular-a11y.md")"
+  after="$(stat_inode_mtime "$CLAUDE_DIR/skills/angular-a11y")"
   assert "stat probe returned a value" "[ -n '$before' ] && [ -n '$after' ]"
   assert "symlink unchanged on second install" "[ '$before' = '$after' ]"
 }
