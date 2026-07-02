@@ -31,7 +31,7 @@ floor, use the newest tagged at or below it and skip the rest.
   fields, not readonly**; don't use them where you'd expect record-like immutability.
   (C# 12+ for classes/structs)
 - `field` keyword and extension members where they cut boilerplate. (C# 14+)
-- `System.Threading.Lock` over `lock(object)` for new code. (C# 13+ / .NET 9+)
+- `System.Threading.Lock` over `lock(object)` for new code. (.NET 9+)
 - File-scoped namespaces (C# 10+), global usings (C# 10+), `nullable` enabled, and
   a warning-clean build (treat warnings as errors).
 
