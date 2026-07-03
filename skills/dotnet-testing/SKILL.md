@@ -11,12 +11,10 @@ description: >-
 
 # Testing
 
-- **xUnit v3** (or TUnit) on the Microsoft Testing Platform; xUnit v2 is
-  maintenance-only.
+- **xUnit v3** (or TUnit) on the Microsoft Testing Platform.
 - **Mocking**: NSubstitute or FakeItEasy (both MIT, no telemetry). Avoid Moq by
-  default given the 2023 SponsorLink incident, unless the project already uses it.
-- **Fake data**: Bogus. AutoFixture only if already adopted (limited maintenance;
-  v5 still in preview).
+  default unless the project already uses it — see "Old patterns" for why.
+- **Fake data**: Bogus. AutoFixture only if already adopted (limited maintenance).
 - `WebApplicationFactory<T>` for in-process API tests; **TestContainers** for real
   databases and brokers in integration tests (hand-written Dapper SQL must be
   exercised against the real engine — see `dotnet-data-access`).
@@ -32,6 +30,19 @@ description: >-
 3. **Refactor** — remove duplication and improve names with tests green; re-run.
 4. Repeat in small increments. Test behaviour, not implementation; use AAA and
    descriptive test names.
+
+## Old patterns (as of 2026-07-03)
+
+- **xUnit v2** — maintenance-only as of this writing; prefer xUnit v3 (or
+  TUnit) on the Microsoft Testing Platform for new work. Re-check current
+  support status before treating this as settled.
+- **Moq** — avoided by default since the 2023 SponsorLink telemetry incident;
+  the concern is reputational/trust rather than an ongoing technical defect.
+  Re-check current sentiment and the project's own precedent before enforcing
+  this over an existing choice.
+- **AutoFixture** — limited maintenance activity; historically the v5 line sat
+  in preview for an extended period. Confirm current release and maintenance
+  status before citing it as a reason to avoid AutoFixture.
 
 ## Review checklist
 
