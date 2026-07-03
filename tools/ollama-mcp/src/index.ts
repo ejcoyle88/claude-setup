@@ -16,8 +16,13 @@ import { z } from "zod";
 const OLLAMA_HOST = (process.env.OLLAMA_HOST ?? "http://ollama:11434").replace(/\/+$/, "");
 
 /** Default model for future offload tools. Not used by ping/health, but read
- * here so it's validated at startup and visible in `health`'s response. */
-const OLLAMA_MODEL = process.env.OLLAMA_MODEL ?? "llama3.2";
+ * here so it's validated at startup and visible in `health`'s response.
+ * Must match the OLLAMA_MODEL the ollama sidecar warms on start (see
+ * docker-compose.yml's x-ollama-common anchor and
+ * .devcontainer/ollama-entrypoint.sh's WARM section, added in claude-r30.2) --
+ * pointing this at a model the sidecar hasn't pulled would reintroduce the
+ * cold "model not found" failure that bead exists to prevent. */
+const OLLAMA_MODEL = process.env.OLLAMA_MODEL ?? "llama3.2:3b";
 
 /** Timeout for the health check's reachability probe, in milliseconds. */
 const HEALTH_CHECK_TIMEOUT_MS = 3000;

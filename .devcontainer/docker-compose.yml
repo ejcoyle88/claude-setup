@@ -42,6 +42,20 @@ x-ollama-common: &ollama-common
     # per ollama's own FAQ, `ollama pull` only ever uses HTTPS, and setting
     # HTTP_PROXY too risks interfering with ollama serve's own HTTP server.
     HTTPS_PROXY: http://ollama-egress-proxy:3128
+    # claude-r30.2: single overridable knob for the model ollama-entrypoint.sh
+    # warms (pulls + confirms present) before this container reports healthy
+    # -- see Dockerfile.ollama's HEALTHCHECK and ollama-entrypoint.sh's WARM
+    # section. Must match tools/ollama-mcp's OLLAMA_MODEL (README default:
+    # llama3.2:3b) -- that's the model the MCP will actually call.
+    #
+    # Default: llama3.2:3b -- ~2GB pull, ~2-3GB RAM at Q4_K_M, runs
+    # acceptably CPU-only (this is the *non*-GPU `ollama` service). Override
+    # by exporting OLLAMA_MODEL before `docker compose up`, e.g. to
+    # qwen2.5:7b (~4.7GB pull, ~5.5GB VRAM, wants the `ollama-gpu` profile --
+    # see that service below) for stronger accuracy at the cost of size/speed.
+    # See tools/ollama-mcp/README.md's Model section for the full tradeoff
+    # writeup.
+    OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3.2:3b}
   depends_on:
     # condition: service_healthy (not just container-started, the compose
     # default) -- Compose's plain depends_on only orders container
@@ -169,9 +183,10 @@ services:
     # No host ports: the devcontainer reaches this by service name,
     # ollama:11434, over the pinned 172.28.0.0/24 network that
     # init-firewall.sh's HOST_NETWORK rule already permits — same story as
-    # otel-collector above. Model select/pull and the MCP that talks to this
-    # sidecar are handled by later beads; this just needs to exist and be
-    # reachable.
+    # otel-collector above. Model select/pull/warm (claude-r30.2) now lives
+    # in ollama-entrypoint.sh's WARM section (OLLAMA_MODEL below) and
+    # Dockerfile.ollama's HEALTHCHECK; the MCP that talks to this sidecar is
+    # tools/ollama-mcp (a separate bead).
     #
     # Egress: unlike devcontainer's firewall, init-firewall.sh can't reach
     # into this namespace (it only ever runs inside the devcontainer
@@ -186,9 +201,13 @@ services:
     # x-ollama-common anchor), which enforces a domain/SNI ACL for
     # registry.ollama.ai and the R2 blob hosts that IP-allowlisting can't
     # safely cover (see ollama-init-firewall.sh and
-    # squid-ollama-egress.conf). The entrypoint also drops NET_ADMIN/NET_RAW
-    # via setpriv right after the firewall is applied, so ollama serve
-    # itself never holds the caps that could undo it.
+    # squid-ollama-egress.conf). Right after the firewall is applied, the
+    # entrypoint re-execs ITSELF (not just `ollama serve`) via setpriv to
+    # drop NET_ADMIN/NET_RAW -- so nothing in this container from that point
+    # on (the entrypoint's own warm/pull supervisor logic, `ollama serve`,
+    # or anything either of them forks) ever holds the caps that could undo
+    # it. See ollama-entrypoint.sh for why a plain per-child setpriv wrap
+    # isn't enough on its own.
     # CPU-only by default on every host, including Docker Desktop / Mac: a
     # `deploy.resources.reservations.devices` block with `driver: nvidia`
     # does NOT silently fall back to CPU when the NVIDIA Container Toolkit
@@ -203,10 +222,12 @@ services:
     deploy:
       resources:
         limits:
-          # Provisional cap for a small instruct model on the shared stack
-          # (devcontainer + 5 sidecars) — a model load with no ceiling can
-          # OOM the host and take the devcontainer down with it. Revisit
-          # once claude-r30.2 picks the actual model.
+          # claude-r30.2: default model is llama3.2:3b (~2-3GB resident at
+          # Q4_K_M) -- 8g leaves comfortable headroom above that on the
+          # shared stack (devcontainer + 5 sidecars) without giving an
+          # unbounded model load room to OOM the host and take the
+          # devcontainer down with it. Revisit if OLLAMA_MODEL is overridden
+          # to something meaningfully larger on this (CPU) service.
           memory: 8g
 
   # Opt-in GPU variant of the ollama service above (same build/volume/egress
@@ -220,7 +241,12 @@ services:
     deploy:
       resources:
         limits:
-          # Same provisional cap as the CPU service — see comment above.
+          # Same provisional cap as the CPU service above. Sized for the
+          # stronger qwen2.5:7b alternative (~4.7GB pull, ~5.5GB VRAM --
+          # this limit bounds container RAM, not VRAM, but the two scale
+          # together for a 7b model) noted in tools/ollama-mcp/README.md's
+          # Model section -- set OLLAMA_MODEL=qwen2.5:7b when bringing this
+          # profile up if you want that instead of the llama3.2:3b default.
           memory: 8g
         reservations:
           devices:

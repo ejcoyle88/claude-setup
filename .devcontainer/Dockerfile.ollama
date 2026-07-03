@@ -30,13 +30,51 @@ COPY ollama-init-firewall.sh /usr/local/bin/ollama-init-firewall.sh
 COPY ollama-entrypoint.sh /usr/local/bin/ollama-entrypoint.sh
 RUN chmod +x /usr/local/bin/firewall-common.sh /usr/local/bin/ollama-init-firewall.sh /usr/local/bin/ollama-entrypoint.sh
 
+# claude-r30.2: fallback default, only in effect if this image is ever run
+# directly without docker-compose.yml (e.g. `docker run`). The normal
+# override point is docker-compose.yml's `OLLAMA_MODEL: ${OLLAMA_MODEL:-...}`
+# interpolation (a compose `environment:` entry always wins over this ENV at
+# runtime) -- keep this literal in sync with that default if it ever changes.
+# See tools/ollama-mcp/README.md's Model section for the size/accuracy/speed
+# tradeoff behind the choice.
+ENV OLLAMA_MODEL=llama3.2:3b
+
 # Upstream image already runs as root (no non-root user defined), and
 # iptables/ipset need root + NET_ADMIN/NET_RAW (granted via cap_add in
 # docker-compose.yml) to program the firewall regardless -- so this doesn't
 # change the *build-time* privilege baseline. It DOES change the runtime
-# posture, though: ollama-entrypoint.sh drops NET_ADMIN/NET_RAW via setpriv
-# right after the firewall is applied and before `ollama serve` starts, so
-# the long-running workload process never holds the capabilities that could
-# undo its own firewall.
+# posture, though: right after the firewall is applied, ollama-entrypoint.sh
+# re-execs ITSELF (not just the eventual `ollama serve` process) through
+# setpriv to drop NET_ADMIN/NET_RAW -- so nothing that runs from that point
+# on in this container (the entrypoint's own warm/pull supervisor logic,
+# `ollama serve`, or anything either forks) ever holds the capabilities that
+# could undo its own firewall. See ollama-entrypoint.sh for why a plain
+# per-child setpriv wrap wouldn't have been enough on its own.
+
+# claude-r30.2: reports healthy only once BOTH the server is answering AND
+# $OLLAMA_MODEL has been pulled and is present locally -- see
+# ollama-entrypoint.sh's WARM section, which is what actually pulls it before
+# this can ever pass -- so "healthy" genuinely means "ready to serve
+# $OLLAMA_MODEL", not just "process is up" (visible via `docker compose ps`/
+# `docker inspect --format='{{.State.Health.Status}}'`). No compose service
+# currently declares `depends_on: ollama: condition: service_healthy` on
+# this one (deliberately -- see docker-compose.yml's `devcontainer` service:
+# gating its startup on this would block every `docker compose up` on a
+# first, from-cold multi-GB pull, even for uses that never touch
+# ollama-mcp). In practice the cold-start race this exists to avoid is still
+# closed because ollama-mcp is spawned per-Claude-session, well after this
+# container is already up -- not because anything in compose blocks on this
+# HEALTHCHECK today. `ollama list`'s first column is an exact model:tag;
+# grep it anchored and whitespace-terminated so e.g. llama3.2:3b doesn't
+# false-match llama3.2:3b-instruct-q8_0 (the unescaped "." in a pulled-in
+# $OLLAMA_MODEL could in theory match any single character instead of a
+# literal dot here -- an acceptable imprecision for a healthcheck, not a
+# security boundary). start-period=1800s (30 min) covers a first, from-cold
+# multi-GB pull over the proxied egress path without counting those retries
+# against --retries; once the model is cached in the ollama-models volume,
+# restarts pass on the first check.
+HEALTHCHECK --interval=10s --timeout=5s --start-period=1800s --retries=3 \
+  CMD ollama list 2>/dev/null | grep -Eq "^${OLLAMA_MODEL:-llama3.2:3b}[[:space:]]" || exit 1
+
 ENTRYPOINT ["/usr/local/bin/ollama-entrypoint.sh"]
 CMD ["serve"]
