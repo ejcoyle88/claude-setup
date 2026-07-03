@@ -1,5 +1,16 @@
 # Root Cause Tracing
 
+## Contents
+- Overview
+- When to Use
+- The Tracing Process
+- Adding Stack Traces
+- Finding Which Test Causes Pollution
+- Real Example: Empty projectDir
+- Key Principle
+- Stack Trace Tips
+- Real-World Impact
+
 ## Overview
 
 Bugs often manifest deep in the call stack (git init in wrong directory, file created in wrong location, database opened with wrong path). Your instinct is to fix where the error appears, but that's treating a symptom.
@@ -162,8 +173,9 @@ digraph principle {
 
 ## Real-World Impact
 
-From debugging session (2025-10-03):
-- Found root cause through 5-level trace
-- Fixed at source (getter validation)
-- Added 4 layers of defense
-- 1847 tests passed, zero pollution
+> **Example session (2025-10-03)** — one illustrative debugging session, not a
+> standing metric:
+> - Found root cause through 5-level trace
+> - Fixed at source (getter validation)
+> - Added 4 layers of defense
+> - 1847 tests passed, zero pollution
