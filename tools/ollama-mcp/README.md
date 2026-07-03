@@ -31,11 +31,13 @@ save. Only the path goes in; only a summary/extracted-fields/label comes out.
   `schema` (a JSON-Schema-like object, e.g.
   `{ type: "object", properties: { title: { type: "string" } }, required: ["title"] }`),
   passed straight through to Ollama's structured-output `format`. Returns
-  `{ data, truncated, truncatedChars? }`. Best-effort: on a small model the
-  output can still fail to match `schema` or fail to parse as JSON at all — in
-  either case this returns `isError: true` with a clear message rather than
-  silently returning garbage. (Schema *validation* + retry-on-malformed-JSON
-  is tracked separately as `claude-r30.5` — deliberately not built here.)
+  `{ data, truncated, truncatedChars? }`. The response is validated against
+  `schema` (required fields present, declared types match — see
+  [Structured-output validation](#structured-output-validation)) rather than
+  just checked for valid JSON; on a parse or validation failure the
+  generation is retried once with the identical prompt before giving up. If
+  the retry also fails, this returns `isError: true` with a message
+  describing what was wrong, never a partially-parsed or best-guess result.
 - **`classify(pathOrText, labels, isPath?, startLine?, endLine?)`** — classifies
   content into exactly one of `labels` (min 2), returning `{ label, truncated,
   truncatedChars? }`. Set `isPath: true` to have this server read `pathOrText`
@@ -59,8 +61,53 @@ All three offload tools:
 - Never throw: a bad/slow/unreachable Ollama, a missing file, or a malformed
   model response all come back as `isError: true` with a message, same
   graceful-degradation pattern as `health`.
-- Use a 60s timeout on the Ollama request itself (`health`'s reachability
-  probe uses a much shorter 3s timeout — generation is slower).
+- Validate the model's JSON response against the schema they asked Ollama's
+  `format` to constrain, retry once on a parse or validation failure, and
+  never pass a malformed/partially-parsed response through as if it were
+  valid — see [Structured-output validation](#structured-output-validation).
+- Use a 60s timeout on the first Ollama request (`health`'s reachability
+  probe uses a much shorter 3s timeout — generation is slower); on a
+  malformed/invalid response, the one retry (see
+  [Structured-output validation](#structured-output-validation)) uses a
+  shorter 30s timeout, so a single tool call's worst-case latency before
+  returning `isError: true` is ~90s, not 60s.
+
+### Structured-output validation
+
+`llama3.2:3b` (this sidecar's default, CPU-only) doesn't reliably produce
+output matching Ollama's structured-output `format` constraint even when it's
+passed one. `claude-r30.5` addressed this: every tool that asks Ollama for
+JSON (`summarize_file`'s `{ summary }`, `classify`'s `{ label }`, and
+`extract`'s caller-supplied `schema`) runs the response through a shared
+parse-and-validate step (`src/validate.ts`), not just "is this valid JSON, is
+it an object" as before:
+
+- The response is checked against the actual schema shape — required fields
+  present, and each property's declared `type` (`string`/`number`/
+  `integer`/`boolean`/`object`/`array`, recursively through nested
+  `properties`/`items`, plus `enum` membership) matches what came back.
+- On either a JSON parse failure or a schema-validation failure, the
+  *identical* prompt is re-issued to Ollama exactly once (with a shorter 30s
+  timeout rather than the first attempt's 60s — a retry is "resample the
+  dice," not "give it more thinking time"), and the retry's response is
+  validated the same way. Worst-case latency for a single tool call before
+  it returns an error is therefore ~90s (60s + 30s), not 60s.
+- If the retry also fails, the tool returns `isError: true` with a message
+  describing exactly what was wrong (e.g. a missing field, a type mismatch, a
+  label outside the given list, or invalid JSON) — never a raw stack trace,
+  and never a best-guess/partially-parsed result passed through as if it were
+  valid.
+
+This validator is a small hand-written one (`validateAgainstSchema` in
+`src/validate.ts`), not a library like `ajv` — the schemas actually used here
+are flat-ish and one level deep at most, so a full JSON-Schema implementation
+wasn't judged worth the dependency weight; see that file's header comment for
+the detailed reasoning. Covered unit tests live in `src/validate.test.ts`
+(run via `npm test`, Node's built-in `node:test` runner — no new
+devDependency). There is no live Ollama sidecar in most dev sandboxes this
+was built in, so the retry path itself (an actual second round-trip to a real
+model) has only been exercised via hand-constructed good/bad JSON payloads
+against the pure validation function, not against a live model.
 
 ## Environment variables
 
@@ -133,6 +180,7 @@ also reviewing that limit risks an OOM under load.
 cd tools/ollama-mcp
 npm install
 npm run build     # compiles src/ -> dist/ via tsc
+npm test           # compiles, then runs the node:test unit tests in dist/
 npm start          # runs dist/index.js over stdio
 ```
 
@@ -188,6 +236,7 @@ sidecar is up and healthy.
   reported (`truncated`/`truncatedChars`) rather than silent, but a genuinely
   large file only gets a summary of its first ~12,000 characters. A follow-up
   could add map-reduce-style chunking for `summarize_file` specifically.
-- **Schema validation + malformed-JSON retry for `extract`.** Already tracked
-  as `claude-r30.5`; this bead only detects and reports malformed/non-object
-  JSON, it doesn't retry or validate against the caller's `schema`.
+
+Schema validation + retry-on-malformed-JSON for `extract`/`classify`/
+`summarize_file` was tracked as `claude-r30.5` and is now built — see
+[Structured-output validation](#structured-output-validation) above.

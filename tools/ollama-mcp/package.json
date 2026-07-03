@@ -11,7 +11,8 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
-    "clean": "rm -rf dist"
+    "clean": "rm -rf dist",
+    "test": "tsc && node --test dist"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",

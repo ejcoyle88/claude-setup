@@ -18,6 +18,7 @@ import * as readline from "node:readline";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
+import { type JsonSchema, parseAndValidateJson } from "./validate.js";
 
 /** Base URL of the Ollama server, e.g. "http://ollama:11434". No trailing slash. */
 const OLLAMA_HOST = (process.env.OLLAMA_HOST ?? "http://ollama:11434").replace(/\/+$/, "");
@@ -38,6 +39,19 @@ const HEALTH_CHECK_TIMEOUT_MS = 3000;
  * milliseconds. Generation on a CPU-only 3b model is much slower than the
  * /api/tags probe `health` uses, so this is far more generous. */
 const GENERATE_TIMEOUT_MS = 60_000;
+
+/** Timeout for the *retry* generation call `generateStructured` issues
+ * after a malformed/invalid first response (see its doc comment), in
+ * milliseconds. Deliberately shorter than GENERATE_TIMEOUT_MS: a retry is
+ * "resample the dice on the same prompt," not "give the model more thinking
+ * time" -- if the model needed unusually long to produce (still-invalid)
+ * output the first time, waiting another full GENERATE_TIMEOUT_MS on the
+ * retry would let a single tool call take up to ~2x GENERATE_TIMEOUT_MS
+ * (~120s) before surfacing an error, with nothing on the caller side raised
+ * to match. Halving it bounds the combined worst case at 1.5x
+ * GENERATE_TIMEOUT_MS (~90s) instead, closer to the pre-retry ~60s ceiling
+ * this bead's retry logic added latency on top of. */
+const RETRY_TIMEOUT_MS = Math.round(GENERATE_TIMEOUT_MS / 2);
 
 /** Upper bound, in characters, on the file content sent to Ollama in a single
  * request. This is a crude proxy for tokens (roughly 4 chars/token for
@@ -175,7 +189,7 @@ server.registerTool(
       slice.content +
       "\n--- FILE CONTENT END ---";
 
-    const generated = await callOllamaGenerate(prompt, {
+    const generated = await generateStructured(prompt, {
       type: "object",
       properties: { summary: { type: "string" } },
       required: ["summary"],
@@ -184,16 +198,13 @@ server.registerTool(
       return { content: [{ type: "text", text: JSON.stringify({ error: generated.error }) }], isError: true };
     }
 
-    const parsed = parseJsonObject(generated.response);
-    if (!parsed.ok) {
-      return {
-        content: [{ type: "text", text: JSON.stringify({ error: parsed.error }) }],
-        isError: true,
-      };
-    }
-
-    const summary = parsed.value.summary;
+    const summary = generated.value.summary;
     if (typeof summary !== "string") {
+      // Should be unreachable -- generateStructured already validated
+      // 'summary' is a string via the schema above -- but this is a
+      // defensive backstop against that guarantee rather than an `as
+      // string` cast, since TS can't itself prove the runtime shape of a
+      // value typed only as Record<string, unknown>.
       return {
         content: [
           { type: "text", text: JSON.stringify({ error: "model response missing string 'summary' field" }) },
@@ -222,11 +233,13 @@ server.registerTool(
       "the fields to extract (e.g. { type: 'object', properties: { title: " +
       "{ type: 'string' } }, required: ['title'] }); it is passed to " +
       "Ollama's structured-output `format` so the model is constrained to " +
-      "match it. This is best-effort: on a small model the output can " +
-      "still fail to match `schema` or fail to parse as JSON at all -- in " +
-      "either case this tool returns isError:true with a clear message " +
-      "rather than returning garbage silently. (Schema validation + " +
-      "retry-on-malformed-JSON is tracked separately as claude-r30.5.) " +
+      "match it. The response is validated against `schema` (required " +
+      "fields present, declared types match) and, if it fails to parse as " +
+      "JSON or fails validation, the generation is retried once before " +
+      "giving up -- on a small model the output can still fail either way " +
+      "even after that; in that case this tool returns isError:true with a " +
+      "clear message describing what was wrong, rather than returning " +
+      "garbage or a partially-parsed guess silently. " +
       `Large files are truncated to ${MAX_INPUT_CHARS} characters -- check ` +
       "the `truncated` field in the result.",
     inputSchema: {
@@ -256,21 +269,13 @@ server.registerTool(
       slice.content +
       "\n--- FILE CONTENT END ---";
 
-    const generated = await callOllamaGenerate(prompt, schema as Record<string, unknown>);
+    const generated = await generateStructured(prompt, schema as JsonSchema);
     if (!generated.ok) {
       return { content: [{ type: "text", text: JSON.stringify({ error: generated.error }) }], isError: true };
     }
 
-    const parsed = parseJsonObject(generated.response);
-    if (!parsed.ok) {
-      return {
-        content: [{ type: "text", text: JSON.stringify({ error: parsed.error }) }],
-        isError: true,
-      };
-    }
-
     const result = {
-      data: parsed.value,
+      data: generated.value,
       truncated: slice.truncated,
       ...(slice.truncated ? { truncatedChars: slice.truncatedChars } : {}),
     };
@@ -332,7 +337,7 @@ server.registerTool(
       "Classify the following content into exactly one of these labels: " +
       `${JSON.stringify(labels)}.\n\n--- CONTENT START ---\n${content}\n--- CONTENT END ---`;
 
-    const generated = await callOllamaGenerate(prompt, {
+    const generated = await generateStructured(prompt, {
       type: "object",
       properties: { label: { type: "string", enum: labels } },
       required: ["label"],
@@ -341,16 +346,12 @@ server.registerTool(
       return { content: [{ type: "text", text: JSON.stringify({ error: generated.error }) }], isError: true };
     }
 
-    const parsed = parseJsonObject(generated.response);
-    if (!parsed.ok) {
-      return {
-        content: [{ type: "text", text: JSON.stringify({ error: parsed.error }) }],
-        isError: true,
-      };
-    }
-
-    const label = parsed.value.label;
+    const label = generated.value.label;
     if (typeof label !== "string" || !labels.includes(label)) {
+      // Should be unreachable -- generateStructured already validated
+      // 'label' is a string in `labels` via the schema's `enum` above -- but
+      // kept as a defensive backstop for the same reason as
+      // summarize_file's 'summary' check above.
       return {
         content: [
           {
@@ -645,13 +646,17 @@ type GenerateResult = { ok: true; response: string } | { ok: false; error: strin
  * (either the literal string "json" or a JSON-Schema-like object -- see
  * https://ollama.com/blog/structured-outputs). Never throws: network
  * errors, non-2xx responses, and timeouts are all reported as a result,
- * same pattern as `checkOllamaHealth`. */
+ * same pattern as `checkOllamaHealth`. `timeoutMs` defaults to
+ * GENERATE_TIMEOUT_MS but can be overridden -- `generateStructured` passes
+ * a shorter RETRY_TIMEOUT_MS for its retry call (see that constant's doc
+ * comment for why). */
 async function callOllamaGenerate(
   prompt: string,
   format?: "json" | Record<string, unknown>,
+  timeoutMs: number = GENERATE_TIMEOUT_MS,
 ): Promise<GenerateResult> {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), GENERATE_TIMEOUT_MS);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const response = await fetch(`${OLLAMA_HOST}/api/generate`, {
       method: "POST",
@@ -676,37 +681,65 @@ async function callOllamaGenerate(
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     const timedOut = error instanceof Error && error.name === "AbortError";
-    return { ok: false, error: timedOut ? `timed out after ${GENERATE_TIMEOUT_MS}ms` : message };
+    return { ok: false, error: timedOut ? `timed out after ${timeoutMs}ms` : message };
   } finally {
     clearTimeout(timer);
   }
 }
 
-type ParseResult = { ok: true; value: Record<string, unknown> } | { ok: false; error: string };
+type StructuredGenerateResult = { ok: true; value: Record<string, unknown> } | { ok: false; error: string };
 
-/** Parses a model's raw text response as a JSON object. Best-effort per this
- * bead's scope (claude-r30.5 tracks schema validation + retry-on-malformed):
- * this only guards against non-JSON or non-object output, returning a clear
- * error instead of passing garbage through as if it were valid structured
- * data. */
-function parseJsonObject(text: string): ParseResult {
-  let value: unknown;
-  try {
-    value = JSON.parse(text);
-  } catch {
-    return { ok: false, error: `model did not return valid JSON: ${truncateForError(text)}` };
+/**
+ * Issues `prompt` to Ollama with `schema` as the structured-output `format`
+ * constraint, then parses and validates the response against `schema` (see
+ * `parseAndValidateJson`/`validateAgainstSchema` in `validate.ts`) -- not
+ * just "is it JSON, is it an object" as the pre-claude-r30.5
+ * `parseJsonObject` did. Small CPU-only models don't reliably honor `format`
+ * even when it's passed (this bead's premise): if the first response fails
+ * to parse or fails validation, this re-issues the *identical* prompt
+ * exactly once and validates that response the same way -- a second sample
+ * from the same model on the same input often succeeds where the first
+ * didn't. If the retry also fails, this returns `ok: false` describing what
+ * was wrong with the last attempt; it never returns a best-guess or
+ * partially-parsed value (claude-r30.5's acceptance criterion: malformed
+ * model output must surface as an error, not be passed through as a
+ * result). Shared by `summarize_file`, `extract`, and `classify` so this
+ * retry+validate behavior isn't duplicated three times.
+ *
+ * A network/timeout failure from `callOllamaGenerate` itself (as opposed to
+ * a malformed *response*) is NOT retried here -- that's a different failure
+ * mode (Ollama may be down or overloaded, not just having produced bad
+ * output), and retrying a genuinely unreachable/overloaded Ollama on every
+ * call isn't worth it for this bead's scope. The retry call itself also
+ * uses a shorter RETRY_TIMEOUT_MS rather than the first attempt's full
+ * GENERATE_TIMEOUT_MS -- see that constant's doc comment for why (bounding
+ * the combined worst-case latency of a single tool call).
+ */
+async function generateStructured(prompt: string, schema: JsonSchema): Promise<StructuredGenerateResult> {
+  const first = await callOllamaGenerate(prompt, schema);
+  if (!first.ok) {
+    return { ok: false, error: first.error };
   }
-  if (typeof value !== "object" || value === null || Array.isArray(value)) {
-    return { ok: false, error: `model returned JSON that is not an object: ${truncateForError(text)}` };
+  const firstResult = parseAndValidateJson(first.response, schema);
+  if (firstResult.ok) {
+    return firstResult;
   }
-  return { ok: true, value: value as Record<string, unknown> };
-}
 
-/** Caps an error-message excerpt of a (potentially large, malformed) model
- * response so a bad response can't itself blow up the result size. */
-function truncateForError(text: string): string {
-  const limit = 200;
-  return text.length > limit ? `${text.slice(0, limit)}...` : text;
+  const retry = await callOllamaGenerate(prompt, schema, RETRY_TIMEOUT_MS);
+  if (!retry.ok) {
+    return {
+      ok: false,
+      error: `retry after malformed response failed: ${retry.error} (first attempt was invalid: ${firstResult.error})`,
+    };
+  }
+  const retryResult = parseAndValidateJson(retry.response, schema);
+  if (!retryResult.ok) {
+    return {
+      ok: false,
+      error: `model response was still invalid after one retry: ${retryResult.error} (first attempt was also invalid: ${firstResult.error})`,
+    };
+  }
+  return retryResult;
 }
 
 async function main() {
