@@ -1,0 +1,36 @@
+# OTel Collector: receives OTLP from Claude Code inside the sandbox, fans
+# metrics to Prometheus (scrape endpoint) and logs to Loki (OTLP ingest).
+# This sidecar is also the right place to later add auth, redaction, or a
+# forwarding exporter to a cloud backend — keeping credentials OUT of the
+# sandboxed container.
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch: {}
+
+exporters:
+  prometheus:
+    endpoint: 0.0.0.0:9464
+  otlphttp/loki:
+    endpoint: http://loki:3100/otlp
+  # Uncomment while debugging to see everything in `docker compose logs otel-collector`:
+  # debug:
+  #   verbosity: detailed
+
+service:
+  pipelines:
+    metrics:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [prometheus]
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlphttp/loki]

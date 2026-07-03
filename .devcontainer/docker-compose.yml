@@ -1,0 +1,102 @@
+# Claude Code sandbox + OTel sidecar stack.
+# Lives in .devcontainer/ next to your existing Dockerfile and init-firewall.sh
+# (both unchanged). The devcontainer service is your current container ported
+# from devcontainer.json; the sidecars give telemetry somewhere to land.
+#
+# Firewall interplay: the subnet is PINNED to 172.28.0.0/24 so that
+# init-firewall.sh's HOST_NETWORK (the /24 around the default gateway,
+# 172.28.0.1) provably covers every sidecar — container→collector traffic is
+# allowed by the existing `-d HOST_NETWORK -j ACCEPT` rule, and service-name
+# DNS rides the Docker embedded DNS (127.0.0.11) rules the script restores.
+# No firewall edits needed. Change the subnet only if it collides with an
+# existing Docker network on your machine.
+
+name: claude-sandbox
+
+services:
+  devcontainer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        TZ: ${TZ:-Europe/London}
+        CLAUDE_CODE_VERSION: latest
+        GIT_DELTA_VERSION: "0.18.2"
+        ZSH_IN_DOCKER_VERSION: "1.2.0"
+    # runArgs doesn't exist in compose mode — capabilities live here instead.
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    # Keep the service alive for the devcontainer to attach to.
+    command: sleep infinity
+    volumes:
+      # Compose file sits in .devcontainer/, so the repo root is one level up.
+      - ..:/workspace:cached
+      - claude-code-bashhistory:/commandhistory
+      # Named volume = empty ~/.claude on first run. For the overnight workflow
+      # you almost certainly want your real global suite instead — swap for:
+      #   - ~/.claude:/home/node/.claude
+      # (or a bind of your dotfiles checkout of it).
+      - claude-code-config:/home/node/.claude
+    environment:
+      NODE_OPTIONS: --max-old-space-size=4096
+      CLAUDE_CONFIG_DIR: /home/node/.claude
+      POWERLEVEL9K_DISABLE_GITSTATUS: "true"
+      # Telemetry target: the sidecar, by compose service name. run-overnight.sh
+      # and interactive `claude` both inherit this (the script's localhost
+      # default only applies when unset).
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_EXPORTER_OTLP_PROTOCOL: grpc
+    depends_on:
+      - otel-collector
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest # pin a version once happy
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./otel-collector-config.yaml:/etc/otelcol/config.yaml:ro
+    depends_on:
+      - loki
+    # No host ports needed for the sandbox→collector path. Uncomment to let
+    # host-side (non-container) claude sessions export here too:
+    # ports:
+    #   - "4317:4317"
+    #   - "4318:4318"
+
+  prometheus:
+    image: prom/prometheus:latest
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090" # optional: raw metric spelunking from the host browser
+
+  loki:
+    image: grafana/loki:latest
+    # Image's default config; Loki 3.x accepts OTLP logs at /otlp out of the
+    # box. If log ingest ever 400s, check `allow_structured_metadata` in the
+    # Loki config.
+
+  grafana:
+    image: grafana/grafana:latest
+    environment:
+      # Local-only convenience: no login. Don't expose this beyond localhost.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    ports:
+      - "3000:3000" # the morning dashboard: http://localhost:3000
+    depends_on:
+      - prometheus
+      - loki
+
+volumes:
+  claude-code-bashhistory:
+  claude-code-config:
+
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24
