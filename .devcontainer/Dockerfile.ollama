@@ -1,0 +1,42 @@
+# Egress-hardened variant of the upstream ollama image: adds the iptables/
+# ipset tooling and firewall scripts needed to run a deny-by-default egress
+# allowlist inside this service's OWN network namespace (see
+# ollama-init-firewall.sh for the rules and rationale). Shared by both the
+# `ollama` and `ollama-gpu` services in docker-compose.yml.
+ARG OLLAMA_VERSION=0.31.1
+FROM ollama/ollama:${OLLAMA_VERSION}
+
+# Install at BUILD time (open network here) so the locked-down runtime
+# firewall this same image sets up at container start never needs to fetch
+# anything itself.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+  iptables \
+  ipset \
+  iproute2 \
+  dnsutils \
+  curl \
+  ca-certificates \
+  && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# setpriv (util-linux) drops NET_ADMIN/NET_RAW before ollama serve starts
+# (see ollama-entrypoint.sh) -- util-linux is Essential on Debian/Ubuntu so
+# it should already be present; fail the BUILD loudly here instead of
+# discovering it's missing at container start.
+RUN command -v setpriv >/dev/null || \
+  { echo "ERROR: setpriv not found (expected from util-linux)"; exit 1; }
+
+COPY firewall-common.sh /usr/local/bin/firewall-common.sh
+COPY ollama-init-firewall.sh /usr/local/bin/ollama-init-firewall.sh
+COPY ollama-entrypoint.sh /usr/local/bin/ollama-entrypoint.sh
+RUN chmod +x /usr/local/bin/firewall-common.sh /usr/local/bin/ollama-init-firewall.sh /usr/local/bin/ollama-entrypoint.sh
+
+# Upstream image already runs as root (no non-root user defined), and
+# iptables/ipset need root + NET_ADMIN/NET_RAW (granted via cap_add in
+# docker-compose.yml) to program the firewall regardless -- so this doesn't
+# change the *build-time* privilege baseline. It DOES change the runtime
+# posture, though: ollama-entrypoint.sh drops NET_ADMIN/NET_RAW via setpriv
+# right after the firewall is applied and before `ollama serve` starts, so
+# the long-running workload process never holds the capabilities that could
+# undo its own firewall.
+ENTRYPOINT ["/usr/local/bin/ollama-entrypoint.sh"]
+CMD ["serve"]
