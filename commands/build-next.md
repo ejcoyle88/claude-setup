@@ -143,8 +143,12 @@ put under git, since diff-based review and rollback both depend on it.
   with `bd update --claim`, close with `bd close`. If you run beads in server mode
   for concurrent agents, the atomic `--claim` is what keeps two runs off the same
   bead.
-- The reviewers already route cost sensibly (e.g. `quality-reviewer` on Haiku);
-  this flow inherits that.
+- All three reviewers are dispatched together every round regardless of their
+  descriptions' "Use when" clauses — those are non-exhaustive prioritization
+  hints, not a filter this flow applies. `quality-reviewer` runs on sonnet with
+  a deliberately broad trigger (fires on nearly every diff); whether that cost
+  is warranted vs. a cheaper model or scope-based selective dispatch is an open
+  question tracked in claude-58k, not something to route around here.
 - This consumes the specialists' raw structured findings directly — it does not
   invoke the human-facing `/review` formatting, which is for a person reading a
   review, not an agent reacting to one.

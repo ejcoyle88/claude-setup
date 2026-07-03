@@ -4,10 +4,17 @@ description: >-
   Quality-focused code reviewer — correctness, error handling, concurrency
   correctness, maintainability, tests, and docs. Use when a diff changes
   control flow or error handling, touches concurrent/async code, adds or
-  changes public APIs or tests, or grows in complexity/duplication. Invoked by
-  the /review orchestrator (or directly). Read-only — returns structured
-  findings for the orchestrator to format; does not produce the final review
-  or edit code.
+  changes public APIs or tests, or grows in complexity/duplication — but treat
+  these as prioritization hints, not an exhaustive gate: when unsure, invoke it
+  anyway (e.g. a subtly wrong data transform can be a quality bug without
+  touching control flow, tests, or a public API). This trigger is deliberately
+  broad, so it fires on nearly every diff by design; it runs on sonnet by
+  default, and whether that cost is warranted vs. a cheaper model or
+  scope-based selective dispatch is an open question tracked in claude-58k,
+  not a settled trade-off. Invoked by the
+  /review orchestrator (or directly). Read-only — returns structured findings
+  for the orchestrator to format; does not produce the final review or edit
+  code.
 tools: Read, Grep, Glob, Bash(~/.claude/scripts/git-ro.sh:*)
 model: sonnet
 hooks:

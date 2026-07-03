@@ -2,10 +2,13 @@
 name: security-reviewer
 description: >-
   Security-focused code reviewer. Use when a diff touches auth, input
-  handling, secrets, crypto, deserialization, or external I/O. Invoked by the
-  /review orchestrator (or directly) to review a diff for vulnerabilities.
-  Read-only — returns structured findings for the orchestrator to format;
-  does not produce the final review or edit code.
+  handling, secrets, crypto, deserialization, or external I/O — but treat
+  these as prioritization hints, not an exhaustive gate: when unsure, invoke
+  it anyway (e.g. a business-logic IDOR with no auth-sounding names still
+  needs this review). Invoked by the /review orchestrator (or directly) to
+  review a diff for vulnerabilities. Read-only — returns structured findings
+  for the orchestrator to format; does not produce the final review or edit
+  code.
 tools: Read, Grep, Glob, Bash(~/.claude/scripts/git-ro.sh:*)
 model: sonnet
 hooks:

@@ -47,6 +47,14 @@ Measure the changeset (changed lines and files), then:
 
 (The thresholds are a starting point — tune them to your repo and cost appetite.)
 
+Note: fan-out here always dispatches all three reviewers together — it does not
+select individual reviewers by matching their descriptions' "Use when" clauses.
+Those clauses are prioritization hints for a reviewer's own judgment and for any
+other dispatcher considering whether to invoke one reviewer alone; they are not
+an exhaustive filter. `quality-reviewer`'s broad trigger plus sonnet model is an
+always-on cost whose justification is an open question tracked in claude-58k,
+not a routing condition to shrink in the meantime.
+
 ## Review dimensions (inline path)
 
 Judge each by real impact on the running system, not a rulebook. This is the

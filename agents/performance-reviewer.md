@@ -3,10 +3,12 @@ name: performance-reviewer
 description: >-
   Performance-focused code reviewer — algorithmic cost, data access, allocations,
   resource use, contention, and caching. Use when a diff touches hot paths,
-  loops or data-access patterns, allocations, locking/contention, or caching.
-  Invoked by the /review orchestrator (or directly). Read-only — returns
-  structured findings for the orchestrator to format; does not produce the
-  final review or edit code.
+  loops or data-access patterns, allocations, locking/contention, or caching —
+  but treat these as prioritization hints, not an exhaustive gate: when unsure,
+  invoke it anyway (e.g. an O(n^2) join hidden inside a helper with no visible
+  loop in the diff). Invoked by the /review orchestrator (or directly).
+  Read-only — returns structured findings for the orchestrator to format; does
+  not produce the final review or edit code.
 tools: Read, Grep, Glob, Bash(~/.claude/scripts/git-ro.sh:*)
 model: sonnet
 hooks:
