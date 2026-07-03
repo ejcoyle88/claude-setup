@@ -28,9 +28,11 @@ description: >-
 - **Options pattern** (`IOptions<T>` / `IOptionsSnapshot<T>`) with `ValidateOnStart`.
 - **Domain events / transactional outbox** for reliable side effects.
 
-## Review notes
+## Review checklist
 
-Flag raw SQL leaking into handlers/services, generic `IRepository<T>` where an
-intention-revealing repo belongs, exceptions used for expected/control-flow
-failures, and unvalidated options bound without `ValidateOnStart`. Treat the
-house choices above as correct — don't flag adherence to them.
+- Raw SQL leaking into handlers/services.
+- Generic `IRepository<T>` used where an intention-revealing repository belongs.
+- Exceptions used for expected / control-flow failures.
+- Options bound without validation (missing `ValidateOnStart`).
+
+Treat the house choices above as correct — don't flag adherence to them.
