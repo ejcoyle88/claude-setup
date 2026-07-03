@@ -33,10 +33,34 @@ x-ollama-common: &ollama-common
     - NET_RAW
   volumes:
     - ollama-models:/root/.ollama
-  # Transient registry/DNS blips during ollama-init-firewall.sh's setup
-  # shouldn't wedge the sidecar forever; bounded so a persistent
-  # misconfiguration still surfaces as "exited" rather than looping forever.
-  restart: on-failure:3
+  environment:
+    # Domain/SNI-scoped egress: ollama's own firewall (ollama-init-firewall.sh)
+    # no longer allowlists any external host directly -- it only allows
+    # reaching this proxy over the pinned compose subnet. The proxy enforces
+    # the actual registry.ollama.ai / R2-blob-host ACL (see
+    # squid-ollama-egress.conf). Only HTTPS_PROXY is set, not HTTP_PROXY --
+    # per ollama's own FAQ, `ollama pull` only ever uses HTTPS, and setting
+    # HTTP_PROXY too risks interfering with ollama serve's own HTTP server.
+    HTTPS_PROXY: http://ollama-egress-proxy:3128
+  depends_on:
+    # condition: service_healthy (not just container-started, the compose
+    # default) -- Compose's plain depends_on only orders container
+    # creation, not readiness; without this, a real `ollama pull` right
+    # after boot could hit connection-refused against a Squid that hasn't
+    # finished starting yet. See Dockerfile.egress-proxy's HEALTHCHECK.
+    ollama-egress-proxy:
+      condition: service_healthy
+  # Bounded, but generously so: ollama pull tracks partial blob downloads
+  # on disk and resumes rather than restarting from scratch on a fresh
+  # `ollama pull` (see ollama's own download code / FAQ) -- though
+  # real-world reports of that resume path being unreliable are common
+  # enough that a multi-GB pull surviving only a handful of restarts is
+  # still a real risk of permanently parking this sidecar as "exited"
+  # mid-pull. on-failure:10 gives noticeably more headroom for that than
+  # a plain fast-fail misconfiguration would need, while staying bounded
+  # so a genuinely broken build/config still surfaces as "exited" instead
+  # of restarting forever.
+  restart: on-failure:10
 
 services:
   devcontainer:
@@ -116,6 +140,30 @@ services:
       - prometheus
       - loki
 
+  # Domain/SNI-scoped forwarding proxy that fronts the ollama sidecars'
+  # egress to registry.ollama.ai and the *.r2.cloudflarestorage.com blob
+  # hosts `ollama pull` redirects to (see squid-ollama-egress.conf for the
+  # ACL and why: both hosts are Cloudflare-anycast, so iptables/ipset can
+  # only allowlist the shared edge IP, not the domain itself).
+  #
+  # No cap_add/NET_ADMIN here, deliberately: unlike the ollama service,
+  # this one enforces its egress restriction at the application layer (the
+  # squid ACL), not via its own iptables firewall -- see
+  # Dockerfile.egress-proxy. No host-exposed ports either: only reachable
+  # from other compose services, by service name (ollama-egress-proxy),
+  # on the pinned 172.28.0.0/24 subnet that ollama-init-firewall.sh's
+  # HOST_NETWORK rule already permits.
+  ollama-egress-proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile.egress-proxy
+    image: claude-sandbox-ollama-egress-proxy:hardened
+    # Bounded but generous -- see the matching comment on x-ollama-common's
+    # restart: a multi-GB blob pull spans a while, and this proxy dying
+    # mid-pull shouldn't cost more restart budget than it has to. See
+    # Dockerfile.egress-proxy for the HEALTHCHECK dependents key off.
+    restart: on-failure:10
+
   ollama:
     <<: *ollama-common
     # No host ports: the devcontainer reaches this by service name,
@@ -131,14 +179,16 @@ services:
     # instead: cap_add (in the x-ollama-common anchor above) plus
     # ollama-entrypoint.sh (baked into Dockerfile.ollama) run
     # ollama-init-firewall.sh on every container start, before `ollama
-    # serve` — no unrestricted internet egress. It mirrors
-    # init-firewall.sh's model, scoped to DNS, the pinned subnet
-    # (container-to-container), and registry.ollama.ai. Model *blob*
-    # downloads (a rotating Cloudflare R2 host) aren't allowlisted yet — see
-    # ollama-init-firewall.sh for why and what claude-r30.2 needs to add.
-    # The entrypoint also drops NET_ADMIN/NET_RAW via setpriv right after
-    # the firewall is applied, so ollama serve itself never holds the caps
-    # that could undo it.
+    # serve` — no unrestricted internet egress. That firewall now allows
+    # NO external host directly (DNS, loopback, and the pinned subnet
+    # only) -- all registry/blob traffic instead goes through the
+    # ollama-egress-proxy service above (HTTPS_PROXY, in the
+    # x-ollama-common anchor), which enforces a domain/SNI ACL for
+    # registry.ollama.ai and the R2 blob hosts that IP-allowlisting can't
+    # safely cover (see ollama-init-firewall.sh and
+    # squid-ollama-egress.conf). The entrypoint also drops NET_ADMIN/NET_RAW
+    # via setpriv right after the firewall is applied, so ollama serve
+    # itself never holds the caps that could undo it.
     # CPU-only by default on every host, including Docker Desktop / Mac: a
     # `deploy.resources.reservations.devices` block with `driver: nvidia`
     # does NOT silently fall back to CPU when the NVIDIA Container Toolkit

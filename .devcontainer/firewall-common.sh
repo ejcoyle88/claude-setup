@@ -168,13 +168,39 @@ firewall_common::lock_down() {
 # and that must stop the container rather than continue in a false sense of
 # safety. Bounded with --max-time so a stalled TLS/HTTP phase (as opposed to
 # a fast, expected connection failure) can't hang startup indefinitely.
+# Optionally routes the check through a forwarding proxy (see
+# verify_allow) for callers proving a proxy's own ACL denies a host it
+# shouldn't allow, rather than proving the iptables layer denies it.
+#
+# CAUTION (Review Round 1 finding A): when via_proxy is NOT given, this is
+# supposed to be a genuinely DIRECT check -- but curl also honors an
+# ambient https_proxy/HTTPS_PROXY environment variable if one happens to
+# be set in this process's environment (e.g. ollama's own container sets
+# HTTPS_PROXY for ollama serve -- see docker-compose.yml -- and that env
+# var is just as visible to this firewall script, which runs in the same
+# container before ollama serve starts). Without --noproxy, a "direct"
+# check would silently ride that ambient proxy instead, and calling
+# verify_deny("https://registry.ollama.ai/v2/") with no via_proxy would
+# then reach registry.ollama.ai anyway (the proxy's ACL allows it) and
+# treat that success as a firewall failure -- exit 1 on every single
+# startup. --noproxy '*' unconditionally overrides any ambient proxy env
+# var for this one curl call, so the no-via_proxy path is always truly
+# direct regardless of what's set in the calling environment.
 firewall_common::verify_deny() {
   local deny_url="$1"
-  if curl --connect-timeout 5 --max-time 10 "$deny_url" >/dev/null 2>&1; then
-    echo "ERROR: Firewall verification failed - was able to reach $deny_url"
+  local via_proxy="${2:-}"
+  local -a curl_args=(--connect-timeout 5 --max-time 10)
+  if [ -n "$via_proxy" ]; then
+    curl_args+=(-x "$via_proxy")
+  else
+    curl_args+=(--noproxy '*')
+  fi
+
+  if curl "${curl_args[@]}" "$deny_url" >/dev/null 2>&1; then
+    echo "ERROR: Firewall verification failed - was able to reach $deny_url${via_proxy:+ via $via_proxy}"
     exit 1
   fi
-  echo "Firewall verification passed - unable to reach $deny_url as expected"
+  echo "Firewall verification passed - unable to reach $deny_url${via_proxy:+ via $via_proxy} as expected"
 }
 
 # Positive check: confirms an allowlisted destination IS reachable. This is
@@ -182,19 +208,34 @@ firewall_common::verify_deny() {
 # needs in order to start, so it soft-fails (warns and continues) by
 # default -- a transient registry/DNS blip shouldn't permanently wedge the
 # container on every restart. Pass hard_fail=1 for callers that want it
-# fatal instead. Bounded with --max-time for the same reason as verify_deny.
+# fatal instead. Optionally routes the check through a forwarding proxy
+# (e.g. "http://ollama-egress-proxy:3128") for callers whose firewall no
+# longer allowlists the destination directly and instead relies on a
+# domain/SNI-scoped proxy to reach it -- see ollama-init-firewall.sh.
+# Bounded with --max-time for the same reason as verify_deny. Also matches
+# verify_deny's --noproxy '*' on the no-via_proxy path -- see verify_deny's
+# CAUTION comment for why an unqualified "direct" curl can't be trusted to
+# actually be direct if an ambient https_proxy/HTTPS_PROXY is set.
 firewall_common::verify_allow() {
   local allow_url="$1"
   local hard_fail="${2:-0}"
-  if curl --connect-timeout 5 --max-time 10 "$allow_url" >/dev/null 2>&1; then
-    echo "Firewall verification passed - able to reach $allow_url as expected"
+  local via_proxy="${3:-}"
+  local -a curl_args=(--connect-timeout 5 --max-time 10)
+  if [ -n "$via_proxy" ]; then
+    curl_args+=(-x "$via_proxy")
+  else
+    curl_args+=(--noproxy '*')
+  fi
+
+  if curl "${curl_args[@]}" "$allow_url" >/dev/null 2>&1; then
+    echo "Firewall verification passed - able to reach $allow_url as expected${via_proxy:+ (via $via_proxy)}"
     return 0
   fi
 
   if [ "$hard_fail" = "1" ]; then
-    echo "ERROR: Firewall verification failed - unable to reach $allow_url"
+    echo "ERROR: Firewall verification failed - unable to reach $allow_url${via_proxy:+ via $via_proxy}"
     exit 1
   fi
-  echo "WARNING: Firewall verification - unable to reach $allow_url (sanity check only; not required for the workload to start, continuing)"
+  echo "WARNING: Firewall verification - unable to reach $allow_url${via_proxy:+ via $via_proxy} (sanity check only; not required for the workload to start, continuing)"
   return 0
 }

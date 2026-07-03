@@ -1,0 +1,68 @@
+# Domain/SNI-scoped forwarding egress proxy for the ollama sidecar. Fronts
+# ollama's outbound traffic to registry.ollama.ai and the *.r2.cloudflarestorage.com
+# blob hosts it redirects downloads to, enforcing a hostname ACL (see
+# squid-ollama-egress.conf) instead of the IP-allowlist ollama-init-firewall.sh
+# uses for everything else -- see that file and the squid config for why:
+# both hosts are Cloudflare-anycast, so IP-allowlisting can't tell them apart
+# from other Cloudflare tenants sharing the same edge IP.
+FROM debian:bookworm-slim
+
+# Install at BUILD time (open network here). This container's own runtime
+# network is intentionally NOT firewalled with iptables (no cap_add /
+# NET_ADMIN in docker-compose.yml, unlike the ollama service) -- its egress
+# is gated entirely by squid's own ACL at the application layer instead,
+# which is the whole point of a domain/SNI-scoped proxy over IP-allowlisting.
+#
+# squid-openssl, NOT plain squid: on Debian, ssl_bump/TLS-peek support
+# (squid-ollama-egress.conf's SNI-checking layer) requires the OpenSSL
+# build of squid -- the two packages are mutually exclusive builds of the
+# same source, and the plain `squid` package has no ssl_bump support at
+# all. `openssl` (the CLI) is only needed to generate the placeholder
+# TLS keypair below; see squid-ollama-egress.conf's http_port comment for
+# why that keypair has to exist even though this proxy never actually
+# terminates/MITMs any allowed connection.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+  squid-openssl \
+  openssl \
+  && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Runs as a dedicated non-root user -- no cache_dir/log files/PID file are
+# configured (see squid-ollama-egress.conf), and 3128 is an unprivileged
+# port, so squid never needs root at all here (unlike a typical squid
+# install that starts as root to bind a low port then drops privilege).
+RUN useradd --system --no-create-home --shell /usr/sbin/nologin egressproxy
+
+# Throwaway, self-signed placeholder keypair -- NOT a CA, never distributed
+# or trusted anywhere, never presented to any real client (this proxy only
+# ever peeks/splices/terminates -- see squid-ollama-egress.conf -- so
+# "bump", the action that would actually present a certificate, is never
+# reached). It exists solely because Squid's ssl-bump http_port mode
+# requires a tls-cert/tls-key pair to initialize its TLS engine at all.
+# Generated once at build time (10-year validity is irrelevant to security
+# here, only to avoiding an unnecessary rebuild-on-expiry footgun).
+RUN mkdir -p /etc/squid/ssl_cert \
+  && openssl req -x509 -nodes -newkey rsa:2048 -days 3650 \
+       -keyout /etc/squid/ssl_cert/placeholder-key.pem \
+       -out /etc/squid/ssl_cert/placeholder-cert.pem \
+       -subj "/CN=ollama-egress-proxy-splice-only-placeholder" \
+  && chown -R egressproxy:egressproxy /etc/squid/ssl_cert \
+  && chmod 600 /etc/squid/ssl_cert/placeholder-key.pem
+
+COPY squid-ollama-egress.conf /etc/squid/squid.conf
+
+USER egressproxy
+
+# No host-exposed port here (see docker-compose.yml) -- only reachable from
+# other compose services, by service name, on this port.
+EXPOSE 3128
+
+# Bare TCP connect check -- proves the process is up and accepting
+# connections (what docker-compose.yml's `condition: service_healthy`
+# dependents need) without needing curl/nc installed: /dev/tcp is a bash
+# builtin, and bash is part of Debian's Essential set (present even in the
+# -slim base). Not a functional/ACL check -- ollama-init-firewall.sh's own
+# startup verification (via curl through this proxy) covers that.
+HEALTHCHECK --interval=5s --timeout=3s --start-period=5s --retries=5 \
+  CMD bash -c 'exec 3<>/dev/tcp/127.0.0.1/3128' || exit 1
+
+ENTRYPOINT ["/usr/sbin/squid", "-N", "-f", "/etc/squid/squid.conf"]
