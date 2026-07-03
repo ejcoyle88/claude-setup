@@ -3,8 +3,8 @@ description: >-
   Take the next backlog task end to end — clarify up front, implement with
   csharp-developer, then up to two specialist review cycles (the second only if
   the first finds blocking issues). Completes one task only.
-argument-hint: "[bead-id]"
-allowed-tools: Read, Grep, Glob, Bash(git diff:*), Bash(git status:*), Bash(git log:*), Bash(git merge-base:*), Bash(git rev-parse:*), Bash(bd ready:*), Bash(bd show:*), Bash(bd update:*), Bash(bd close:*), Bash(bd create:*), Bash(bd dep:*), Task, AskUserQuestion
+argument-hint: "[bead-id] [--unattended]"
+allowed-tools: Read, Grep, Glob, Bash(git diff:*), Bash(git status:*), Bash(git log:*), Bash(git merge-base:*), Bash(git rev-parse:*), Bash(git add:*), Bash(git commit:*), Bash(bd ready:*), Bash(bd show:*), Bash(bd update:*), Bash(bd close:*), Bash(bd create:*), Bash(bd dep:*), Task, AskUserQuestion
 ---
 
 You are the orchestrator for building one backlog task. Coordinate the
@@ -14,6 +14,34 @@ specialist reviewers (`security-reviewer`, `quality-reviewer`,
 any user questions live here, not inside a subagent. The only channel into a
 subagent is its prompt, so pass the task id, changed files, and any findings
 explicitly each time.
+
+## Unattended mode (`--unattended` in `$ARGUMENTS`)
+
+Used by the overnight runner (`run-overnight.sh`): headless, nobody to answer
+questions. Everything below applies as written, with these overrides:
+
+- **Never call `AskUserQuestion`** — there is no one to answer; the run would
+  hang or die.
+- **Ambiguity → defer, don't guess.** If a bead is materially underspecified
+  (Step 1) or the developer returns `NEEDS-INPUT` you can't resolve from the
+  bead itself: create a question bead capturing the question, its context, and
+  the recommendation (`bd create "Question: <summary> [for <id>]" -p 0`), make
+  the original depend on it (`bd dep add <id> <question-id>`) so it leaves the
+  ready queue, release your claim, and select the next ready bead. If three
+  beads in a row defer this way, stop and report — the backlog needs a human
+  pass. Exception: if a `NEEDS-INPUT` recommendation is low-risk and reversible
+  (naming, internal structure — not schema, public API, data, or security),
+  adopt the recommendation, proceed, and record the assumption in the bead's
+  close summary.
+- **Commit per task.** After Step 4 closes a bead: `git add -A` and
+  `git commit -m "<bead-id>: <one-line summary>"`. This is what keeps the next
+  iteration's review diff scoped to one task. If blocking findings survive
+  Round 2, still commit (`git commit -m "wip(<bead-id>): unresolved review
+  findings"`), leave the bead in progress, and file a follow-up bead listing
+  the unresolved findings.
+- **Report tersely** — the final message lands in a log file, not a chat.
+
+In interactive mode (no flag), ignore this section entirely.
 
 ## Step 1 — Select, claim, and clarify (cheap, up front)
 
