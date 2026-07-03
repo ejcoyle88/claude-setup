@@ -40,3 +40,5 @@ daemon/
 daemon.status.json
 
 jobs/
+.env
+.overnight-logs/

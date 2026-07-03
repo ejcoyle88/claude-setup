@@ -25,3 +25,20 @@ jobs:
       - name: Run installer tests
         shell: bash
         run: bash tests/test_install.sh
+
+  overnight-tests:
+    # Linux-only: this test sources tools/run-overnight.sh (which shells out to
+    # python3 and awk with GNU-style regex quantifiers at source time, not just
+    # when invoked) and fabricates worker-*.log fixtures with bash-specific
+    # constructs. That mix isn't proven portable to the Windows Git Bash runner
+    # (e.g. plain `python3` on PATH is not guaranteed there), so this runs as
+    # its own ubuntu-only job rather than a step in the install-tests matrix,
+    # to avoid spurious failures on macos/windows unrelated to the actual bug
+    # this test guards against.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run overnight-runner tests
+        shell: bash
+        run: bash tests/test_run_overnight.sh

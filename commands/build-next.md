@@ -5,6 +5,7 @@ description: >-
   the first finds blocking issues). Completes one task only.
 argument-hint: "[bead-id] [--unattended]"
 allowed-tools: Read, Grep, Glob, Bash(git diff:*), Bash(git status:*), Bash(git log:*), Bash(git merge-base:*), Bash(git rev-parse:*), Bash(git add:*), Bash(git commit:*), Bash(bd ready:*), Bash(bd show:*), Bash(bd update:*), Bash(bd close:*), Bash(bd create:*), Bash(bd dep:*), Task, AskUserQuestion
+model: sonnet
 ---
 
 You are the orchestrator for building one backlog task. Coordinate the
@@ -37,7 +38,7 @@ questions. Everything below applies as written, with these overrides:
   `git commit -m "<bead-id>: <one-line summary>"`. This is what keeps the next
   iteration's review diff scoped to one task. If blocking findings survive
   Round 2, still commit (`git commit -m "wip(<bead-id>): unresolved review
-  findings"`), leave the bead in progress, and file a follow-up bead listing
+findings"`), leave the bead in progress, and file a follow-up bead listing
   the unresolved findings.
 - **Report tersely** — the final message lands in a log file, not a chat.
 
@@ -46,11 +47,12 @@ In interactive mode (no flag), ignore this section entirely.
 ## Step 1 — Select, claim, and clarify (cheap, up front)
 
 Select the bead:
+
 - If `$ARGUMENTS` names a bead id (e.g. `bd-a1b2`), use it.
 - Otherwise list ready (unblocked) work with `bd ready --json` and pick the
   highest-priority bead — the lowest `-p` value, where `p0` is highest. Among
   beads of equal top priority, take the first in the returned order. (`bd ready`
-  already excludes anything with open blockers, so "ready" *is* "next" — you don't
+  already excludes anything with open blockers, so "ready" _is_ "next" — you don't
   need separate blocker logic.)
 - If `bd ready` returns nothing, report that there's no ready work and stop.
 
@@ -70,12 +72,13 @@ Pick the developer for this bead's language. The code isn't written yet, so infe
 the language from the **bead itself** — its target component/area, or a language
 label if your beads workflow tags one — not from file extensions:
 
-  - C# / .NET   → `csharp-developer`
-  - Rust        → `rust-developer`
-  - Angular / front-end (TypeScript) → `angular-developer`
-  - Claude Code setup / config (a bead about the `.claude/` suite itself —
-    agents, skills, commands, hooks, settings, CLAUDE.md) → `agent-improvement-developer`
-  - (add a row as you add each language specialist)
+- C# / .NET → `csharp-developer`
+- Rust → `rust-developer`
+- Angular / front-end (TypeScript) → `angular-developer`
+- Claude Code setup / config (a bead about the `.claude/` suite itself —
+  agents, skills, commands, hooks, settings, CLAUDE.md) → `agent-improvement-developer`
+- Dev environment / containers / CI / observability (Dockerfile, compose,
+  devcontainer, firewall, OTel stack) → `infra-developer`
 
 If a bead spans languages, take the dominant one and file the rest as follow-up
 beads in Step 4. If you genuinely can't tell, ask via `AskUserQuestion`.
@@ -103,18 +106,19 @@ contents instead of a diff — and file a follow-up bead suggesting `~/.claude` 
 put under git, since diff-based review and rollback both depend on it.
 
 **Round 1**
+
 1. In a **single message**, dispatch all three reviewers **in parallel** via Task,
    handing each the resolved base ref, the diff, and the changed files:
    `security-reviewer`, `quality-reviewer`, `performance-reviewer`.
 2. **Verify each reviewer's response before trusting it — one re-dispatch
    decision, covering both checks together.** For each reviewer, evaluate both
    conditions before deciding whether to re-dispatch:
-   - *CANNOT REVIEW claim*: verify against the diff you resolved above instead
+   - _CANNOT REVIEW claim_: verify against the diff you resolved above instead
      of accepting the self-report — was it truly empty/undecodable, did the
      fetch truly fail. If the claim checks out as legitimate, the
      coverage-completeness check below does not apply to that response — a
      genuine bail-out owes no per-file accounting.
-   - *Coverage completeness*: on every completed review (any response other
+   - _Coverage completeness_: on every completed review (any response other
      than a verified-legitimate CANNOT REVIEW), the reviewer's response must
      carry a `FILES REVIEWED: <list>` coverage note (its own line, after a
      trailing `---`, never folded into a finding block) naming every file you
@@ -134,6 +138,7 @@ put under git, since diff-based review and rollback both depend on it.
    reviewer per round even when both misfire, closing both the bogus-bail-out
    route and the faked-clean-pass route (including a decoy finding whose
    `WHERE` lists every dispatched file at once) with one bounded mechanism.
+
 3. Strip any `FILES REVIEWED:` line from a response before merging — it's a
    coverage note, not a finding. Merge the remaining structured findings;
    **keep only 🔴 critical and 🟡 warning** (drop suggestions — the developer is
@@ -147,6 +152,7 @@ put under git, since diff-based review and rollback both depend on it.
    NEEDS-INPUT escalation applies.)
 
 **Round 2** (only reached if Round 1 had blocking findings)
+
 1. Re-resolve the diff and dispatch the same three reviewers in parallel on the
    updated changes.
 2. Apply the same combined verification as Round 1 (CANNOT REVIEW check, with

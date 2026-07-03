@@ -50,6 +50,18 @@
 #       re-links newly added/removed skills/agents/commands so each fresh
 #       iteration sees the current suite. Failure counts as a failed iteration
 #       (claude is not launched on a broken setup step).
+#   ANALYZE_TELEMETRY=1      after the work loop, run one fresh headless claude
+#       on /analyze-telemetry <run-id> to mine the night's telemetry + session
+#       artifacts for token-waste and file [token-efficiency] beads. Skipped if
+#       zero iterations completed (nothing to analyze). Set 0 to disable.
+#       PROM_URL / LOKI_URL are passed through for the aggregate queries.
+#       Bounded separately from a full build iteration (it's a read-only mining
+#       pass, not agentic work) via ANALYZE_MAX_TURNS / ANALYZE_TIMEOUT; its
+#       cost is folded into the run's reported total spend, but is NOT checked
+#       against MAX_TOTAL_COST_USD (the budget loop has already exited by the
+#       time this runs).
+#   ANALYZE_MAX_TURNS=30     turn cap for the telemetry-analysis pass specifically.
+#   ANALYZE_TIMEOUT=20m      timeout for the telemetry-analysis pass specifically.
 #   MAX_TURNS=150            per-run agentic turn cap (claude --max-turns)
 #   MAX_TOTAL_COST_USD=50    whole-run budget; split evenly across workers.
 #       Read from stream-json result events. NOTE: on a subscription plan the
@@ -75,6 +87,9 @@ PERMISSION_FLAGS="${PERMISSION_FLAGS:---permission-mode auto}"
 STOP_FILE="${STOP_FILE:-$PROJECT_DIR/.stop-overnight}"
 VERIFY_CMD="${VERIFY_CMD:-}"
 PRE_ITERATION_CMD="${PRE_ITERATION_CMD:-}"
+ANALYZE_TELEMETRY="${ANALYZE_TELEMETRY:-1}"
+ANALYZE_MAX_TURNS="${ANALYZE_MAX_TURNS:-30}"
+ANALYZE_TIMEOUT="${ANALYZE_TIMEOUT:-20m}"
 MAX_TURNS="${MAX_TURNS:-150}"
 MAX_TOTAL_COST_USD="${MAX_TOTAL_COST_USD:-50}"
 PARALLEL_WORKERS="${PARALLEL_WORKERS:-1}"
@@ -149,6 +164,36 @@ else:
     status = "err" if res.get("is_error") else "ok"
     print(f"{status}|{res.get('total_cost_usd') or 0}|{res.get('num_turns') or 0}|{res.get('session_id') or ''}")
 PY
+}
+
+# Sum the "complete: N successful" counts out of one or more worker-summary
+# logs. Factored out (rather than inline) so it's independently testable —
+# see tests/test_run_overnight.sh. Uses awk, not `bc`: bc is not installed in
+# the devcontainer image, and a naive `grep -o '[0-9]*' | paste -sd+ - | bc`
+# also breaks because grep's `*` quantifier matches the empty string at every
+# non-digit position, feeding bc a string of stray `+`s it can't parse.
+count_completed_iterations() { # count_completed_iterations <log-dir>
+  local dir="$1" f total=0 n
+  for f in "$dir"/worker-*.log; do
+    [ -f "$f" ] || continue
+    n="$(awk -F'complete: ' '/complete: [0-9]+ successful/ { split($2, a, " "); sum += a[1] } END { print sum + 0 }' "$f")"
+    total=$((total + n))
+  done
+  echo "$total"
+}
+
+# Sum the "$<cost> spent" figures out of one or more worker-summary logs, so
+# the end-of-night telemetry-analysis cost (below) can be reported alongside
+# the work-loop spend instead of in isolation. awk for float arithmetic
+# (bash can't do it, and this project already avoids `bc`).
+total_worker_spend() { # total_worker_spend <log-dir>
+  local dir="$1" f total=0 n
+  for f in "$dir"/worker-*.log; do
+    [ -f "$f" ] || continue
+    n="$(awk -F'\\$' '/successful iteration\(s\), \$/ { split($2, a, " "); sum += a[1] } END { print sum + 0 }' "$f")"
+    total="$(awk -v a="$total" -v b="$n" 'BEGIN { print a + b }')"
+  done
+  echo "$total"
 }
 
 verify() { # verify <workdir> <worker-summary> <label> ; returns VERIFY_CMD status
@@ -252,6 +297,13 @@ run_worker() { # run_worker <index> <workdir>
 }
 
 # ── main ─────────────────────────────────────────────────────────────────────
+# Guarded so tests can `source` this file (to reuse count_completed_iterations /
+# total_worker_spend / parse_result etc. directly) without kicking off the
+# actual overnight workflow — the guard is the standard `[[ $0 == source ]]`
+# idiom, not a behavior change for normal invocation (`./run-overnight.sh` or
+# `bash run-overnight.sh` still runs everything below exactly as before).
+if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
+
 log "Overnight run $RUN_ID: $PARALLEL_WORKERS worker(s), $MAX_ITERATIONS iters/worker, \$$MAX_TOTAL_COST_USD budget (\$$WORKER_BUDGET/worker), max-turns $MAX_TURNS/run."
 log "Permissions: $PERMISSION_FLAGS | OTel: $([ "$OTEL_ENABLED" = "1" ] && echo "on → $OTEL_EXPORTER_OTLP_ENDPOINT ($OTEL_EXPORTER_OTLP_PROTOCOL)" || echo "off")"
 [ -z "$VERIFY_CMD" ] && log "WARNING: VERIFY_CMD is empty — the deterministic verification gate is DISABLED. Set e.g. VERIFY_CMD='dotnet build && dotnet test'."
@@ -295,4 +347,41 @@ fi
 for f in "$LOG_DIR"/worker-*.log; do
   [ -f "$f" ] && { echo "── $(basename "$f") ──" >> "$SUMMARY"; cat "$f" >> "$SUMMARY"; }
 done
-log "Run complete. Review $LOG_DIR, 'bd ready', Question:/fix beads, and any worker branches."
+
+# End-of-night telemetry analysis: one fresh headless pass over the whole run's
+# telemetry + session artifacts, filing [token-efficiency] beads. Runs AFTER the
+# loop (so the run's OTel data has flushed) and only if any iteration completed.
+# Bounded tighter than a full build iteration (ANALYZE_MAX_TURNS/ANALYZE_TIMEOUT,
+# not MAX_TURNS/RUN_TIMEOUT) since it's a read-only mining pass, not agentic work.
+worker_spend="$(total_worker_spend "$LOG_DIR")"
+analyze_cost="0"
+if [ "$ANALYZE_TELEMETRY" = "1" ]; then
+  completed_total="$(count_completed_iterations "$LOG_DIR")"
+  if [ "${completed_total:-0}" -gt 0 ]; then
+    log "Analyzing telemetry for run $RUN_ID ($completed_total iteration(s) completed)..."
+    ANALYZE_LOG="$LOG_DIR/analyze-telemetry.log"
+    ( cd "$PROJECT_DIR" && \
+      PROM_URL="${PROM_URL:-http://prometheus:9090}" LOKI_URL="${LOKI_URL:-http://loki:3100}" \
+      OTEL_RESOURCE_ATTRIBUTES="service.name=overnight-analyzer,run.id=$RUN_ID" \
+      timeout "$ANALYZE_TIMEOUT" claude -p "/analyze-telemetry $RUN_ID" \
+        $PERMISSION_FLAGS --output-format stream-json --verbose --max-turns "$ANALYZE_MAX_TURNS" \
+    ) >"$ANALYZE_LOG" 2>&1
+    if [ $? -eq 0 ]; then
+      log "Telemetry analysis done. Filed beads: bd list --label token-efficiency"
+      analyze_parsed="$(parse_result "$ANALYZE_LOG" "$ANALYZE_LOG.result.txt")"
+      IFS='|' read -r _ analyze_cost _ _ <<< "$analyze_parsed"
+      analyze_cost="${analyze_cost:-0}"
+      [ -s "$ANALYZE_LOG.result.txt" ] && wlog "$SUMMARY" "  $(head -c 400 "$ANALYZE_LOG.result.txt" | tr '\n' ' ')"
+    else
+      log "Telemetry analysis failed (see $ANALYZE_LOG) — non-fatal."
+    fi
+  else
+    log "No completed iterations — skipping telemetry analysis."
+  fi
+fi
+total_reported_cost="$(awk -v w="$worker_spend" -v a="$analyze_cost" 'BEGIN { print w + a }')"
+log "Total reported cost this run: \$$total_reported_cost (workers: \$$worker_spend, telemetry analysis: \$$analyze_cost). NOTE: the analysis pass is not itself checked against MAX_TOTAL_COST_USD (the budget loop has already exited by the time it runs)."
+
+log "Run complete. Review $LOG_DIR, 'bd ready', Question:/fix + [token-efficiency] beads, and any worker branches."
+
+fi # end BASH_SOURCE guard

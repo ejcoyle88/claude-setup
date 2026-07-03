@@ -39,7 +39,7 @@ reviewer. Cover:
 - **Error handling** — failures caught at the right level (not swallowed);
   resources released on every path; meaningful propagation over silent failure.
 - **Concurrency correctness** — race conditions, deadlocks, shared mutable state,
-  unawaited async work, missing cancellation. Flag the *bug*, not the *slowness*
+  unawaited async work, missing cancellation. Flag the _bug_, not the _slowness_
   — throughput and contention cost belong to the performance reviewer.
 - **Maintainability** — naming, cohesion/coupling, duplication, dead code, and
   functions complex enough to be error-prone. Treat coverage/complexity
@@ -72,6 +72,7 @@ WHERE: filename:approx_line_number
 CATEGORY: quality
 ISSUE: what is wrong and why it matters.
 FIX: concrete suggestion or example snippet.
+
 ---
 
 If you cannot perform the review at all — empty or undecodable diff, missing
