@@ -3,8 +3,9 @@ name: dotnet-dependencies
 description: >-
   Dependency conventions AND review checks for .NET: license-awareness for
   once-default libraries that became commercial (MediatR, AutoMapper, Duende),
-  Central Package Management, vulnerability/deprecation checks, and using the
-  NuGet MCP for real-time package data. Use whenever adding, updating, replacing,
+  Central Package Management, vulnerability/deprecation checks, and finding
+  real-time package data via web search, context7, or nuget.org (no NuGet MCP
+  is configured). Use whenever adding, updating, replacing,
   or reviewing a NuGet dependency — or judging whether a new package is warranted,
   acceptably licensed, healthy, or safe — even if the task just says "add a
   package for X".
@@ -31,9 +32,10 @@ If the project already licenses these, use them normally.
 
 - **Central Package Management** (`Directory.Packages.props`) for version consistency.
 - Keep `dotnet list package --vulnerable` and `--deprecated` clean.
-- Use the **NuGet MCP** for real-time package info, framework-compatible version
-  recommendations, and vulnerable/transitive update tooling — don't rely on
-  memory for current versions or advisories.
+- No NuGet MCP server is configured in this environment. For real-time package
+  info, framework-compatible version recommendations, and advisories, use web
+  search, `context7` (library docs), or check nuget.org directly — don't rely
+  on memory for current versions or advisories.
 
 ## Review checklist
 
