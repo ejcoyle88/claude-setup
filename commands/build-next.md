@@ -106,15 +106,39 @@ put under git, since diff-based review and rollback both depend on it.
 1. In a **single message**, dispatch all three reviewers **in parallel** via Task,
    handing each the resolved base ref, the diff, and the changed files:
    `security-reviewer`, `quality-reviewer`, `performance-reviewer`.
-2. **Don't trust a `CANNOT REVIEW: <reason>` at face value** — verify it
-   against the diff you resolved above instead of accepting the self-report.
-   If that diff was non-empty and readable, treat the response as suspect:
-   re-dispatch that reviewer once; if it still returns CANNOT REVIEW, surface
-   the discrepancy as a 🟡 warning-level finding (so it survives the filter
-   step below) — do not silently drop it.
-3. Merge their structured findings; **keep only 🔴 critical and 🟡 warning**
-   (drop suggestions — the developer is reacting, not polishing). Deduplicate; on
-   overlap keep the higher severity and the clearer fix.
+2. **Verify each reviewer's response before trusting it — one re-dispatch
+   decision, covering both checks together.** For each reviewer, evaluate both
+   conditions before deciding whether to re-dispatch:
+   - *CANNOT REVIEW claim*: verify against the diff you resolved above instead
+     of accepting the self-report — was it truly empty/undecodable, did the
+     fetch truly fail. If the claim checks out as legitimate, the
+     coverage-completeness check below does not apply to that response — a
+     genuine bail-out owes no per-file accounting.
+   - *Coverage completeness*: on every completed review (any response other
+     than a verified-legitimate CANNOT REVIEW), the reviewer's response must
+     carry a `FILES REVIEWED: <list>` coverage note (its own line, after a
+     trailing `---`, never folded into a finding block) naming every file you
+     dispatched to it — unconditionally, regardless of how many findings it
+     returned or what their `WHERE` fields say. A missing note, or one that
+     omits a dispatched file, makes the response suspect. Don't accept a
+     finding's `WHERE` as a substitute for the note, even one that lists
+     several files at once — a single decoy finding whose `WHERE` names every
+     dispatched file would otherwise "prove" coverage without ever requiring
+     the note. (Extra files read for context beyond what was dispatched are
+     fine; only dispatched files going unaccounted for count.)
+
+   If either check is suspect, re-dispatch that reviewer **once**, re-checking
+   both on the retry; if either still fails, surface it as a single 🟡
+   warning-level finding (so it survives the filter step below) — do not
+   silently drop it. Evaluating both together caps this at one re-dispatch per
+   reviewer per round even when both misfire, closing both the bogus-bail-out
+   route and the faked-clean-pass route (including a decoy finding whose
+   `WHERE` lists every dispatched file at once) with one bounded mechanism.
+3. Strip any `FILES REVIEWED:` line from a response before merging — it's a
+   coverage note, not a finding. Merge the remaining structured findings;
+   **keep only 🔴 critical and 🟡 warning** (drop suggestions — the developer is
+   reacting, not polishing). Deduplicate; on overlap keep the higher severity
+   and the clearer fix.
 4. **If there are no blocking findings → go to Step 4.** The change is clean; do
    not spend a second cycle.
 5. Otherwise invoke **the same developer that implemented the bead** with the
@@ -125,8 +149,11 @@ put under git, since diff-based review and rollback both depend on it.
 **Round 2** (only reached if Round 1 had blocking findings)
 1. Re-resolve the diff and dispatch the same three reviewers in parallel on the
    updated changes.
-2. Merge and filter to blocking findings as before, applying the same
-   CANNOT REVIEW verification/re-dispatch-once check from Round 1.
+2. Apply the same combined verification as Round 1 (CANNOT REVIEW check, with
+   its legitimate-bail-out exemption, plus the unconditional coverage-note
+   check, capped at one re-dispatch per reviewer regardless of which condition
+   failed), strip any `FILES REVIEWED:` line, then merge and filter to
+   blocking findings as before.
 3. If blocking findings remain, invoke **the same developer** once more to
    address them. Then **stop — do not run a third review.**
 
