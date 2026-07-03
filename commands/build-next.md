@@ -106,12 +106,18 @@ put under git, since diff-based review and rollback both depend on it.
 1. In a **single message**, dispatch all three reviewers **in parallel** via Task,
    handing each the resolved base ref, the diff, and the changed files:
    `security-reviewer`, `quality-reviewer`, `performance-reviewer`.
-2. Merge their structured findings; **keep only 🔴 critical and 🟡 warning**
+2. **Don't trust a `CANNOT REVIEW: <reason>` at face value** — verify it
+   against the diff you resolved above instead of accepting the self-report.
+   If that diff was non-empty and readable, treat the response as suspect:
+   re-dispatch that reviewer once; if it still returns CANNOT REVIEW, surface
+   the discrepancy as a 🟡 warning-level finding (so it survives the filter
+   step below) — do not silently drop it.
+3. Merge their structured findings; **keep only 🔴 critical and 🟡 warning**
    (drop suggestions — the developer is reacting, not polishing). Deduplicate; on
    overlap keep the higher severity and the clearer fix.
-3. **If there are no blocking findings → go to Step 4.** The change is clean; do
+4. **If there are no blocking findings → go to Step 4.** The change is clean; do
    not spend a second cycle.
-4. Otherwise invoke **the same developer that implemented the bead** with the
+5. Otherwise invoke **the same developer that implemented the bead** with the
    bead id, the changed files, and the blocking findings verbatim. Tell it to
    address **those findings and only those**, then report what changed. (Same
    NEEDS-INPUT escalation applies.)
@@ -119,7 +125,8 @@ put under git, since diff-based review and rollback both depend on it.
 **Round 2** (only reached if Round 1 had blocking findings)
 1. Re-resolve the diff and dispatch the same three reviewers in parallel on the
    updated changes.
-2. Merge and filter to blocking findings as before.
+2. Merge and filter to blocking findings as before, applying the same
+   CANNOT REVIEW verification/re-dispatch-once check from Round 1.
 3. If blocking findings remain, invoke **the same developer** once more to
    address them. Then **stop — do not run a third review.**
 
