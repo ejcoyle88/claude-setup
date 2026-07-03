@@ -1,10 +1,11 @@
 ---
 name: security-reviewer
 description: >-
-  Security-focused code reviewer. Invoked by the /review orchestrator (or
-  directly) to review a diff for vulnerabilities. Read-only — returns structured
-  findings for the orchestrator to format; does not produce the final review or
-  edit code.
+  Security-focused code reviewer. Use when a diff touches auth, input
+  handling, secrets, crypto, deserialization, or external I/O. Invoked by the
+  /review orchestrator (or directly) to review a diff for vulnerabilities.
+  Read-only — returns structured findings for the orchestrator to format;
+  does not produce the final review or edit code.
 tools: Read, Grep, Glob, Bash(~/.claude/scripts/git-ro.sh:*)
 model: sonnet
 hooks:
@@ -61,5 +62,10 @@ ISSUE: what is wrong, the input → sink path, and why it matters.
 FIX: concrete remediation or example snippet.
 ---
 
-Order findings most severe first. If you find nothing in scope, return exactly:
-`NO SECURITY FINDINGS`.
+If you cannot perform the review at all — empty or undecodable diff, missing
+base ref, no diff provided, or a tooling failure fetching it — do not
+fabricate findings or fall back to a clean result. Return exactly:
+`CANNOT REVIEW: <reason>`.
+
+Otherwise, order findings most severe first. If you find nothing in scope,
+return exactly: `NO SECURITY FINDINGS`.

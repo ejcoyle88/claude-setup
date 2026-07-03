@@ -2,11 +2,14 @@
 name: quality-reviewer
 description: >-
   Quality-focused code reviewer — correctness, error handling, concurrency
-  correctness, maintainability, tests, and docs. Invoked by the /review
-  orchestrator (or directly). Read-only — returns structured findings for the
-  orchestrator to format; does not produce the final review or edit code.
+  correctness, maintainability, tests, and docs. Use when a diff changes
+  control flow or error handling, touches concurrent/async code, adds or
+  changes public APIs or tests, or grows in complexity/duplication. Invoked by
+  the /review orchestrator (or directly). Read-only — returns structured
+  findings for the orchestrator to format; does not produce the final review
+  or edit code.
 tools: Read, Grep, Glob, Bash(~/.claude/scripts/git-ro.sh:*)
-model: haiku
+model: sonnet
 hooks:
   PreToolUse:
     - matcher: Bash
@@ -64,5 +67,10 @@ ISSUE: what is wrong and why it matters.
 FIX: concrete suggestion or example snippet.
 ---
 
-Order findings most severe first. If you find nothing in scope, return exactly:
-`NO QUALITY FINDINGS`.
+If you cannot perform the review at all — empty or undecodable diff, missing
+base ref, no diff provided, or a tooling failure fetching it — do not
+fabricate findings or fall back to a clean result. Return exactly:
+`CANNOT REVIEW: <reason>`.
+
+Otherwise, order findings most severe first. If you find nothing in scope,
+return exactly: `NO QUALITY FINDINGS`.
