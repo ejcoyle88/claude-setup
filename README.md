@@ -248,6 +248,15 @@ within the repo (e.g. `./tools/run-overnight.sh`), not from `~/.claude/`.
 Global (`~/.claude/`) is the intended scope — this is a personal toolchain, not
 per-repo config. Per-project overrides still work from a repo's `.claude/`.
 
+**Deny-rule split**: secret-path deny rules for machine/user-wide locations
+(`~/.ssh/**`, `~/.aws/**`, `~/.claude/.credentials.json`, `~/.claude/.claude.json`,
+and the matching `jq`-specific patterns) live in `settings.shared.json` so they're
+version-controlled and reach every project via the `install.sh` merge. The
+`.env`/`.env.*` deny pair lives only in this repo's own `.claude/settings.json`
+(project-scoped) rather than also in `settings.shared.json`, to avoid two
+committed copies of the same rule — add the same pair to another project's own
+`.claude/settings.json` if you need it protected there too.
+
 ### Sandbox / overnight
 
 Copy `.devcontainer/` into the target repo and open it in a devcontainer. The

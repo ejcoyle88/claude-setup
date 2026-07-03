@@ -42,3 +42,6 @@ daemon.status.json
 jobs/
 .env
 .overnight-logs/
+
+# Personal, machine-local permission overrides — not shared project convention
+.claude/settings.local.json

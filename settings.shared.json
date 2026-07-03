@@ -1,5 +1,20 @@
 {
   "permissions": {
+    "deny": [
+      "Read(~/.ssh/**)",
+      "Edit(~/.ssh/**)",
+      "Read(~/.aws/**)",
+      "Edit(~/.aws/**)",
+      "Read(~/.claude/.credentials.json)",
+      "Edit(~/.claude/.credentials.json)",
+      "Read(~/.claude/.claude.json)",
+      "Edit(~/.claude/.claude.json)",
+      "Bash(jq * ~/.ssh/*)",
+      "Bash(jq * ~/.aws/*)",
+      "Bash(jq *.env*)",
+      "Bash(jq * ~/.claude/.credentials.json*)",
+      "Bash(jq * ~/.claude/.claude.json*)"
+    ],
     "allow": [
       "Bash(.specify/scripts/bash/setup-plan.sh:*)",
       "Bash(git checkout:*)",

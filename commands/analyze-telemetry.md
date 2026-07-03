@@ -6,7 +6,13 @@ description: >-
   group. Read-only except for filing beads. Invoked by run-overnight.sh after the
   work loop, or manually with a run id.
 argument-hint: "[run-id] [--dry-run]"
-allowed-tools: Read, Grep, Glob, Bash(bd create:*), Bash(bd list:*), Bash(bd show:*), Bash(curl -sf http://prometheus:9090/*), Bash(curl -sf http://loki:3100/*), Bash(cat .overnight-logs/*), Bash(jq:*)
+# No jq grant: Claude Code's Bash permission matching can't express "the only
+# path argument must be under .overnight-logs/" for a tool that accepts
+# multiple file operands and file-binding flags (--rawfile/--slurpfile/-f). A
+# leading-wildcard allow pattern here was found to let jq read arbitrary files
+# (e.g. ~/.docker/config.json) as long as some .overnight-logs/* path also
+# appeared on the line. Parse the JSON directly via Read/cat instead.
+allowed-tools: Read(.overnight-logs/**), Grep(.overnight-logs/**), Glob(.overnight-logs/**), Bash(bd create:*), Bash(bd list:*), Bash(bd show:*), Bash(curl -sf http://prometheus:9090/*), Bash(curl -sf http://loki:3100/*), Bash(cat .overnight-logs/*)
 model: opus
 ---
 
