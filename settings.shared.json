@@ -46,7 +46,12 @@
       "Bash(chmod:*)",
       "Bash(git config:*)",
       "mcp__serena__initial_instructions",
-      "mcp__serena__get_symbols_overview"
+      "mcp__serena__get_symbols_overview",
+      "mcp__ollama-mcp__ping",
+      "mcp__ollama-mcp__health",
+      "mcp__ollama-mcp__summarize_file",
+      "mcp__ollama-mcp__extract",
+      "mcp__ollama-mcp__classify"
     ],
     "defaultMode": "acceptEdits"
   },

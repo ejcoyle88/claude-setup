@@ -223,6 +223,45 @@ connected, then try the `ping` and `health` tools, followed by
 `summarize_file`/`extract`/`classify` against a real file once the `ollama`
 sidecar is up and healthy.
 
+### Enabling/disabling the offload
+
+This server is registered at **project scope** via `.mcp.json`, which is
+checked into the repo — so it's on by default for anyone who clones this repo
+and trusts its project MCP config (Claude Code will prompt to approve
+project-scoped servers from an unfamiliar repo on first use).
+
+To disable it for everyone who uses this repo (edits the tracked `.mcp.json`
+in your working tree — this is a shared-file change, not a personal one; it
+will show up in `git status` and you should be deliberate about whether/when
+to commit it):
+
+- Remove (or comment out) the `ollama-mcp` entry from `.mcp.json`, or
+- Run `claude mcp remove ollama-mcp --scope project`.
+
+To disable it only for yourself, without touching the shared `.mcp.json` at
+all, use local scope instead: `claude mcp remove ollama-mcp --scope local`
+records the removal in your personal, untracked Claude Code config, leaving
+`.mcp.json` and everyone else's setup untouched.
+
+Either way, no change to `settings.shared.json` is needed: the
+`mcp__ollama-mcp__*` allowlist entries there just grant permissions for tools
+that a removed/absent server will never expose, so leaving them in place is
+harmless. Re-enable by restoring the `.mcp.json` entry (or re-running
+`claude mcp add`, see above) — the allowlist already covers it.
+
+### Allowlist trust scope (cross-project caveat)
+
+The `mcp__ollama-mcp__*` entries in `settings.shared.json` (repo root) are
+merged into your *global* `~/.claude/settings.json` by `install.sh`, and they
+match purely on MCP server name + tool name — they carry no binding to this
+repo or this implementation. That means the auto-approval applies in **every
+project you open**, not just this one: if some other, unrelated project
+registers its own MCP server also named `ollama-mcp` exposing tools also named
+`ping`/`health`/`summarize_file`/`extract`/`classify`, calls to that server
+would be silently auto-approved too, with no guarantee it has this server's
+path-confinement or local-only-egress properties. Be aware of this before
+opening an unfamiliar repo that defines its own project-scoped `.mcp.json`.
+
 ## Follow-ups not built in this bead
 
 - **Glob support.** The design doc mentioned "a file path / glob"; this bead
