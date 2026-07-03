@@ -2,7 +2,7 @@
 name: developer-workflow
 description: >-
   Shared working scaffolding for the language-specialist developer subagents
-  (csharp-developer, rust-developer, and any future <lang>-developer): the
+  (csharp-developer, rust-developer, and any future language-specific developer): the
   establish-context-then-edit workflow, Serena symbol-aware navigation, the
   orchestrator escalation protocol, the quality gate, and the return contract.
   Preloaded into each developer via its `skills:` frontmatter. Keep
@@ -34,12 +34,13 @@ or grepping when navigating and editing *existing* code — they're symbol-aware
 more precise, and far more token-efficient. They add little value when writing
 new code from scratch; use normal file tools there.
 
-- `get_symbols_overview` to map a file's or directory's types and members.
-- `find_symbol` by name path to read only the symbol you need.
-- `find_referencing_symbols` before changing a signature or behaviour — impact
-  analysis, not a grep.
-- `replace_symbol_body` / `insert_before_symbol` / `insert_after_symbol` for
-  symbol-level edits; `rename_symbol` where the language server supports it.
+- `mcp__serena__get_symbols_overview` to map a file's or directory's types and members.
+- `mcp__serena__find_symbol` by name path to read only the symbol you need.
+- `mcp__serena__find_referencing_symbols` before changing a signature or behaviour —
+  impact analysis, not a grep.
+- `mcp__serena__replace_symbol_body` / `mcp__serena__insert_before_symbol` /
+  `mcp__serena__insert_after_symbol` for symbol-level edits; `mcp__serena__rename_symbol`
+  where the language server supports it.
 - Use plain `Read` / `Grep` / `Glob` for non-code files and text/filename search.
 - Symbol-tool quality depends on a healthy language server for *this* language;
   if results look empty or stale, fall back to `Read` / `Grep` rather than guessing.
