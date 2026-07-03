@@ -2,7 +2,7 @@
   "name": "ollama-mcp",
   "version": "0.1.0",
   "private": true,
-  "description": "Stdio MCP server that offloads work to a local Ollama instance (scaffold: health/ping only).",
+  "description": "Stdio MCP server that offloads bulk text work (summarize_file, extract, classify) to a local Ollama instance, plus ping/health checks.",
   "type": "module",
   "main": "dist/index.js",
   "engines": {
