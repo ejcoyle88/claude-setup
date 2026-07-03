@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Bisection script to find which test creates unwanted files/state.
-# Runs each matching test file one at a time via `npm test <file>` and
+# Runs each matching test file one at a time via `npm test -- <file>` and
 # stops at the first one whose run leaves POLLUTION_CHECK on disk.
 #
-# Dependencies: npm must be on PATH, and the project's `npm test <file>`
+# Dependencies: npm must be on PATH, and the project's `npm test -- <file>`
 # invocation must accept a single test file path (as most JS/TS test
 # runners - Jest, Vitest, etc. - do when invoked through `npm test --`).
 #
@@ -41,11 +41,32 @@ case "$TEST_PATTERN" in
   *) FIND_PATTERN="./$TEST_PATTERN" ;;
 esac
 
+# Capture find's output and exit status separately from sort's (pipefail is
+# scoped to this subshell only, so it doesn't change the rest of the script's
+# behavior under `set -e`). Without this, a genuine `find` failure (bad
+# -path argument, permission denied, etc.) would otherwise be swallowed by
+# the pipe into `sort` and surface as "Found 0 test files" instead of an
+# error, since a failure inside `< <(...)` process substitution isn't
+# checked by `set -e` either.
+if FIND_OUTPUT=$(set -o pipefail; find . -path "$FIND_PATTERN" | sort); then
+  FIND_STATUS=0
+else
+  FIND_STATUS=$?
+fi
+if [ "$FIND_STATUS" -ne 0 ]; then
+  echo "Error: 'find' failed (exit $FIND_STATUS) while searching for pattern: $TEST_PATTERN" >&2
+  exit 1
+fi
+
 # Get list of test files, newline-safe (avoids word-splitting on filenames
 # with spaces/globs, unlike `for f in $TEST_FILES`). A read loop is used
 # instead of `mapfile` for Bash 3.2 compatibility (stock macOS /bin/bash).
+# Guard against FIND_OUTPUT being empty: a legitimately-empty match set
+# must produce TOTAL=0, not a single empty-string entry from `<<<`.
 TEST_FILES=()
-while IFS= read -r f; do TEST_FILES+=("$f"); done < <(find . -path "$FIND_PATTERN" | sort)
+if [ -n "$FIND_OUTPUT" ]; then
+  while IFS= read -r f; do TEST_FILES+=("$f"); done <<< "$FIND_OUTPUT"
+fi
 TOTAL="${#TEST_FILES[@]}"
 
 echo "Found $TOTAL test files"
@@ -74,9 +95,15 @@ for TEST_FILE in "${TEST_FILES[@]}"; do
   # so a FAILING run is distinguished from a CLEAN one instead of silently
   # swallowing the exit code. Avoiding a temp file also means test stdout/
   # stderr (which can contain env dumps, tokens, connection strings) is
-  # never persisted to disk, even transiently.
+  # never persisted to disk, even transiently. `--` forwards $TEST_FILE to
+  # the underlying test runner as documented above; without it, npm may
+  # drop the positional arg and silently run the whole suite instead of
+  # just this file. Output is piped through `tail -c` (with `pipefail`
+  # scoped to this subshell so npm's real exit code, not tail's, is what
+  # gets checked) to bound memory in case a hanging/looping test produces
+  # unbounded output; only the last 20 lines are ever displayed (below).
   TEST_OUTPUT=""
-  if TEST_OUTPUT=$(npm test "$TEST_FILE" 2>&1); then
+  if TEST_OUTPUT=$(set -o pipefail; npm test -- "$TEST_FILE" 2>&1 | tail -c 1000000); then
     TEST_RESULT="clean"
   else
     TEST_RESULT="failing"
@@ -102,7 +129,7 @@ for TEST_FILE in "${TEST_FILES[@]}"; do
       echo ""
     fi
     echo "To investigate:"
-    echo "  npm test $TEST_FILE    # Run just this test"
+    echo "  npm test -- $TEST_FILE    # Run just this test"
     echo "  cat $TEST_FILE         # Review test code"
     exit 1
   fi
@@ -112,7 +139,7 @@ echo ""
 if [ -n "$FAILING_TESTS" ]; then
   echo "✅ No polluter found - but some test runs FAILED (unrelated to pollution):"
   printf "%b" "$FAILING_TESTS" | sed 's/^/   - /'
-  echo "Re-run 'npm test <file>' on the failing file(s) above to see full output."
+  echo "Re-run 'npm test -- <file>' on the failing file(s) above to see full output."
   exit 2
 fi
 
