@@ -1,0 +1,24 @@
+{
+  "name": "ollama-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Stdio MCP server that offloads work to a local Ollama instance (scaffold: health/ping only).",
+  "type": "module",
+  "main": "dist/index.js",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.0",
+    "typescript": "^5.7.3"
+  }
+}
