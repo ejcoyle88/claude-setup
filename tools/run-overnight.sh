@@ -45,6 +45,11 @@
 #       before any tokens are spent — and (b) after every claude run, BEFORE the
 #       iteration counts as a success. Don't trust the model's claim that tests
 #       pass; check. Empty = gate disabled (warned loudly).
+#   PRE_ITERATION_CMD=""     runs in the workdir before EACH claude launch.
+#       For the config-repo dogfood setup: PRE_ITERATION_CMD="./install.sh"
+#       re-links newly added/removed skills/agents/commands so each fresh
+#       iteration sees the current suite. Failure counts as a failed iteration
+#       (claude is not launched on a broken setup step).
 #   MAX_TURNS=150            per-run agentic turn cap (claude --max-turns)
 #   MAX_TOTAL_COST_USD=50    whole-run budget; split evenly across workers.
 #       Read from stream-json result events. NOTE: on a subscription plan the
@@ -69,6 +74,7 @@ SLEEP_BETWEEN="${SLEEP_BETWEEN:-15}"
 PERMISSION_FLAGS="${PERMISSION_FLAGS:---permission-mode auto}"
 STOP_FILE="${STOP_FILE:-$PROJECT_DIR/.stop-overnight}"
 VERIFY_CMD="${VERIFY_CMD:-}"
+PRE_ITERATION_CMD="${PRE_ITERATION_CMD:-}"
 MAX_TURNS="${MAX_TURNS:-150}"
 MAX_TOTAL_COST_USD="${MAX_TOTAL_COST_USD:-50}"
 PARALLEL_WORKERS="${PARALLEL_WORKERS:-1}"
@@ -185,6 +191,19 @@ run_worker() { # run_worker <index> <workdir>
 
     local tag; tag="w$idx-iter-$(printf '%02d' "$i")"
     local ilog="$LOG_DIR/$tag.log"
+
+    if [ -n "$PRE_ITERATION_CMD" ]; then
+      if ! ( cd "$workdir" && bash -c "$PRE_ITERATION_CMD" ) >>"$wsum" 2>&1; then
+        consec=$((consec + 1))
+        wlog "$wsum" "PRE_ITERATION_CMD failed ($consec consecutive) — skipping claude launch this iteration."
+        if [ "$consec" -ge "$MAX_CONSEC_FAILURES" ]; then
+          wlog "$wsum" "Hit $MAX_CONSEC_FAILURES consecutive failures — halting worker."
+          break
+        fi
+        sleep "$SLEEP_BETWEEN"; continue
+      fi
+    fi
+
     wlog "$wsum" "Iteration $i: $n ready bead(s); spent \$$spent of \$$WORKER_BUDGET. Launching claude..."
 
     ( cd "$workdir" && \
