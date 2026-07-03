@@ -30,16 +30,35 @@ echo "🔍 Searching for test that creates: $POLLUTION_CHECK"
 echo "Test pattern: $TEST_PATTERN"
 echo ""
 
-# Get list of test files
-TEST_FILES=$(find . -path "$TEST_PATTERN" | sort)
-TOTAL=$(echo "$TEST_FILES" | wc -l | tr -d ' ')
+# Search root is `.`, so GNU find prepends `./` to every path it walks.
+# `-path` does a literal(-ish) match against that prepended path, so a
+# pattern with no leading `./` (e.g. 'src/**/*.test.ts', as documented in
+# the Usage example above) would never match anything. Normalize the
+# pattern to always start with `./`, without double-prefixing a pattern
+# the caller already wrote with one.
+case "$TEST_PATTERN" in
+  ./*) FIND_PATTERN="$TEST_PATTERN" ;;
+  *) FIND_PATTERN="./$TEST_PATTERN" ;;
+esac
+
+# Get list of test files, newline-safe (avoids word-splitting on filenames
+# with spaces/globs, unlike `for f in $TEST_FILES`). A read loop is used
+# instead of `mapfile` for Bash 3.2 compatibility (stock macOS /bin/bash).
+TEST_FILES=()
+while IFS= read -r f; do TEST_FILES+=("$f"); done < <(find . -path "$FIND_PATTERN" | sort)
+TOTAL="${#TEST_FILES[@]}"
 
 echo "Found $TOTAL test files"
 echo ""
 
+if [ "$TOTAL" -eq 0 ]; then
+  echo "No test files matched pattern: $TEST_PATTERN"
+  exit 0
+fi
+
 COUNT=0
 FAILING_TESTS=""
-for TEST_FILE in $TEST_FILES; do
+for TEST_FILE in "${TEST_FILES[@]}"; do
   COUNT=$((COUNT + 1))
 
   # Skip if pollution already exists
