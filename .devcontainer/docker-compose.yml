@@ -91,9 +91,69 @@ services:
       - prometheus
       - loki
 
+  ollama:
+    image: ollama/ollama:latest
+    # No host ports: the devcontainer reaches this by service name,
+    # ollama:11434, over the pinned 172.28.0.0/24 network that
+    # init-firewall.sh's HOST_NETWORK rule already permits — same story as
+    # otel-collector above. Model select/pull and the MCP that talks to this
+    # sidecar are handled by later beads; this just needs to exist and be
+    # reachable.
+    #
+    # Egress: unlike devcontainer, this service is OUTSIDE init-firewall.sh's
+    # allowlist — that script only runs inside the devcontainer service's own
+    # network namespace (it's the only service with NET_ADMIN/NET_RAW), so it
+    # can't and doesn't constrain ollama's outbound traffic. Ollama currently
+    # has unrestricted internet egress. Fine for the ping/health-check use
+    # case in this bead; egress hardening for this service must be revisited
+    # before the MCP / model-pull beads route real (possibly adversarial)
+    # traffic through it.
+    volumes:
+      - ollama-models:/root/.ollama
+    # CPU-only by default on every host, including Docker Desktop / Mac: a
+    # `deploy.resources.reservations.devices` block with `driver: nvidia`
+    # does NOT silently fall back to CPU when the NVIDIA Container Toolkit
+    # is missing — `docker compose up` fails container creation outright
+    # ("could not select device driver nvidia"), and with no restart policy
+    # the service just sits exited. So the GPU reservation lives on the
+    # opt-in `ollama-gpu` service below instead of here, keeping the base
+    # stack working everywhere. For the GPU path on a Linux host with the
+    # NVIDIA Container Toolkit installed, bring that variant up instead:
+    #   docker compose --profile gpu up -d --scale ollama=0 ollama-gpu
+    deploy:
+      resources:
+        limits:
+          # Provisional cap for a small instruct model on the shared stack
+          # (devcontainer + 5 sidecars) — a model load with no ceiling can
+          # OOM the host and take the devcontainer down with it. Revisit
+          # once claude-r30.2 picks the actual model.
+          memory: 8g
+
+  # Opt-in GPU variant of the ollama service above (same image/volume/egress
+  # posture — see the comments there). Only takes effect on a Linux host
+  # with the NVIDIA Container Toolkit installed; gated behind the `gpu`
+  # profile so it never runs, and never breaks `docker compose up`, unless
+  # explicitly requested.
+  ollama-gpu:
+    image: ollama/ollama:latest
+    profiles: ["gpu"]
+    volumes:
+      - ollama-models:/root/.ollama
+    deploy:
+      resources:
+        limits:
+          # Same provisional cap as the CPU service — see comment above.
+          memory: 8g
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
 volumes:
   claude-code-bashhistory:
   claude-code-config:
+  ollama-models:
 
 networks:
   default:
