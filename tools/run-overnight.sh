@@ -789,8 +789,22 @@ check_telemetry_health() {
   local otlp_port="${otlp_hostport##*:}"
   otlp_port="${otlp_port%%/*}"
   if [ -n "$otlp_host" ] && [ -n "$otlp_port" ]; then
-    if (exec 3<>"/dev/tcp/$otlp_host/$otlp_port") 2>/dev/null; then
-      exec 3<&- 3>&- 2>/dev/null
+    # claude-eti: bounded with `timeout 5`, matching the curl legs in this
+    # function (--max-time 5). Without it, a dropped-SYN scenario (partition,
+    # bad DNS, a host firewalled to silently drop rather than actively refuse)
+    # blocks on the OS-level TCP connect timeout -- unbounded from bash's
+    # perspective, easily well over a minute -- which defeats the "bounded,
+    # negligible-cost end-of-run check" property every other leg here upholds.
+    # Run the /dev/tcp connect in its own `bash -c` subprocess (not just a
+    # subshell) so `timeout` has a distinct process to SIGTERM if the connect
+    # is still blocked at 5s; host/port are passed as args ($1/$2, with `_`
+    # standing in for $0) rather than interpolated into the single-quoted
+    # script. otel-collector's image is `scratch`-based with no shell/curl/
+    # wget (see this service's docker-compose.yml comment) and its config
+    # here has no `health_check` extension configured, so there's no HTTP
+    # health surface to probe instead -- this raw TCP connect is the only
+    # option without adding a probe extension to the collector image.
+    if timeout 5 bash -c 'exec 3<>"/dev/tcp/$1/$2"' _ "$otlp_host" "$otlp_port" 2>/dev/null; then
       log "Telemetry health: otel-collector OTLP port ($otlp_host:$otlp_port) accepting connections."
     else
       log "TELEMETRY HEALTH WARNING: otel-collector OTLP port ($otlp_host:$otlp_port) did not accept a connection at end of run. Exports since it went down were dropped SILENTLY — the OTel SDK does not retry-and-fail-loud on a dead endpoint (see this script's OTEL_ENABLED docs above). Check 'docker compose ps otel-collector' and its restart count (memory cap + restart: on-failure:5 — that budget may have been exhausted, or it may be down for another reason)."
