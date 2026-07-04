@@ -54,7 +54,16 @@ jobs:
     outputs:
       observability: ${{ steps.filter.outputs.observability }}
     steps:
+      # Full history: dorny/paths-filter diffs against github.event.before on
+      # push events, and a depth-1 checkout won't have that commit. The
+      # action can fetch missing history itself as a fallback, but relying on
+      # that silently is fragile -- if it ever fails quietly (shallow-history
+      # edge cases, force-pushes), the filter could resolve to `false` on a
+      # genuinely relevant .devcontainer/** push and silently skip
+      # observability-smoke-tests on the exact change it exists to catch.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706 # v4
         id: filter
