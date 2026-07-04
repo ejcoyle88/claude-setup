@@ -49,6 +49,25 @@
 #       from a genuine operator Ctrl+C in the top-level summary (see
 #       run_worker's graceful-stop check) rather than left silent.
 #
+#   Ctrl+C (interactive, two-stage cancel — claude-23n / claude-14w): 1st
+#       Ctrl+C is graceful — like touching STOP_FILE, it stops new iterations
+#       from being launched but lets the in-flight claude run finish, then
+#       exits. 2nd Ctrl+C is a hard-kill — it terminates the in-flight claude
+#       process (and its `timeout` wrapper) immediately via its process
+#       group, then exits. STOP_FILE and Ctrl+C are the same graceful-stop
+#       INTENT expressed two ways — one from another terminal/unattended
+#       context, one interactively — but Ctrl+C never creates or leaves
+#       behind the STOP_FILE itself (nor is it the same thing as the internal
+#       _OVERNIGHT_STOP_FLAG_FILE used to propagate a Ctrl+C's graceful-stop
+#       request across worker processes in PARALLEL_WORKERS>1 mode — that's
+#       an implementation detail, documented at its definition). Either form
+#       of Ctrl+C skips the end-of-night /analyze-telemetry pass (worker
+#       summaries and the telemetry-health check still run), and the run
+#       exits non-zero — 1 for a graceful (1st-signal-only) stop, 130 for a
+#       hard-killed (2nd-signal) one. Full mechanism: see the "── Signal
+#       handling (claude-23n / claude-14w)" block and the
+#       _overnight_interrupt_handler() docstring, both below.
+#
 #   MCP trust gate (claude-9hl): headless `claude -p` auto-connects a
 #       project's .mcp.json MCP servers with NO trust prompt and no fail-closed
 #       behavior (verified in claude-1bz; see tools/ollama-mcp/README.md's
