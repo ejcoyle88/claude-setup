@@ -325,6 +325,90 @@ that a removed/absent server will never expose, so leaving them in place is
 harmless. Re-enable by restoring the `.mcp.json` entry (or re-running
 `claude mcp add`, see above) — the allowlist already covers it.
 
+### Concurrent-session contention (claude-6ll)
+
+Because this server is registered at **project scope** (see above), every
+Claude Code session opened against this repo spawns its own independent
+`node dist/index.js` process — and every one of those processes talks to the
+*same single* `OLLAMA_HOST` sidecar (one CPU-only `llama3.2:3b` instance, no
+built-in request queue/pooling coordination between ollama-mcp processes).
+`claude-6ll` benchmarked how much concurrent `/api/generate` load that shared
+sidecar actually sustains, using
+[`benchmark-concurrency.mjs`](./benchmark-concurrency.mjs) (fires N concurrent
+`/api/generate` calls directly at the live sidecar, for increasing N, and times
+each). Run it yourself: `node tools/ollama-mcp/benchmark-concurrency.mjs`.
+
+**Measured, in this sandbox** (CPU-only, `deploy.resources.limits.memory: 8g`
+on a host with well under that much physical RAM actually free — see
+`.devcontainer/docker-compose.yml`'s `ollama` service and
+`.devcontainer/Dockerfile.ollama`/`ollama-entrypoint.sh` for the container's
+setup; neither sets `OLLAMA_NUM_PARALLEL`/`OLLAMA_MAX_QUEUE`, so Ollama's own
+defaults apply — auto-selected `OLLAMA_NUM_PARALLEL` based on available
+memory, `OLLAMA_MAX_QUEUE` 512):
+
+| Concurrency (N) | Successes | Notes |
+| --- | --- | --- |
+| 1 | 1/1 | ~38.8s single-call latency — already ~65% of `GENERATE_TIMEOUT_MS` (60s) on its own. |
+| 2 | 1/2 | One call completed in ~34.7s; the other never got a response and hit the full 60s client timeout. |
+| 4 | 1/4 | One call completed in ~40s; the other three all timed out at 60s. |
+| 8 | 0/8 | **All eight** timed out at 60s — even the request that would've been "first in line" never completed. |
+
+**Decision: this needed a mitigation, not just a documented limitation.** The
+bead's own criterion was whether contention shows up "at a concurrency level
+that's realistically reachable (e.g. 2-3 concurrent Claude Code sessions each
+doing one offload call)" — the N=2 row above *is* that scenario, and it
+already produces a hard failure (`isError: true`, generic 60s timeout) for one
+of the two sessions. Recording that as an accepted limitation without changing
+anything would leave a second concurrent session silently eating a full 60s
+wait for a failure it could have been told about immediately.
+
+**What's implemented (`src/index.ts`, `acquireGenerateLock`/
+`releaseGenerateLock`/`callOllamaGenerate`):** a cross-process, fail-fast
+advisory lock, keyed off `OLLAMA_HOST` and stored as a file in `tmpdir()`
+(shared by every ollama-mcp process on this host, unlike an in-process
+semaphore, which can't coordinate across the separate OS processes each
+Claude Code session spawns). Every `/api/generate` call — both
+`generateStructured`'s first attempt and its retry — acquires this lock
+first:
+
+- If uncontended, it acquires immediately, makes the real call, and releases
+  the lock afterward (success or failure either way).
+- If another ollama-mcp process currently holds it, the call **fails
+  immediately** with a clear "sidecar is busy, retry shortly" error — it does
+  **not** wait in a queue. Given the ~38.8s single-call baseline above (~65%
+  of the 60s budget), queueing a second call behind a first would frequently
+  blow through `GENERATE_TIMEOUT_MS` before the second call had done any real
+  work anyway; failing fast turns an opaque, minute-long timeout into an
+  immediate, actionable signal instead.
+- A held lock older than `GENERATE_LOCK_STALE_MS` (3 minutes — comfortably
+  past the ~90s worst case a legitimate call can take with its retry, see
+  `RETRY_TIMEOUT_MS`'s doc comment) is treated as abandoned by a crashed
+  holder and reclaimed, so one killed process can't wedge every other session
+  behind a lock nobody will ever release.
+- Any unexpected lock-mechanics failure (unwritable `tmpdir()`, etc.)
+  degrades to "proceed without coordination" (today's pre-`claude-6ll`
+  behavior) rather than breaking every generate call — this lock is a
+  best-effort mitigation for measured contention, not a correctness boundary
+  the tools depend on to function at all.
+
+Verified end-to-end (not just unit-level): two separate `node dist/index.js`
+processes, each driven through the real MCP client SDK exactly as two
+concurrent Claude Code sessions would, both calling `summarize_file` at the
+same instant — one lost the race and returned the busy error in ~20ms, the
+other proceeded uncontended and completed normally in ~19s.
+
+**Residual gap, by design, not closed by this mitigation:** the lock tracks
+this *local* bookkeeping, not Ollama's actual internal state. If a caller's
+client-side `AbortController` fires at `GENERATE_TIMEOUT_MS` and gives up, this
+releases the lock even though Ollama may still be processing that abandoned
+request server-side for some time afterward — a freshly-acquiring caller can
+still land on a sidecar that's still busy with the abandoned request during
+that window. Closing that fully would require either a lower-level integration
+with Ollama's own queue/worker state or accepting a slower fail-fast (waiting
+out a supposedly-released lock's likely tail), neither of which was judged
+worth the added complexity for a CPU-only local dev sidecar — flagged here for
+awareness, not proposed as a follow-up bead.
+
 ### Allowlist trust scope (cross-project caveat)
 
 The `mcp__ollama-mcp__*` entries in `settings.shared.json` (repo root) are

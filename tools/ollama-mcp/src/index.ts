@@ -11,8 +11,10 @@
  * confined to WORKSPACE_ROOT (see `resolveWorkspacePath`) -- no absolute
  * path, `../` traversal, or symlink can read a file outside it.
  */
+import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
-import { open, realpath, stat } from "node:fs/promises";
+import { open, readFile, realpath, stat, unlink } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import * as path from "node:path";
 import * as readline from "node:readline";
 import { fileURLToPath } from "node:url";
@@ -59,6 +61,54 @@ const GENERATE_TIMEOUT_MS = 60_000;
  * GENERATE_TIMEOUT_MS (~90s) instead, closer to the pre-retry ~60s ceiling
  * this bead's retry logic added latency on top of. */
 const RETRY_TIMEOUT_MS = Math.round(GENERATE_TIMEOUT_MS / 2);
+
+/** claude-6ll: cross-process advisory lock guarding every outbound
+ * `/api/generate` call (see `acquireGenerateLock`/`releaseGenerateLock`
+ * below). This repo registers ollama-mcp at *project scope*
+ * (`.mcp.json`), so every Claude Code session opened against this repo
+ * spawns its OWN `node dist/index.js` process, and all of those independent
+ * processes share the same single `OLLAMA_HOST` sidecar with no queue/pool
+ * coordination between them -- an in-process semaphore in one process
+ * cannot serialize calls another process makes, so this coordinates via a
+ * lock FILE (shared filesystem: every ollama-mcp process on this host sees
+ * the same `tmpdir()`), not an in-memory data structure.
+ *
+ * This isn't a wait-in-line queue -- it's fail-fast, on purpose. A real
+ * benchmark (`benchmark-concurrency.mjs`, run against this sidecar's
+ * CPU-only llama3.2:3b) measured a single uncontended `/api/generate` call
+ * at ~35-40s wall time -- already 60-65% of GENERATE_TIMEOUT_MS -- so
+ * *waiting* for a prior call to finish before even starting a second one
+ * would frequently blow through GENERATE_TIMEOUT_MS on its own, before the
+ * second call has done any work. Since there's no slack in the timeout
+ * budget to queue politely, a caller that finds the lock already held gets
+ * an immediate, clearly-worded "busy, retry shortly" error instead of
+ * silently occupying a tool-call slot for up to 60s only to time out anyway
+ * -- see README's "Concurrent-session contention" section for the measured
+ * numbers this design responds to (2 concurrent calls already produced one
+ * hard timeout; 8 concurrent calls produced zero successes).
+ */
+const GENERATE_LOCK_PATH = path.join(
+  tmpdir(),
+  `ollama-mcp-generate-${createHash("sha256").update(OLLAMA_HOST).digest("hex").slice(0, 16)}.lock`,
+);
+
+/** How old an existing lock file must be before a blocked caller reclaims it
+ * instead of reporting "busy" (see `acquireGenerateLock`). Must comfortably
+ * exceed the ~1.5x GENERATE_TIMEOUT_MS (~90s) worst case a single
+ * *well-behaved* call can legitimately hold the lock (first attempt +
+ * retry, see RETRY_TIMEOUT_MS's doc comment) -- otherwise a live, in-flight
+ * call's lock could be mistaken for stale and reclaimed out from under it,
+ * letting two calls proceed concurrently anyway. Long enough past that
+ * worst case to avoid false reclaims, short enough that a genuinely crashed
+ * holder (process killed, container restarted mid-call) doesn't wedge every
+ * other ollama-mcp process on this host behind a lock nobody will ever
+ * release. */
+const GENERATE_LOCK_STALE_MS = 3 * 60_000;
+
+type LockAcquireResult =
+  | { state: "acquired" }
+  | { state: "unavailable" }
+  | { state: "busy"; heldForMs: number };
 
 /** Upper bound, in characters, on the file content sent to Ollama in a single
  * request. This is a crude proxy for tokens (roughly 4 chars/token for
@@ -678,6 +728,101 @@ async function readLineRange(filePath: string, start: number, endLine?: number):
 
 type GenerateResult = { ok: true; response: string } | { ok: false; error: string };
 
+/** Attempts to atomically create GENERATE_LOCK_PATH via the `wx` open flag
+ * (fails with EEXIST if the file already exists) -- the standard
+ * dependency-free pattern for a filesystem-based mutex, since file creation
+ * with O_EXCL is atomic at the OS level (no separate exists-check-then-create
+ * race). On success, writes this process's pid + acquisition time into the
+ * file (used by a subsequent blocked caller to judge staleness) and reports
+ * "acquired" -- the caller must call `releaseGenerateLock` when done. On
+ * EEXIST, reads the existing lock's age: if it's older than
+ * GENERATE_LOCK_STALE_MS, assumes the prior holder crashed without
+ * releasing, reclaims it (unlink + one retry of the create), and otherwise
+ * reports "busy" with how long the current holder has held it (surfaced in
+ * the caller-facing error message so a busy response is diagnosable, not
+ * just "try again"). Never throws: any unexpected lock-mechanics failure
+ * (permissions, a missing/unwritable tmpdir, ...) reports "unavailable" so
+ * the caller falls back to today's pre-claude-6ll behavior (proceed without
+ * cross-process coordination) rather than making every generate call fail
+ * because an ancillary coordination mechanism broke -- this lock is a
+ * best-effort mitigation for measured contention, not a correctness
+ * boundary this tool depends on to function at all. */
+async function acquireGenerateLock(): Promise<LockAcquireResult> {
+  const tryCreate = async (): Promise<"acquired" | "exists" | "unavailable"> => {
+    try {
+      const handle = await open(GENERATE_LOCK_PATH, "wx");
+      try {
+        await handle.writeFile(JSON.stringify({ pid: process.pid, acquiredAt: Date.now() }));
+      } finally {
+        await handle.close();
+      }
+      return "acquired";
+    } catch (error) {
+      if (error && typeof error === "object" && "code" in error && error.code === "EEXIST") {
+        return "exists";
+      }
+      console.error(`ollama-mcp: could not acquire generate lock (${GENERATE_LOCK_PATH}), proceeding without it:`, error);
+      return "unavailable";
+    }
+  };
+
+  const first = await tryCreate();
+  if (first !== "exists") {
+    return first === "acquired" ? { state: "acquired" } : { state: "unavailable" };
+  }
+
+  let acquiredAt: number | undefined;
+  try {
+    const holder = JSON.parse(await readFile(GENERATE_LOCK_PATH, "utf8")) as { acquiredAt?: unknown };
+    acquiredAt = typeof holder.acquiredAt === "number" ? holder.acquiredAt : undefined;
+  } catch {
+    // Unreadable/corrupt/already-removed lock file -- treated as
+    // indeterminate age below (Number.POSITIVE_INFINITY), which is always
+    // "stale" -- safer to reclaim an unreadable lock than to trust an age we
+    // couldn't determine and report "busy" against a lock that may not even
+    // reflect a live holder.
+  }
+  const heldForMs = acquiredAt === undefined ? Number.POSITIVE_INFINITY : Date.now() - acquiredAt;
+
+  if (heldForMs <= GENERATE_LOCK_STALE_MS) {
+    return { state: "busy", heldForMs };
+  }
+
+  // Stale -- reclaim it. Best-effort unlink (another process may have won
+  // the same race and already removed/replaced it); either way, one more
+  // create attempt decides the outcome. If that retry still finds it
+  // occupied (another process reclaimed and re-acquired first), report
+  // "busy" rather than looping further -- bounded to a single reclaim
+  // attempt per call, same fail-fast philosophy as the rest of this lock.
+  try {
+    await unlink(GENERATE_LOCK_PATH);
+  } catch {
+    // Already gone / lost the race -- fall through to the retry below.
+  }
+  const retry = await tryCreate();
+  if (retry === "acquired") {
+    return { state: "acquired" };
+  }
+  if (retry === "unavailable") {
+    return { state: "unavailable" };
+  }
+  return { state: "busy", heldForMs: 0 };
+}
+
+/** Releases a lock previously acquired by `acquireGenerateLock` (only ever
+ * called when that returned `{ state: "acquired" }` -- never for
+ * "unavailable", which never created the file, or "busy", which never held
+ * it). Best-effort: an already-missing file (e.g. reclaimed by another
+ * process as stale while this call was still finishing, an edge case bounded
+ * by GENERATE_LOCK_STALE_MS) is not an error worth surfacing. */
+async function releaseGenerateLock(): Promise<void> {
+  try {
+    await unlink(GENERATE_LOCK_PATH);
+  } catch (error) {
+    console.error(`ollama-mcp: failed to release generate lock (${GENERATE_LOCK_PATH}), leaving it in place:`, error);
+  }
+}
+
 /** POSTs a single non-streaming prompt to /api/generate, optionally
  * constraining the output with Ollama's structured-output `format` field
  * (either the literal string "json" or a JSON-Schema-like object -- see
@@ -686,12 +831,41 @@ type GenerateResult = { ok: true; response: string } | { ok: false; error: strin
  * same pattern as `checkOllamaHealth`. `timeoutMs` defaults to
  * GENERATE_TIMEOUT_MS but can be overridden -- `generateStructured` passes
  * a shorter RETRY_TIMEOUT_MS for its retry call (see that constant's doc
- * comment for why). */
+ * comment for why).
+ *
+ * claude-6ll: every call first goes through `acquireGenerateLock` -- a
+ * cross-process, fail-fast serialization point (see its doc comment and
+ * GENERATE_LOCK_PATH's for why this exists and why it fails fast instead of
+ * queueing). A caller that finds the sidecar already busy gets an immediate,
+ * clearly-worded error here and never even issues the HTTP request -- it
+ * does NOT wait, since the measured single-call latency on this sidecar
+ * (~35-40s) leaves too little of GENERATE_TIMEOUT_MS's budget to wait
+ * through another full call first. Note this only serializes calls this
+ * lock actually knows about: an abandoned call (client gave up at
+ * GENERATE_TIMEOUT_MS but Ollama may still be processing it server-side
+ * after this releases the lock) can still leave a brief window where a
+ * freshly-acquiring caller's request lands on a still-busy sidecar anyway --
+ * a residual gap this fail-fast design doesn't fully close, documented in
+ * README's "Concurrent-session contention" section. */
 async function callOllamaGenerate(
   prompt: string,
   format?: "json" | Record<string, unknown>,
   timeoutMs: number = GENERATE_TIMEOUT_MS,
 ): Promise<GenerateResult> {
+  const lock = await acquireGenerateLock();
+  if (lock.state === "busy") {
+    const heldForDescription = Number.isFinite(lock.heldForMs) ? `${Math.round(lock.heldForMs / 1000)}s` : "an indeterminate time";
+    return {
+      ok: false,
+      error:
+        "ollama sidecar is busy serving another generate request from a different ollama-mcp session on this " +
+        `host (held for ~${heldForDescription}). This CPU-only, single-instance sidecar was measured to fail ` +
+        "concurrent /api/generate calls rather than queue them gracefully within the timeout budget (see " +
+        "README's \"Concurrent-session contention\" section) -- retry shortly once the other session's call " +
+        "finishes.",
+    };
+  }
+
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
@@ -721,6 +895,9 @@ async function callOllamaGenerate(
     return { ok: false, error: timedOut ? `timed out after ${timeoutMs}ms` : message };
   } finally {
     clearTimeout(timer);
+    if (lock.state === "acquired") {
+      await releaseGenerateLock();
+    }
   }
 }
 
