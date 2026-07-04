@@ -38,6 +38,28 @@ save. Only the path goes in; only a summary/extracted-fields/label comes out.
   generation is retried once with the identical prompt before giving up. If
   the retry also fails, this returns `isError: true` with a message
   describing what was wrong, never a partially-parsed or best-guess result.
+
+  `path` may also be a **glob pattern** — anything containing `*`, `?`, or
+  `[` — matching several files at once (bead claude-1nx): `*` (any run of
+  characters within one path segment), `?` (exactly one character),
+  `[...]`/`[!...]` (POSIX-style character classes/negation), and `**` (zero
+  or more whole path segments, e.g. `src/**/*.ts`); no brace expansion
+  (`{a,b}`). When `path` is a glob pattern, `startLine`/`endLine` and (for
+  `summarize_file`) `focus` apply identically to every matched file, and the
+  result shape changes to `{ results: [{ path, summary|data, truncated,
+  truncatedChars? } | { path, error }, ...] }` instead of a single top-level
+  `summary`/`data` — one file failing (unreadable, fails workspace
+  confinement, model generation failure, ...) becomes that file's own
+  `{ path, error }` entry rather than aborting the whole call; the overall
+  tool response is only `isError: true` if *every* matched file failed. A
+  pattern matching more than 20 files is rejected outright with
+  `isError: true` (narrow the pattern or issue several calls) rather than
+  silently processing only the first 20 or turning one tool call into an
+  unbounded number of sequential Ollama generate calls. This repo's Node
+  floor (20, see `engines` below) predates `fs.promises.glob` (Node 22), and
+  a third-party glob dependency was judged unnecessary for this repo's
+  minimal, POSIX-glob-subset needs — see `matchGlob`'s doc comment in
+  `src/index.ts` for the (dependency-free) matching implementation.
 - **`classify(pathOrText, labels, isPath?, startLine?, endLine?)`** — classifies
   content into exactly one of `labels` (min 2), returning `{ label, truncated,
   truncatedChars? }`. Set `isPath: true` to have this server read `pathOrText`
@@ -166,6 +188,12 @@ error rather than read. This also closes an indirect path: `extract`'s
 caller-supplied `schema` could otherwise be crafted to have the model echo
 arbitrary file content back into the tool result, so confining *which* files
 can be read at all is the actual control, not just validating output shape.
+This same per-file check applies to every file a glob pattern matches, not
+just a plain single path — glob expansion only narrows candidates by
+listing directories under `WORKSPACE_ROOT` (so a `../` segment can never
+even produce a match), but a matched symlink pointing outside the root is
+still individually rejected (its own `{ path, error }` entry, not silently
+dropped from the result) exactly like a literal path would be.
 `WORKSPACE_ROOT` defaults to this process's working directory, which is the
 repo root when launched as a stdio MCP server from the devcontainer.
 
@@ -721,12 +749,6 @@ sometimes cost more than it saves.
 
 ## Follow-ups not built in this bead
 
-- **Glob support.** The design doc mentioned "a file path / glob"; this bead
-  ships single-path input only (plus an optional line range) as the MVP —
-  Node 20 (this repo's floor, see `engines` above) has no built-in
-  `fs.promises.glob` (that lands in Node 22), and a dependency-free glob
-  implementation was judged out of scope for this bead. A follow-up bead could
-  add either a small glob dependency or bump the Node floor.
 - **Chunking for oversized files.** Content beyond `MAX_INPUT_CHARS` (12,000
   chars) is truncated, not chunked-and-summarized-per-chunk. Truncation is
   reported (`truncated`/`truncatedChars`) rather than silent, but a genuinely

@@ -13,13 +13,16 @@
  */
 import { createHash, randomUUID } from "node:crypto";
 import { createReadStream } from "node:fs";
-import { open, readFile, realpath, stat, unlink } from "node:fs/promises";
+import type { Dirent } from "node:fs";
+import { open, opendir, readFile, realpath, stat, unlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import * as readline from "node:readline";
 import { fileURLToPath } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import type { RequestHandlerExtra } from "@modelcontextprotocol/sdk/shared/protocol.js";
+import type { ServerNotification, ServerRequest } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import {
   makeProgressNotifier,
@@ -28,6 +31,16 @@ import {
   withPeriodicProgress,
 } from "./progress.js";
 import { type JsonSchema, parseAndValidateJson } from "./validate.js";
+
+/** The `extra` argument every `server.registerTool` handler callback
+ * receives as its second parameter (per `@modelcontextprotocol/sdk/server/
+ * mcp.js`'s `ToolCallback`). Named here so the glob-branch helper functions
+ * below (`summarizeGlob`/`extractGlob`), which live outside the inline
+ * handler closures, can be given the same type the SDK infers for the
+ * handlers themselves -- matching `progress.ts`'s `ProgressCapableExtra`,
+ * which picks a narrower structural subset of this same type for the same
+ * reason. */
+type ToolExtra = RequestHandlerExtra<ServerRequest, ServerNotification>;
 
 /** Base URL of the Ollama server, e.g. "http://ollama:11434". No trailing slash. */
 const OLLAMA_HOST = (process.env.OLLAMA_HOST ?? "http://ollama:11434").replace(/\/+$/, "");
@@ -145,6 +158,113 @@ const MAX_UTF8_BYTES_PER_CHAR = 4;
  * excerpts) while staying cheap to `stat`/reject. */
 const MAX_FILE_SIZE_BYTES = 8 * 1024 * 1024;
 
+/** Upper bound on how many files a single glob pattern (`summarize_file`/
+ * `extract`'s `path` argument, when it contains a glob metacharacter -- see
+ * `isGlobPattern`) may match before the tool refuses the call outright with
+ * `isError: true`, rather than silently processing only the first N matches
+ * or fanning out an unbounded number of individual Ollama `/api/generate`
+ * calls. Each matched file still gets its own generate call, and those are
+ * already serialized behind GENERATE_LOCK (see its doc comment) -- a pattern
+ * matching, say, 500 files would turn one tool call into a many-minutes-long
+ * sequential batch with no way for the caller to cancel individual files.
+ * Deliberately small: this MVP's glob support is for "summarize these few
+ * related files in one call", not "run this over the whole repo" -- a
+ * caller that legitimately needs more should narrow the pattern or issue
+ * several separate calls. */
+const MAX_GLOB_MATCHES = 20;
+
+/** Upper bound on the total number of directory entries `matchGlob`'s walk
+ * will look at (summed across every directory it reads, one entry at a time
+ * -- see `readDirCapped`) before it aborts with an error, separate from --
+ * and checked independently of -- `MAX_GLOB_MATCHES`'s cap on *matches
+ * returned*. Without this, a `**` pattern that matches sparsely or not at
+ * all (e.g. `**\/*.zzz`) still has to walk the *entire* tree under `root`
+ * before it can conclude "no matches" -- and since `root` defaults to
+ * WORKSPACE_ROOT (the repo root), that tree includes `node_modules`
+ * (hundreds-to-thousands of nested package directories once installed),
+ * `.git/objects`, and any build output, none of which `MAX_GLOB_MATCHES`
+ * does anything to bound. A caller-controlled `path` argument could
+ * otherwise cheaply trigger a full-tree scan on demand, repeatedly, with no
+ * rate limit. 5000 is generously above this repo's own entry count outside
+ * the well-known skipped directories (see `GLOB_SKIPPED_DIR_NAMES`) -- a few
+ * hundred as of this writing -- while still bounding the worst case to a
+ * fixed, cheap-to-hit ceiling rather than "however big the tree gets."
+ *
+ * claude-1nx round-2 review: a directory every `**` segment visits used to
+ * be `readdir`'d twice (once to check whether it matches the next segment,
+ * once more via a redundant recursive `walk()` call for "`**` matches zero
+ * directories"), with both calls incrementing this same counter -- meaning
+ * the real margin before hitting this cap was roughly *half* what this
+ * comment claimed. `walk`/`processDir` now `readdir` each directory exactly
+ * once and reuse the same `entries` for both the zero-match continuation and
+ * the descend-into-subdirectories loop, so the margin above is accurate
+ * again. */
+const MAX_GLOB_DIR_ENTRIES_SCANNED = 5000;
+
+/** Upper bound on how many entries `readDirCapped` will read out of a
+ * *single* directory before treating that alone as tripping the scan cap
+ * (same error path as `MAX_GLOB_DIR_ENTRIES_SCANNED`), even if the running
+ * total across the whole walk hasn't reached `MAX_GLOB_DIR_ENTRIES_SCANNED`
+ * yet. Closes a gap `MAX_GLOB_DIR_ENTRIES_SCANNED` alone doesn't (claude-1nx
+ * round-2 review): that cap is only consulted once a directory's entries have
+ * already been read, so one directory containing an unusually large number of
+ * entries -- not `node_modules`/`.git`/`dist`, which are skipped outright,
+ * but any other directory under `root` -- could reach a large count before
+ * the total cap is ever checked. `readDirCapped` enforces both caps
+ * incrementally, one entry at a time (via a manual `fs.Dir` read loop, not a
+ * single bulk `readdir({ withFileTypes: true })` call that always
+ * materializes the whole array first), so a pathological single directory is
+ * cut off after this many entries rather than being fully enumerated before
+ * either cap is consulted. Set well above any real directory in this repo
+ * (order of a few hundred entries at most, see `MAX_GLOB_DIR_ENTRIES_SCANNED`'s
+ * doc comment) but comfortably below `MAX_GLOB_DIR_ENTRIES_SCANNED` itself
+ * (40% of it) -- small enough that a single oversized directory can't alone
+ * exhaust the *entire* walk's budget, preserving the property that the total
+ * cap bounds work spread across the whole tree, not just however large one
+ * directory happens to be. */
+const MAX_GLOB_DIR_ENTRIES_PER_DIRECTORY = 2000;
+
+/** Directory names `matchGlob`'s walk never descends into, regardless of
+ * whether the pattern's segment would otherwise match them or the pattern
+ * uses `**`. These are never useful to match into for this tool's purpose
+ * (summarizing/extracting source a human would plausibly ask about) and are
+ * exactly the directories that make an unbounded walk expensive in
+ * practice: `node_modules` (huge, and irrelevant to source review),
+ * `.git` (packfiles/objects, not source), and `dist` (build output, a
+ * derivative of the source rather than the source itself). */
+const GLOB_SKIPPED_DIR_NAMES = new Set(["node_modules", ".git", "dist"]);
+
+/** Upper bound, in characters, on a `summarize_file`/`extract` `path`
+ * argument -- enforced at the zod schema level (see both tools'
+ * `inputSchema`), covering plain paths and glob patterns alike. Existing
+ * legitimate paths/patterns in this repo top out at well under 100
+ * characters; 256 leaves generous headroom for real use while still
+ * capping the cost of the length-dependent parsing work `matchGlob`/
+ * `matchGlobSegment` do per glob pattern (see
+ * `MAX_GLOB_METACHARACTERS_PER_SEGMENT` for the complementary per-segment
+ * density cap). */
+const MAX_PATH_ARGUMENT_LENGTH = 256;
+
+/** Upper bound on how many glob metacharacters (`*`, `?`, `[`) a single
+ * `/`-delimited segment of a glob pattern may contain before `matchGlob`
+ * refuses the whole pattern outright, checked once up front (not per
+ * directory entry).
+ *
+ * claude-1nx round-2 review: segment matching used to compile each segment
+ * to a `RegExp` (`*`/`?` becoming an unanchored `[^/]*`/`[^/]`), and this cap
+ * existed purely to bound the classic catastrophic-backtracking shape that
+ * created against a non-matching directory-entry name -- `MAX_PATH_ARGUMENT_
+ * LENGTH` alone doesn't prevent a short segment from being packed full of
+ * wildcards. `matchGlobSegment` has since been rewritten as a linear-time,
+ * non-backtracking two-pointer matcher (the standard `fnmatch`/glob
+ * technique -- see its doc comment), which closes that class of bug
+ * regardless of how many wildcards a segment packs in, so this cap is no
+ * longer the primary ReDoS defense. It's kept anyway as a cheap, independent
+ * sanity bound on segment complexity (defense in depth, and a clearer error
+ * for a pattern that's very unlikely to be a legitimate glob). 8 is far more
+ * than any realistic glob segment needs (e.g. `*.test.ts` uses one). */
+const MAX_GLOB_METACHARACTERS_PER_SEGMENT = 8;
+
 /** Root directory that every `path`/`pathOrText` (when `isPath`) argument is
  * confined to -- see `resolveWorkspacePath`. Defaults to this process's cwd,
  * which is the repo root when launched as a stdio MCP server from the
@@ -232,15 +352,25 @@ server.registerTool(
     description:
       "Summarize a file on disk using the local Ollama model, without the " +
       "file content ever entering the caller's context -- only the summary " +
-      "is returned. Pass a file path, never the file's content. Optionally " +
-      "narrow with `focus` (what to summarize toward) and/or `startLine`/" +
-      "`endLine` (a 1-indexed inclusive slice). Large files are truncated " +
+      "is returned. Pass a file path, never the file's content. `path` may " +
+      `also be a glob pattern (\`*\`, \`?\`, \`[...]\`, \`**\` for nested ` +
+      `directories, e.g. 'src/**/*.ts') matching up to ${MAX_GLOB_MATCHES} ` +
+      "files, each summarized independently -- the result then has a " +
+      "`results` array (one entry per matched file, each with its own " +
+      "`summary`/`error`) instead of a single top-level `summary`. " +
+      "Optionally narrow with `focus` (what to summarize toward) and/or " +
+      "`startLine`/`endLine` (a 1-indexed inclusive slice, applied to every " +
+      "matched file the same way). Large files are truncated " +
       `to ${MAX_INPUT_CHARS} characters before being sent to the model -- ` +
       "check the `truncated` field in the result.",
     inputSchema: {
       path: z
         .string()
-        .describe("Path to the file to summarize (read by this server, not the caller)."),
+        .max(MAX_PATH_ARGUMENT_LENGTH)
+        .describe(
+          "Path to the file to summarize, or a glob pattern matching several " +
+            `(read by this server, not the caller). Max ${MAX_PATH_ARGUMENT_LENGTH} characters.`,
+        ),
       focus: z
         .string()
         .optional()
@@ -249,6 +379,10 @@ server.registerTool(
     },
   },
   async ({ path, focus, startLine, endLine }, extra) => {
+    if (isGlobPattern(path)) {
+      return await summarizeGlob(path, focus, startLine, endLine, extra);
+    }
+
     const slice = await readFileSlice(path, startLine, endLine);
     if (!slice.ok) {
       return { content: [{ type: "text", text: JSON.stringify({ error: slice.error }) }], isError: true };
@@ -319,11 +453,20 @@ server.registerTool(
       "clear message describing what was wrong, rather than returning " +
       "garbage or a partially-parsed guess silently. " +
       `Large files are truncated to ${MAX_INPUT_CHARS} characters -- check ` +
-      "the `truncated` field in the result.",
+      "the `truncated` field in the result. `path` may also be a glob " +
+      `pattern (\`*\`, \`?\`, \`[...]\`, \`**\` for nested directories, e.g. ` +
+      `'src/**/*.ts') matching up to ${MAX_GLOB_MATCHES} files, each ` +
+      "extracted independently -- the result then has a `results` array " +
+      "(one entry per matched file, each with its own `data`/`error`) " +
+      "instead of a single top-level `data`.",
     inputSchema: {
       path: z
         .string()
-        .describe("Path to the file to extract from (read by this server, not the caller)."),
+        .max(MAX_PATH_ARGUMENT_LENGTH)
+        .describe(
+          "Path to the file to extract from, or a glob pattern matching several " +
+            `(read by this server, not the caller). Max ${MAX_PATH_ARGUMENT_LENGTH} characters.`,
+        ),
       schema: z
         .unknown()
         .refine((value) => typeof value === "object" && value !== null && !Array.isArray(value), {
@@ -334,6 +477,10 @@ server.registerTool(
     },
   },
   async ({ path, schema, startLine, endLine }, extra) => {
+    if (isGlobPattern(path)) {
+      return await extractGlob(path, schema as JsonSchema, startLine, endLine, extra);
+    }
+
     const slice = await readFileSlice(path, startLine, endLine);
     if (!slice.ok) {
       return { content: [{ type: "text", text: JSON.stringify({ error: slice.error }) }], isError: true };
@@ -509,22 +656,31 @@ type SliceResult =
 
 type ResolvedPathResult = { ok: true; path: string } | { ok: false; error: string };
 
-/** Resolves a caller-supplied path against WORKSPACE_ROOT and verifies --
- * after following symlinks -- that it still lands inside WORKSPACE_ROOT.
- * This is the sandboxing boundary for every tool that reads a file from
- * disk: an absolute path (e.g. `/etc/passwd`), a `../` traversal out of the
- * root, or a symlink inside the root that points outside it are all
- * rejected. Never throws -- returns a result so callers can turn this into
- * a normal `isError: true` tool response instead of a thrown exception. */
-async function resolveWorkspacePath(input: string): Promise<ResolvedPathResult> {
+/** Resolves a caller-supplied path against `root` and verifies -- after
+ * following symlinks -- that it still lands inside `root`. This is the
+ * sandboxing boundary for every tool that reads a file from disk: an
+ * absolute path (e.g. `/etc/passwd`), a `../` traversal out of the root, or
+ * a symlink inside the root that points outside it are all rejected. Never
+ * throws -- returns a result so callers can turn this into a normal
+ * `isError: true` tool response instead of a thrown exception.
+ *
+ * `root` defaults to WORKSPACE_ROOT (every real call site -- the single-path
+ * branches of `summarize_file`/`extract`/`classify` via `readFileSlice`, and
+ * the per-file confinement check each glob match goes through -- uses the
+ * default); it's overridable, and this function exported, purely so tests
+ * can exercise the actual confinement/symlink-escape logic against a
+ * disposable temp directory instead of the real workspace root, the same
+ * injectable-parameter pattern `acquireGenerateLock`'s `lockPath` option
+ * already uses. */
+export async function resolveWorkspacePath(input: string, root: string = WORKSPACE_ROOT): Promise<ResolvedPathResult> {
   // path.resolve processes its arguments right-to-left and stops as soon as
   // an absolute path is constructed, so an absolute `input` here makes
-  // WORKSPACE_ROOT irrelevant to the resolution itself (Node's documented
+  // `root` irrelevant to the resolution itself (Node's documented
   // behavior) -- that's fine, because the containment check below rejects
-  // the result unless it's still inside WORKSPACE_ROOT either way.
-  const candidate = path.resolve(WORKSPACE_ROOT, input);
-  if (candidate !== WORKSPACE_ROOT && !candidate.startsWith(WORKSPACE_ROOT + path.sep)) {
-    return { ok: false, error: `path '${input}' resolves outside the workspace root (${WORKSPACE_ROOT})` };
+  // the result unless it's still inside `root` either way.
+  const candidate = path.resolve(root, input);
+  if (candidate !== root && !candidate.startsWith(root + path.sep)) {
+    return { ok: false, error: `path '${input}' resolves outside the workspace root (${root})` };
   }
 
   let real: string;
@@ -534,10 +690,10 @@ async function resolveWorkspacePath(input: string): Promise<ResolvedPathResult> 
     const message = error instanceof Error ? error.message : String(error);
     return { ok: false, error: `failed to resolve '${input}': ${message}` };
   }
-  if (real !== WORKSPACE_ROOT && !real.startsWith(WORKSPACE_ROOT + path.sep)) {
+  if (real !== root && !real.startsWith(root + path.sep)) {
     return {
       ok: false,
-      error: `path '${input}' resolves outside the workspace root (${WORKSPACE_ROOT}) after following symlinks`,
+      error: `path '${input}' resolves outside the workspace root (${root}) after following symlinks`,
     };
   }
   return { ok: true, path: real };
@@ -546,7 +702,7 @@ async function resolveWorkspacePath(input: string): Promise<ResolvedPathResult> 
 /** Reads a file from disk (never from a tool argument -- this is the crux of
  * the "reference-based" design: the file body only ever exists inside this
  * process, not in anything the caller sent or anything we send back). The
- * path is first confined to WORKSPACE_ROOT (see `resolveWorkspacePath`) and
+ * path is first confined to `root` (see `resolveWorkspacePath`) and
  * size-capped (see MAX_FILE_SIZE_BYTES) before any content is read. If
  * `startLine`/`endLine` are given (1-indexed, inclusive), only that line
  * range is streamed off disk -- reading stops at `endLine` rather than
@@ -555,9 +711,18 @@ async function resolveWorkspacePath(input: string): Promise<ResolvedPathResult> 
  * truncated, reported via `truncated`/`truncatedChars` rather than silently
  * dropped. Never throws -- I/O errors (missing file, permission denied, path
  * is a directory, etc.) are reported as a result, matching the
- * graceful-degradation style of `checkOllamaHealth`. */
-async function readFileSlice(inputPath: string, startLine?: number, endLine?: number): Promise<SliceResult> {
-  const resolved = await resolveWorkspacePath(inputPath);
+ * graceful-degradation style of `checkOllamaHealth`.
+ *
+ * `root` defaults to WORKSPACE_ROOT and is exported for the same
+ * test-injection reason as `resolveWorkspacePath`'s -- every real call site
+ * uses the default. */
+export async function readFileSlice(
+  inputPath: string,
+  startLine?: number,
+  endLine?: number,
+  root: string = WORKSPACE_ROOT,
+): Promise<SliceResult> {
+  const resolved = await resolveWorkspacePath(inputPath, root);
   if (!resolved.ok) {
     return { ok: false, error: resolved.error };
   }
@@ -593,6 +758,537 @@ async function readFileSlice(inputPath: string, startLine?: number, endLine?: nu
     const message = error instanceof Error ? error.message : String(error);
     return { ok: false, error: `failed to read '${inputPath}': ${message}` };
   }
+}
+
+/** Characters that make a `summarize_file`/`extract` `path` argument a glob
+ * pattern (see `matchGlob`) rather than a plain single path: `*`, `?`, and
+ * `[` (bracket character classes). A path containing none of these is
+ * treated exactly as before this bead -- read directly via `readFileSlice`,
+ * single-object result -- so existing single-path callers see no behavior
+ * change. `{` (brace expansion) is deliberately NOT a trigger: this
+ * matcher doesn't implement brace expansion, so a literal `{`/`}` in a path
+ * is passed through as an ordinary (if unusual) filename character. */
+const GLOB_METACHARACTERS = /[*?[]/;
+
+/** True if `input` should be treated as a glob pattern (see `matchGlob`)
+ * rather than a single literal file path. */
+export function isGlobPattern(input: string): boolean {
+  return GLOB_METACHARACTERS.test(input);
+}
+
+/** Finds the index of the `]` closing a `[...]`/`[!...]` bracket expression
+ * that starts at `pattern[openIdx]` (`pattern[openIdx]` must be `[`), or -1
+ * if there is no closing `]` -- in which case the `[` isn't a valid bracket
+ * expression and callers treat it as a literal character instead (see
+ * `matchToken`). */
+function findBracketClose(pattern: string, openIdx: number): number {
+  return pattern.indexOf("]", openIdx + 1);
+}
+
+/** True if `ch` is a member of the `[...]`/`[!...]` bracket expression
+ * spanning `pattern[openIdx..closeIdx]` inclusive (`pattern[openIdx]` must be
+ * `[` and `pattern[closeIdx]` must be the matching `]` found by
+ * `findBracketClose`). A leading `!` or `^` negates the class, POSIX-glob
+ * style. `ch === undefined` (matching past the end of the directory-entry
+ * name) never matches. */
+function bracketMatches(pattern: string, openIdx: number, closeIdx: number, ch: string | undefined): boolean {
+  if (ch === undefined) {
+    return false;
+  }
+  let body = pattern.slice(openIdx + 1, closeIdx);
+  let negate = false;
+  if (body.startsWith("!") || body.startsWith("^")) {
+    negate = true;
+    body = body.slice(1);
+  }
+  const isMember = body.includes(ch);
+  return negate ? !isMember : isMember;
+}
+
+/** Matches `ch` (a single directory-entry-name character, or `undefined` if
+ * matching has run past the end of the name) against the single pattern
+ * token starting at `pattern[pIdx]` -- `?`, a `[...]`/`[!...]` bracket
+ * expression, or an ordinary literal character. Must NOT be called with
+ * `pattern[pIdx] === "*"`; `matchGlobSegment` handles `*` itself, since (as
+ * the only unbounded-repetition token) it needs to track backtracking state
+ * across calls that this per-token helper has no place to keep. Returns
+ * whether the token matched and, if so, the pattern index immediately after
+ * the token consumed (more than `pIdx + 1` for a bracket expression, which
+ * can span several characters). */
+function matchToken(pattern: string, pIdx: number, ch: string | undefined): { matched: boolean; nextPIdx: number } {
+  const patternChar = pattern[pIdx];
+  if (patternChar === "?") {
+    return { matched: ch !== undefined, nextPIdx: pIdx + 1 };
+  }
+  if (patternChar === "[") {
+    const closeIdx = findBracketClose(pattern, pIdx);
+    if (closeIdx === -1) {
+      // No matching ']' -- not a valid bracket expression; '[' matches only
+      // itself (same rule the previous regex-based matcher used).
+      return { matched: ch === "[", nextPIdx: pIdx + 1 };
+    }
+    return { matched: bracketMatches(pattern, pIdx, closeIdx, ch), nextPIdx: closeIdx + 1 };
+  }
+  return { matched: ch === patternChar, nextPIdx: pIdx + 1 };
+}
+
+/** Matches a directory-entry `name` against one `/`-delimited glob *segment*
+ * (never the whole pattern -- `**` is handled separately by `matchGlob`, one
+ * directory level at a time). Supports `*` (any run of characters), `?`
+ * (exactly one character), and `[...]`/`[!...]` POSIX-style bracket
+ * character classes/negation; every other character matches only itself. No
+ * brace expansion, no `\`-escaping of a literal metacharacter -- out of
+ * scope for this minimal matcher (see `isGlobPattern`'s doc comment).
+ *
+ * claude-1nx round-2 review (finding B): this replaces a previous
+ * implementation that compiled each segment to a `RegExp` (`*`/`?` becoming
+ * an unanchored `[^/]*`/`[^/]`) and matched via `RegExp.test`. A segment
+ * packing several `*`/`?` next to literal text is exactly the shape behind
+ * real-world glob-engine ReDoS (e.g. minimatch's CVE-2022-3517): tested
+ * against a non-matching directory-entry name sharing the pattern's literal
+ * structure, a backtracking regex engine can take polynomial-in-the-worst-
+ * case time with a large exponent (one factor of `n` per `*`), which is
+ * catastrophic in practice long before the exponent gets large.
+ *
+ * This implementation is the standard `fnmatch`/glob two-pointer matcher
+ * instead: a `*` records its own pattern position (`starIdx`) and where in
+ * `name` it started matching (`starMatch`); on a later mismatch, matching
+ * only rewinds those two plain integers and retries one character further
+ * into `name` -- it never re-invokes a backtracking regex engine, and there
+ * is no pattern/name shape (arbitrarily many `*` interleaved with literals,
+ * matched against a similarly-shaped long name) that can trigger
+ * catastrophic blowup. Worst case is O(pattern length * name length) --
+ * comfortably fast for the bounded lengths this tool allows (segments come
+ * from a `matchGlob` pattern already capped at MAX_PATH_ARGUMENT_LENGTH
+ * characters; directory-entry names are bounded by the filesystem itself),
+ * and with no catastrophic case regardless of how many wildcards a segment
+ * packs in -- the complementary MAX_GLOB_METACHARACTERS_PER_SEGMENT cap is
+ * now only a defense-in-depth sanity bound, not the primary ReDoS defense
+ * (see that constant's doc comment). */
+function matchGlobSegment(pattern: string, name: string): boolean {
+  let pIdx = 0;
+  let sIdx = 0;
+  let starIdx = -1;
+  let starMatch = 0;
+
+  while (sIdx < name.length) {
+    if (pIdx < pattern.length && pattern[pIdx] === "*") {
+      starIdx = pIdx;
+      starMatch = sIdx;
+      pIdx++;
+      continue;
+    }
+    if (pIdx < pattern.length) {
+      const { matched, nextPIdx } = matchToken(pattern, pIdx, name[sIdx]);
+      if (matched) {
+        pIdx = nextPIdx;
+        sIdx++;
+        continue;
+      }
+    }
+    if (starIdx !== -1) {
+      // Backtrack: the last '*' consumes one more character than it did
+      // before, and matching resumes right after it -- rewinding only these
+      // two plain integers, never re-running a regex engine.
+      pIdx = starIdx + 1;
+      starMatch++;
+      sIdx = starMatch;
+    } else {
+      return false;
+    }
+  }
+
+  // Any trailing '*'s match zero characters.
+  while (pIdx < pattern.length && pattern[pIdx] === "*") {
+    pIdx++;
+  }
+  return pIdx === pattern.length;
+}
+
+export type GlobMatchResult = { ok: true; matches: string[] } | { ok: false; error: string };
+
+/** Expands a glob `pattern` (must contain at least one of `*`, `?`, `[` --
+ * see `isGlobPattern`) into the paths, relative to `root`, of every entry
+ * under `root` that matches it. Supports `*`, `?`, `[...]`/`[!...]` (see
+ * `matchGlobSegment`) plus `**` (matches zero or more whole path segments,
+ * `fnmatch` "globstar" style, e.g. `src/**\/*.ts`). No brace expansion
+ * (`{a,b}`).
+ *
+ * This performs NO workspace-confinement check itself -- it only narrows
+ * the candidate set by *listing* directories under `root` (via
+ * `readDirCapped`), so a `../` segment in `pattern` can never produce a
+ * match (a directory listing never yields `.`/`..` as entries -- a literal
+ * `..` segment simply matches nothing) and an absolute pattern is rejected
+ * up front. It also does NOT follow symlinked directories while walking
+ * (skips descending into them, closing a traversal-loop/escape vector during
+ * the walk itself) -- but a symlinked *file*, or a symlinked directory
+ * matched by the pattern's *final* segment, CAN still appear in the
+ * returned list. That's intentional: per this function's contract, it is
+ * the caller's job to run every returned path through the same
+ * `resolveWorkspacePath` confinement check (with its `realpath`
+ * symlink-escape check) that the single-path branch already applies via
+ * `readFileSlice` -- exactly what `processGlobMatches` below does -- so a
+ * symlink pointing outside `root` is rejected per-file (a normal `{ error }`
+ * entry for that one match), not silently dropped from the match list
+ * before it can be reported. Matches beyond MAX_GLOB_MATCHES abort the walk
+ * and report an error rather than silently processing only the first N. The
+ * walk also never descends into `GLOB_SKIPPED_DIR_NAMES` (`node_modules`,
+ * `.git`, `dist`) regardless of pattern, and aborts with an error if it
+ * visits more than MAX_GLOB_DIR_ENTRIES_SCANNED directory entries in total,
+ * or more than MAX_GLOB_DIR_ENTRIES_PER_DIRECTORY entries in any single
+ * directory -- all three guard against a sparse-or-empty-match `**` pattern
+ * (e.g. `**\/*.zzz`) walking the entire tree under `root` just to conclude
+ * "no matches", or a single pathologically large directory being fully
+ * enumerated before either cap is consulted (see each constant's doc
+ * comment). Each pattern segment is also rejected up front if it packs more
+ * than MAX_GLOB_METACHARACTERS_PER_SEGMENT wildcard characters (see that
+ * constant's doc comment for why this is now a secondary sanity bound, not
+ * the primary ReDoS defense). `root` defaults to WORKSPACE_ROOT;
+ * overridable for tests, same injectable-parameter pattern as
+ * `resolveWorkspacePath`'s. */
+export async function matchGlob(pattern: string, root: string = WORKSPACE_ROOT): Promise<GlobMatchResult> {
+  if (pattern.length > MAX_PATH_ARGUMENT_LENGTH) {
+    return {
+      ok: false,
+      error: `glob pattern exceeds the maximum length of ${MAX_PATH_ARGUMENT_LENGTH} characters -- narrow the pattern`,
+    };
+  }
+  if (path.isAbsolute(pattern)) {
+    return { ok: false, error: `glob pattern '${pattern}' must be relative to the workspace root, not absolute` };
+  }
+  const segments = pattern.split("/").filter((segment) => segment.length > 0 && segment !== ".");
+  if (segments.length === 0) {
+    return { ok: false, error: `glob pattern '${pattern}' has no path segments to match` };
+  }
+  for (const segment of segments) {
+    const metacharacterCount = (segment.match(/[*?[]/g) ?? []).length;
+    if (metacharacterCount > MAX_GLOB_METACHARACTERS_PER_SEGMENT) {
+      return {
+        ok: false,
+        error:
+          `glob pattern '${pattern}' has a path segment with too many wildcard characters ` +
+          `(${metacharacterCount} > ${MAX_GLOB_METACHARACTERS_PER_SEGMENT}) -- narrow the pattern`,
+      };
+    }
+  }
+
+  const matches: string[] = [];
+  let exceededLimit = false;
+  let exceededScanCap = false;
+  let entriesScanned = 0;
+
+  /** Reads `dirAbs`'s entries one at a time via a manual `fs.Dir` read loop
+   * (rather than a single bulk `readdir({ withFileTypes: true })` call),
+   * applying both `MAX_GLOB_DIR_ENTRIES_PER_DIRECTORY` (this directory
+   * alone) and `MAX_GLOB_DIR_ENTRIES_SCANNED` (the running total across the
+   * whole walk) incrementally as each entry is read, rather than only after
+   * the full array already exists in memory -- see
+   * `MAX_GLOB_DIR_ENTRIES_PER_DIRECTORY`'s doc comment for the gap this
+   * closes (claude-1nx round-2 review, finding A). Returns `undefined` if
+   * `dirAbs` doesn't exist/isn't a directory (nothing to match -- same as a
+   * `readdir` throw before) OR if a cap was tripped while reading, in which
+   * case `exceededScanCap` has already been set to `true`; callers
+   * distinguish the two the same way every other early-return in this walk
+   * already does, by checking `exceededScanCap` themselves before doing
+   * anything with a `undefined` result. */
+  async function readDirCapped(dirAbs: string): Promise<Dirent[] | undefined> {
+    let dir;
+    try {
+      dir = await opendir(dirAbs);
+    } catch {
+      return undefined; // dirAbs doesn't exist (or isn't a directory) -- nothing to match here.
+    }
+    const entries: Dirent[] = [];
+    try {
+      let dirent = await dir.read();
+      while (dirent !== null) {
+        entries.push(dirent);
+        entriesScanned++;
+        if (entries.length > MAX_GLOB_DIR_ENTRIES_PER_DIRECTORY || entriesScanned > MAX_GLOB_DIR_ENTRIES_SCANNED) {
+          exceededScanCap = true;
+          return undefined;
+        }
+        dirent = await dir.read();
+      }
+    } finally {
+      await dir.close();
+    }
+    return entries;
+  }
+
+  /** Records `dirAbs` itself as a match once every pattern segment has been
+   * consumed (`idx === segments.length`), enforcing MAX_GLOB_MATCHES the
+   * same way every other match-recording site in this walk does. Returns
+   * `true` if it did (callers that already have `entries` fetched for
+   * `dirAbs` -- the `**` zero-match continuation in `processDir` below --
+   * use this to short-circuit before touching `entries` at all, since a
+   * terminal match doesn't need them). */
+  function recordMatchIfComplete(dirAbs: string, idx: number): boolean {
+    if (idx !== segments.length) {
+      return false;
+    }
+    matches.push(dirAbs);
+    if (matches.length > MAX_GLOB_MATCHES) {
+      exceededLimit = true;
+    }
+    return true;
+  }
+
+  /** Matches `entries` (already read for `dirAbs` by `walk`) against
+   * `segments[idx]`, recursing into `walk` for any child directory that
+   * needs its OWN fresh listing.
+   *
+   * claude-1nx round-2 review (finding C): this is factored out of `walk` so
+   * the "'**' matches zero segments" continuation can call it directly with
+   * the SAME `entries` already fetched a few lines above (in `walk`, for the
+   * "descend into subdirectories, staying on '**'" loop) instead of
+   * recursing through `walk`'s top -- which would unconditionally re-read
+   * `dirAbs` via `readDirCapped`, `readdir`-ing (and re-counting against
+   * `entriesScanned`) every `**`-visited directory twice for no reason. */
+  async function processDir(dirAbs: string, idx: number, entries: Dirent[]): Promise<void> {
+    if (exceededLimit || exceededScanCap) {
+      return;
+    }
+    if (recordMatchIfComplete(dirAbs, idx)) {
+      return;
+    }
+
+    const segment = segments[idx];
+    if (segment === "**") {
+      await processDir(dirAbs, idx + 1, entries); // '**' may match zero directories -- reuse these entries, no re-read.
+      for (const entry of entries) {
+        if (exceededLimit || exceededScanCap) {
+          return;
+        }
+        if (entry.isDirectory() && !entry.isSymbolicLink() && !GLOB_SKIPPED_DIR_NAMES.has(entry.name)) {
+          await walk(path.join(dirAbs, entry.name), idx); // stay on '**', descend one level -- a different directory, needs its own read.
+        }
+      }
+      return;
+    }
+
+    for (const entry of entries) {
+      if (exceededLimit || exceededScanCap) {
+        return;
+      }
+      if (!matchGlobSegment(segment, entry.name)) {
+        continue;
+      }
+      const candidate = path.join(dirAbs, entry.name);
+      if (idx === segments.length - 1) {
+        matches.push(candidate);
+        if (matches.length > MAX_GLOB_MATCHES) {
+          exceededLimit = true;
+          return;
+        }
+      } else if (entry.isDirectory() && !entry.isSymbolicLink() && !GLOB_SKIPPED_DIR_NAMES.has(entry.name)) {
+        await walk(candidate, idx + 1); // a different directory -- needs its own read.
+      }
+    }
+  }
+
+  async function walk(dirAbs: string, idx: number): Promise<void> {
+    if (exceededLimit || exceededScanCap) {
+      return;
+    }
+    if (recordMatchIfComplete(dirAbs, idx)) {
+      return;
+    }
+    const entries = await readDirCapped(dirAbs);
+    if (entries === undefined) {
+      return; // either dirAbs doesn't exist, or a cap was tripped (exceededScanCap already set) -- either way, nothing more to do here.
+    }
+    await processDir(dirAbs, idx, entries);
+  }
+
+  await walk(root, 0);
+
+  if (exceededLimit) {
+    return {
+      ok: false,
+      error: `glob pattern '${pattern}' matched more than ${MAX_GLOB_MATCHES} files -- narrow the pattern`,
+    };
+  }
+  if (exceededScanCap) {
+    return {
+      ok: false,
+      error:
+        `glob pattern '${pattern}' scanned more than ${MAX_GLOB_DIR_ENTRIES_SCANNED} directory entries ` +
+        "without concluding -- narrow the pattern or start it from a more specific subdirectory",
+    };
+  }
+  if (matches.length === 0) {
+    return { ok: false, error: `glob pattern '${pattern}' matched no files under the workspace root` };
+  }
+  return { ok: true, matches: matches.map((m) => path.relative(root, m)).sort() };
+}
+
+/** Runs `perFile` once per entry in `matches`, first reading each through
+ * the same confined/bounded `readFileSlice` the single-path branch already
+ * uses (so a matched symlink escaping `root`, a missing file, an oversized
+ * file, etc. becomes that one file's own `{ path, error }` entry rather than
+ * aborting the whole call). Stops (without erroring) if `signal` is already
+ * aborted before a given file starts -- a caller-cancelled MCP request has
+ * no client left to deliver the rest of the results to anyway. Never
+ * throws: every failure mode (confinement, read, or `perFile` itself) is
+ * folded into a `{ path, error }` entry.
+ *
+ * Exported (with an injectable `root`) purely so tests can exercise the
+ * real match -> confine -> read pipeline -- including the
+ * per-match-rejected-not-dropped symlink/traversal case -- with a stub
+ * `perFile` that never calls Ollama, same test-injection rationale as
+ * `resolveWorkspacePath`'s `root` parameter. The real `summarizeGlob`/
+ * `extractGlob` call sites always pass WORKSPACE_ROOT. */
+export async function processGlobMatches(
+  matches: string[],
+  startLine: number | undefined,
+  endLine: number | undefined,
+  signal: AbortSignal | undefined,
+  root: string,
+  perFile: (
+    slice: Extract<SliceResult, { ok: true }>,
+  ) => Promise<Record<string, unknown> | { error: string }>,
+): Promise<Array<Record<string, unknown>>> {
+  const results: Array<Record<string, unknown>> = [];
+  for (const relPath of matches) {
+    if (signal?.aborted) {
+      break;
+    }
+    const slice = await readFileSlice(relPath, startLine, endLine, root);
+    if (!slice.ok) {
+      results.push({ path: relPath, error: slice.error });
+      continue;
+    }
+    let outcome: Record<string, unknown> | { error: string };
+    try {
+      outcome = await perFile(slice);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      outcome = { error: `perFile failed for '${relPath}': ${message}` };
+    }
+    results.push({ path: relPath, ...outcome });
+  }
+  return results;
+}
+
+/** True when every entry in a multi-file `results` array (see
+ * `processGlobMatches`) is an error -- used to decide the overall tool
+ * response's `isError` flag. A partial success (some files summarized/
+ * extracted fine, others not) is reported via each entry's own presence or
+ * absence of `error`, not as a top-level `isError: true` -- but a batch
+ * where NOTHING succeeded (every file errored, or the request was
+ * cancelled before any file was processed at all, leaving an empty array)
+ * should still surface as `isError: true`, matching every other tool
+ * handler's graceful-degradation convention in this file. */
+function allResultsErrored(results: Array<Record<string, unknown>>): boolean {
+  return results.every((result) => typeof result.error === "string");
+}
+
+/** Glob-pattern branch of the `summarize_file` tool handler (see its
+ * `server.registerTool` call above for the single-path branch). Summarizes
+ * every file `pattern` matches independently, returning `{ results }`
+ * instead of a single top-level `summary`. */
+async function summarizeGlob(
+  pattern: string,
+  focus: string | undefined,
+  startLine: number | undefined,
+  endLine: number | undefined,
+  extra: ToolExtra,
+): Promise<{ content: Array<{ type: "text"; text: string }>; isError?: boolean }> {
+  const expanded = await matchGlob(pattern);
+  if (!expanded.ok) {
+    return { content: [{ type: "text", text: JSON.stringify({ error: expanded.error }) }], isError: true };
+  }
+
+  const results = await processGlobMatches(
+    expanded.matches,
+    startLine,
+    endLine,
+    extra.signal,
+    WORKSPACE_ROOT,
+    async (slice) => {
+      const prompt =
+        "Summarize the following file content in 3-6 sentences, plain prose, " +
+        "no preamble." +
+        (focus ? ` Focus specifically on: ${focus}.` : "") +
+        "\n\n--- FILE CONTENT START ---\n" +
+        slice.content +
+        "\n--- FILE CONTENT END ---";
+
+      const generated = await generateStructured(
+        prompt,
+        { type: "object", properties: { summary: { type: "string" } }, required: ["summary"] },
+        makeProgressNotifier(extra),
+        extra.signal,
+      );
+      if (!generated.ok) {
+        return { error: generated.error };
+      }
+      const summary = generated.value.summary;
+      if (typeof summary !== "string") {
+        return { error: "model response missing string 'summary' field" };
+      }
+      return {
+        summary,
+        truncated: slice.truncated,
+        ...(slice.truncated ? { truncatedChars: slice.truncatedChars } : {}),
+      };
+    },
+  );
+
+  return {
+    content: [{ type: "text", text: JSON.stringify({ results }, null, 2) }],
+    isError: allResultsErrored(results),
+  };
+}
+
+/** Glob-pattern branch of the `extract` tool handler (see its
+ * `server.registerTool` call above for the single-path branch). Extracts
+ * `schema` from every file `pattern` matches independently, returning
+ * `{ results }` instead of a single top-level `data`. */
+async function extractGlob(
+  pattern: string,
+  schema: JsonSchema,
+  startLine: number | undefined,
+  endLine: number | undefined,
+  extra: ToolExtra,
+): Promise<{ content: Array<{ type: "text"; text: string }>; isError?: boolean }> {
+  const expanded = await matchGlob(pattern);
+  if (!expanded.ok) {
+    return { content: [{ type: "text", text: JSON.stringify({ error: expanded.error }) }], isError: true };
+  }
+
+  const results = await processGlobMatches(
+    expanded.matches,
+    startLine,
+    endLine,
+    extra.signal,
+    WORKSPACE_ROOT,
+    async (slice) => {
+      const prompt =
+        "Extract structured data from the following file content, matching " +
+        "the required JSON schema exactly. Return only the JSON object, no " +
+        "commentary." +
+        "\n\n--- FILE CONTENT START ---\n" +
+        slice.content +
+        "\n--- FILE CONTENT END ---";
+
+      const generated = await generateStructured(prompt, schema, makeProgressNotifier(extra), extra.signal);
+      if (!generated.ok) {
+        return { error: generated.error };
+      }
+      return {
+        data: generated.value,
+        truncated: slice.truncated,
+        ...(slice.truncated ? { truncatedChars: slice.truncatedChars } : {}),
+      };
+    },
+  );
+
+  return {
+    content: [{ type: "text", text: JSON.stringify({ results }, null, 2) }],
+    isError: allResultsErrored(results),
+  };
 }
 
 /** UTF-8 sequences are at most `MAX_UTF8_BYTES_PER_CHAR` bytes. Scans
