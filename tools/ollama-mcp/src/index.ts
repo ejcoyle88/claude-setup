@@ -270,6 +270,7 @@ server.registerTool(
         required: ["summary"],
       },
       makeProgressNotifier(extra),
+      extra.signal,
     );
     if (!generated.ok) {
       return { content: [{ type: "text", text: JSON.stringify({ error: generated.error }) }], isError: true };
@@ -346,7 +347,12 @@ server.registerTool(
       slice.content +
       "\n--- FILE CONTENT END ---";
 
-    const generated = await generateStructured(prompt, schema as JsonSchema, makeProgressNotifier(extra));
+    const generated = await generateStructured(
+      prompt,
+      schema as JsonSchema,
+      makeProgressNotifier(extra),
+      extra.signal,
+    );
     if (!generated.ok) {
       return { content: [{ type: "text", text: JSON.stringify({ error: generated.error }) }], isError: true };
     }
@@ -422,6 +428,7 @@ server.registerTool(
         required: ["label"],
       },
       makeProgressNotifier(extra),
+      extra.signal,
     );
     if (!generated.ok) {
       return { content: [{ type: "text", text: JSON.stringify({ error: generated.error }) }], isError: true };
@@ -956,6 +963,35 @@ export async function releaseGenerateLock(token: string, options: GenerateLockOp
  * a shorter RETRY_TIMEOUT_MS for its retry call (see that constant's doc
  * comment for why).
  *
+ * claude-144: `callerSignal` (when given) is the *incoming MCP request's*
+ * `AbortSignal` -- `extra.signal` in a tool handler, per the SDK's
+ * `RequestHandlerExtra` -- threaded all the way down from the tool handlers
+ * through `generateStructured`. Without this, a client that aborts/times out
+ * only tears down its own view of the call: the outbound `/api/generate`
+ * request keeps running against the sidecar for up to its own worst-case
+ * duration, worsening the exact single-instance contention `acquireGenerateLock`
+ * below exists to mitigate (see this bead's description). This is combined
+ * with the existing timeout-driven `AbortController` via `AbortSignal.any` --
+ * additive, not a replacement -- so either source aborts the fetch
+ * independently:
+ *   - an already-aborted `callerSignal` short-circuits before the generate
+ *     lock is even acquired -- no lock churn and no outbound fetch for a
+ *     call the client has already given up on.
+ *   - `callerSignal` aborting while the fetch is in flight cancels it
+ *     immediately, same latency as the timeout path.
+ *   - `GENERATE_TIMEOUT_MS`/`RETRY_TIMEOUT_MS`'s own timer-driven abort is
+ *     unchanged.
+ * The two abort causes are distinguished by re-checking `callerSignal?.aborted`
+ * after the fact, rather than trusting the rejection's shape/`name` -- a
+ * signal aborted with a custom `reason` (the MCP SDK does this on a cancel
+ * notification, see `Protocol._oncancel`) makes `fetch` reject with that
+ * `reason` value directly, not necessarily a `DOMException` named
+ * "AbortError". Either way this stays a network/timeout-class failure, not a
+ * malformed-response one, and `generateStructured` already only retries the
+ * latter (see its doc comment) -- so a client-cancelled call is never
+ * mistaken for a retryable transient failure, with no extra plumbing needed
+ * here.
+ *
  * claude-6ll: every call first goes through `acquireGenerateLock` -- a
  * cross-process, fail-fast serialization point (see its doc comment and
  * GENERATE_LOCK_PATH's for why this exists and why it fails fast instead of
@@ -969,13 +1005,31 @@ export async function releaseGenerateLock(token: string, options: GenerateLockOp
  * after this releases the lock) can still leave a brief window where a
  * freshly-acquiring caller's request lands on a still-busy sidecar anyway --
  * a residual gap this fail-fast design doesn't fully close, documented in
- * README's "Concurrent-session contention" section. */
-async function callOllamaGenerate(
+ * README's "Concurrent-session contention" section.
+ *
+ * `fetchImpl` defaults to the real global `fetch` and only exists so
+ * generate.test.ts can exercise this function's actual abort/timeout logic
+ * with a fake `fetch` instead of the real network -- same injectable pattern
+ * `checkOllamaHealth` already uses (see its doc comment). `lockOptions` is
+ * forwarded verbatim to `acquireGenerateLock`/`releaseGenerateLock` for the
+ * same reason lock.test.ts always passes its own scratch `lockPath`: so
+ * generate.test.ts never acquires/reclaims the real, shared
+ * `GENERATE_LOCK_PATH` a live `node dist/index.js` process on this host might
+ * actually be holding. Neither parameter changes this function's behavior
+ * for its real callers (`generateStructured`), which never pass them. */
+export async function callOllamaGenerate(
   prompt: string,
   format?: "json" | Record<string, unknown>,
   timeoutMs: number = GENERATE_TIMEOUT_MS,
+  callerSignal?: AbortSignal,
+  fetchImpl: typeof fetch = fetch,
+  lockOptions: GenerateLockOptions = {},
 ): Promise<GenerateResult> {
-  const lock = await acquireGenerateLock();
+  if (callerSignal?.aborted) {
+    return { ok: false, error: "request was cancelled by the caller before the generate call started" };
+  }
+
+  const lock = await acquireGenerateLock(lockOptions);
   if (lock.state === "busy") {
     const heldForDescription = Number.isFinite(lock.heldForMs) ? `${Math.round(lock.heldForMs / 1000)}s` : "an indeterminate time";
     return {
@@ -989,10 +1043,11 @@ async function callOllamaGenerate(
     };
   }
 
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const timeoutController = new AbortController();
+  const timer = setTimeout(() => timeoutController.abort(), timeoutMs);
+  const signal = callerSignal ? AbortSignal.any([timeoutController.signal, callerSignal]) : timeoutController.signal;
   try {
-    const response = await fetch(`${OLLAMA_HOST}/api/generate`, {
+    const response = await fetchImpl(`${OLLAMA_HOST}/api/generate`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
@@ -1001,7 +1056,7 @@ async function callOllamaGenerate(
         stream: false,
         ...(format !== undefined ? { format } : {}),
       }),
-      signal: controller.signal,
+      signal,
     });
     if (!response.ok) {
       const body = await response.text().catch(() => "");
@@ -1013,13 +1068,19 @@ async function callOllamaGenerate(
     }
     return { ok: true, response: body.response };
   } catch (error) {
+    if (callerSignal?.aborted) {
+      // The caller gave up mid-flight -- distinguish this from a genuine
+      // timeout/network failure (see this function's doc comment) so it's
+      // never mistaken for a retryable transient failure upstream.
+      return { ok: false, error: "request was cancelled by the caller" };
+    }
     const message = error instanceof Error ? error.message : String(error);
     const timedOut = error instanceof Error && error.name === "AbortError";
     return { ok: false, error: timedOut ? `timed out after ${timeoutMs}ms` : message };
   } finally {
     clearTimeout(timer);
     if (lock.state === "acquired") {
-      await releaseGenerateLock(lock.token);
+      await releaseGenerateLock(lock.token, lockOptions);
     }
   }
 }
@@ -1063,13 +1124,34 @@ type StructuredGenerateResult = { ok: true; value: Record<string, unknown> } | {
  * a test) -- callers in this file always pass a real notifier built via
  * `makeProgressNotifier`, which itself is a no-op unless the caller's
  * request carried a `progressToken`.
+ *
+ * `callerSignal` (claude-144) is the incoming MCP request's `AbortSignal`
+ * (a tool handler's `extra.signal`) -- forwarded unchanged to both of
+ * `callOllamaGenerate`'s calls (first attempt and retry) so a client-side
+ * abort/timeout cancels whichever outbound `/api/generate` call is actually
+ * in flight, not just this call's view of it. See `callOllamaGenerate`'s
+ * doc comment for how that's combined with the existing timeout-driven
+ * abort and how the two are distinguished. Optional and defaulted to
+ * `undefined` so existing/test callers that don't pass one keep working
+ * unchanged. `fetchImpl` (default: the real global `fetch`) and `lockOptions`
+ * (default: `{}`, i.e. the real `GENERATE_LOCK_PATH`) exist purely for
+ * generate.test.ts's benefit, same as `callOllamaGenerate`'s own parameters
+ * of the same names -- threaded through unchanged so a test can exercise
+ * this function's full retry/abort interaction with a fake `fetch` and an
+ * isolated scratch lock file instead of the real network/lock.
  */
-async function generateStructured(
+export async function generateStructured(
   prompt: string,
   schema: JsonSchema,
   notify: ProgressNotifier = NO_OP_PROGRESS_NOTIFIER,
+  callerSignal?: AbortSignal,
+  fetchImpl: typeof fetch = fetch,
+  lockOptions: GenerateLockOptions = {},
 ): Promise<StructuredGenerateResult> {
-  const first = await withPeriodicProgress(callOllamaGenerate(prompt, schema), notify);
+  const first = await withPeriodicProgress(
+    callOllamaGenerate(prompt, schema, GENERATE_TIMEOUT_MS, callerSignal, fetchImpl, lockOptions),
+    notify,
+  );
   if (!first.ok) {
     return { ok: false, error: first.error };
   }
@@ -1078,7 +1160,10 @@ async function generateStructured(
     return firstResult;
   }
 
-  const retry = await withPeriodicProgress(callOllamaGenerate(prompt, schema, RETRY_TIMEOUT_MS), notify);
+  const retry = await withPeriodicProgress(
+    callOllamaGenerate(prompt, schema, RETRY_TIMEOUT_MS, callerSignal, fetchImpl, lockOptions),
+    notify,
+  );
   if (!retry.ok) {
     return {
       ok: false,
