@@ -21,6 +21,16 @@ explicitly each time.
 Used by the overnight runner (`run-overnight.sh`): headless, nobody to answer
 questions. Everything below applies as written, with these overrides:
 
+- **No async callback channel between iterations.** Each overnight iteration is
+  a brand-new one-shot `claude -p` process; there is no later turn in this
+  process to be "notified" on. If a developer or reviewer is dispatched to run
+  in the background and the process exits before it resolves, its output is
+  silently discarded and any bead it claimed is left stranded `in_progress`.
+  Every subagent dispatch anywhere in this flow — Step 2's developer, Step 3's
+  reviewers, any fix re-dispatch — **must be awaited in the foreground** before
+  the iteration is considered to have made progress on it. Never end an
+  iteration (or move to the next step) while a dispatched subagent's result is
+  still outstanding.
 - **Never call `AskUserQuestion`** — there is no one to answer; the run would
   hang or die.
 - **Ambiguity → defer, don't guess.** If a bead is materially underspecified
@@ -85,11 +95,17 @@ beads in Step 4. If you genuinely can't tell, ask via `AskUserQuestion`.
 
 Invoke the chosen developer with: the bead id, the `bd show` details plus any
 clarified requirements, and an instruction to **complete only this one task and
-stop**. Tell it to use its skills and Serena tools as needed. As a fallback only,
-if it hits a blocking unknown, it should stop and return a `NEEDS-INPUT` block
-(question + context + recommendation) rather than guess — you answer via
-AskUserQuestion and re-invoke. Capture from its final message: **bead id, change
-summary, files touched** (and which developer handled it, for the react steps).
+stop**. Dispatch it in the **foreground** (`run_in_background: false`) and wait
+for its result before proceeding to Step 3 — never background this call. In
+unattended mode there is no later turn in this process to pick up a
+backgrounded result at all (see "no async callback channel" above); even
+interactively, Step 3 needs this developer's diff, so the dispatch must
+resolve before you move on regardless of mode. Tell it to use its skills and
+Serena tools as needed. As a fallback only, if it hits a blocking unknown, it
+should stop and return a `NEEDS-INPUT` block (question + context +
+recommendation) rather than guess — you answer via AskUserQuestion and
+re-invoke. Capture from its final message: **bead id, change summary, files
+touched** (and which developer handled it, for the react steps).
 
 ## Step 3 — Review cycles (at most two; the second is conditional)
 
@@ -107,8 +123,12 @@ put under git, since diff-based review and rollback both depend on it.
 
 **Round 1**
 
-1. In a **single message**, dispatch all three reviewers **in parallel** via Task,
-   handing each the resolved base ref, the diff, and the changed files:
+1. In a **single message**, dispatch all three reviewers **in parallel** via Task
+   — three foreground (`run_in_background: false`) tool calls in that one
+   message, which the harness runs concurrently and blocks on until all three
+   return, not three background dispatches. Wait for all three results before
+   continuing; never let this step complete with a reviewer still outstanding.
+   Hand each the resolved base ref, the diff, and the changed files:
    `security-reviewer`, `quality-reviewer`, `performance-reviewer`.
 2. **Verify each reviewer's response before trusting it — one re-dispatch
    decision, covering both checks together.** For each reviewer, evaluate both
@@ -131,8 +151,9 @@ put under git, since diff-based review and rollback both depend on it.
      the note. (Extra files read for context beyond what was dispatched are
      fine; only dispatched files going unaccounted for count.)
 
-   If either check is suspect, re-dispatch that reviewer **once**, re-checking
-   both on the retry; if either still fails, surface it as a single 🟡
+   If either check is suspect, re-dispatch that reviewer **once**, foreground
+   as always, re-checking both on the retry; if either still fails, surface it
+   as a single 🟡
    warning-level finding (so it survives the filter step below) — do not
    silently drop it. Evaluating both together caps this at one re-dispatch per
    reviewer per round even when both misfire, closing both the bogus-bail-out
@@ -148,8 +169,9 @@ put under git, since diff-based review and rollback both depend on it.
    not spend a second cycle.
 5. Otherwise, before invoking the developer, record a hash (or the literal
    text) of the diff you just reviewed — Round 2 below checks the fix against
-   this. Then invoke **the same developer that implemented the bead** with the
-   bead id, the changed files, and the blocking findings verbatim. Tell it to
+   this. Then invoke **the same developer that implemented the bead**, in the
+   foreground as in Step 2, with the bead id, the changed files, and the
+   blocking findings verbatim. Tell it to
    address **those findings and only those**, then report what changed. (Same
    NEEDS-INPUT escalation applies.) **Round 2 is reached only from here** —
    immediately after this developer-fix dispatch has returned — never merely
@@ -165,7 +187,7 @@ condition, not independent paths)
    developer-fix dispatch did not produce a delta — do not re-dispatch the
    reviewers against a diff they already reviewed. Instead, treat it as a
    failed fix: log/report that the fix dispatch produced no diff change, then
-   re-invoke the same developer once more with the same findings (first
+   re-invoke the same developer once more, foreground, with the same findings (first
    occurrence for this bead), then re-resolve the diff and re-compare against
    the same recorded hash/text before proceeding to item 2. If the diff still
    hasn't changed (i.e., this branch is being entered a second time for this
@@ -183,15 +205,17 @@ condition, not independent paths)
    mode, surface this via
    `AskUserQuestion` (developer's fix produced no diff change — retry,
    investigate manually, or abandon?) rather than silently deferring.
-2. If the diff did change, dispatch the same three reviewers in parallel on
-   the updated changes.
+2. If the diff did change, dispatch the same three reviewers in parallel — same
+   foreground, single-message convention as Round 1, item 1 — on the updated
+   changes.
 3. Apply the same combined verification as Round 1 (CANNOT REVIEW check, with
    its legitimate-bail-out exemption, plus the unconditional coverage-note
    check, capped at one re-dispatch per reviewer regardless of which condition
    failed), strip any `FILES REVIEWED:` line, then merge and filter to
    blocking findings as before.
-4. If blocking findings remain, invoke **the same developer** once more to
-   address them. Then **stop — do not run a third review.**
+4. If blocking findings remain, invoke **the same developer**, foreground, once
+   more to address them, and wait for it to return. Then **stop — do not run a
+   third review.**
 
 ## Step 4 — Close out and report
 
