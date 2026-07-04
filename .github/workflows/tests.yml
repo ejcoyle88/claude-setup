@@ -140,6 +140,71 @@ jobs:
         working-directory: .devcontainer
         run: docker compose up -d --wait --wait-timeout 90 loki prometheus grafana
 
+      # claude-wut: unlike loki/prometheus above, grafana defines no compose
+      # HEALTHCHECK, so `--wait` above only proves its container reached
+      # "running" -- not that its HTTP server actually answers, and not that
+      # datasource provisioning (grafana/provisioning/datasources/
+      # datasources.yml) succeeded. An image bump or a provisioning-YAML
+      # regression that leaves the grafana process running but its UI/API
+      # broken would pass the previous step silently -- exactly the failure
+      # mode this job exists to catch, just uncovered for grafana until now.
+      # Port 3000 is published to the host (`ports: ["3000:3000"]` on the
+      # grafana service), so plain localhost works from this runner.
+      #
+      # Two checks, retried together in one short, bounded loop (a cold
+      # grafana process can take a few seconds after "running" before its
+      # HTTP server actually answers):
+      #   - GET /api/health must return HTTP 200: confirms the web server
+      #     itself is up. NOTE: the bead suggested `?db=1` to also confirm
+      #     datasource wiring, but checked against current Grafana source
+      #     (pkg/api/http_server.go's apiHealthHandler): there is no `db`
+      #     query parameter, the endpoint always checks its database
+      #     unconditionally, and that "database" is Grafana's own internal
+      #     store (dashboards/users/orgs) -- NOT the provisioned
+      #     Prometheus/Loki datasources -- so it can't confirm provisioning
+      #     either way. Plain /api/health is used here instead.
+      #   - GET /api/datasources must list both "Prometheus" and "Loki":
+      #     this is what actually confirms provisioning succeeded, which
+      #     /api/health does not cover. Works unauthenticated here because
+      #     the grafana service sets GF_AUTH_ANONYMOUS_ENABLED=true with
+      #     GF_AUTH_ANONYMOUS_ORG_ROLE=Admin (listing datasources requires
+      #     the Admin role) -- fine for this local-only dev sandbox.
+      #
+      # 10 attempts x 2s = 20s max, on top of the 90s --wait-timeout above;
+      # a cold Grafana process is normally ready within a couple of seconds
+      # of "running", so this stays a smoke check, not a soak test, while
+      # still failing loudly (non-zero exit) if it never comes up.
+      - name: Verify grafana HTTP API and datasource provisioning
+        shell: bash
+        working-directory: .devcontainer
+        run: |
+          max_attempts=10
+          sleep_seconds=2
+          health_code="000"
+          health_body=""
+          datasources=""
+          for attempt in $(seq 1 "$max_attempts"); do
+            health_response=$(curl -s --max-time 5 -w '\n%{http_code}' http://localhost:3000/api/health)
+            health_code=$(echo "$health_response" | tail -n1)
+            health_body=$(echo "$health_response" | sed '$d')
+            datasources=$(curl -s --max-time 5 http://localhost:3000/api/datasources)
+            names=$(echo "$datasources" | jq -r '.[].name' 2>/dev/null || echo "")
+            if [ "$health_code" = "200" ] && echo "$names" | grep -qx "Prometheus" && echo "$names" | grep -qx "Loki"; then
+              echo "grafana HTTP API healthy and datasources provisioned after ${attempt} attempt(s):"
+              echo "$health_body"
+              echo "$datasources"
+              exit 0
+            fi
+            echo "grafana not fully ready yet (attempt ${attempt}/${max_attempts}, /api/health HTTP status: ${health_code}), retrying in ${sleep_seconds}s..."
+            sleep "$sleep_seconds"
+          done
+          echo "grafana did not become fully ready (HTTP API + datasource provisioning) within $((max_attempts * sleep_seconds))s" >&2
+          echo "last /api/health response (HTTP ${health_code}):" >&2
+          echo "$health_body" >&2
+          echo "last /api/datasources response:" >&2
+          echo "$datasources" >&2
+          exit 1
+
       - name: Show final service status
         if: always()
         shell: bash
