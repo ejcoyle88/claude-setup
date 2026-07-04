@@ -21,9 +21,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # setpriv (util-linux) drops NET_ADMIN/NET_RAW before ollama serve starts
 # (see ollama-entrypoint.sh) -- util-linux is Essential on Debian/Ubuntu so
 # it should already be present; fail the BUILD loudly here instead of
-# discovering it's missing at container start.
-RUN command -v setpriv >/dev/null || \
-  { echo "ERROR: setpriv not found (expected from util-linux)"; exit 1; }
+# discovering it's missing at container start. Beyond just existing, setpriv
+# must also ACCEPT the exact drop args ollama-entrypoint.sh invokes it with --
+# a prior regression used cap_-prefixed names (e.g. cap_net_admin) that
+# setpriv rejects; only the UN-prefixed form (net_admin/net_raw) is valid.
+# Running the real invocation with a harmless `true` payload proves both
+# existence and argument-acceptance in one shot: dropping an already-absent
+# capability still exits 0 (works regardless of this build container's own
+# cap set), so only a rejected cap NAME/flag fails the build here -- exactly
+# the class of error that otherwise slips through to a runtime failure.
+RUN setpriv --bounding-set=-net_admin,-net_raw --inh-caps=-net_admin,-net_raw true || \
+  { echo "ERROR: setpriv rejected the cap-drop args ollama-entrypoint.sh depends on (--bounding-set=-net_admin,-net_raw --inh-caps=-net_admin,-net_raw); check setpriv is installed from util-linux and its cap names are un-prefixed (net_admin/net_raw, not cap_net_admin/cap_net_raw)"; exit 1; }
 
 COPY firewall-common.sh /usr/local/bin/firewall-common.sh
 COPY ollama-init-firewall.sh /usr/local/bin/ollama-init-firewall.sh

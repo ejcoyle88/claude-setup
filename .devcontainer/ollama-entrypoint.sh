@@ -8,7 +8,7 @@
 # non-devcontainer-CLI services).
 set -euo pipefail
 
-readonly SETPRIV_DROP=(--bounding-set=-cap_net_admin,-cap_net_raw --inh-caps=-cap_net_admin,-cap_net_raw)
+readonly SETPRIV_DROP=(--bounding-set=-net_admin,-net_raw --inh-caps=-net_admin,-net_raw)
 
 # Fail-closed gate: whether the firewall has already been applied AND this
 # process has already been re-exec'd through setpriv (see the re-exec below)
