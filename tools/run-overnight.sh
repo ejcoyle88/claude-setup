@@ -39,6 +39,15 @@
 #       no prompt text) unless you opt in via OTEL_LOG_USER_PROMPTS etc.
 #       Each worker is tagged via OTEL_RESOURCE_ATTRIBUTES (run.id, worker.id).
 #   STOP_FILE=<project>/.stop-overnight   touch to stop all workers gracefully
+#       ACCEPTED RESIDUAL LIMITATION: checked purely by existence, same-UID
+#       writable by every worker's own headless claude -p agent — any worker
+#       can touch this (or the internal two-stage-cancel flag file described
+#       next to _OVERNIGHT_STOP_FLAG_FILE's definition, same exposure) and
+#       halt every other worker. No UID/sandbox boundary exists between main
+#       and the worker agents here to prevent it; the accepted mitigation is
+#       that a flag-file-observed halt is logged LOUDLY and distinguishably
+#       from a genuine operator Ctrl+C in the top-level summary (see
+#       run_worker's graceful-stop check) rather than left silent.
 #
 #   MCP trust gate (claude-9hl): headless `claude -p` auto-connects a
 #       project's .mcp.json MCP servers with NO trust prompt and no fail-closed
@@ -156,7 +165,38 @@
 
 set -u
 
+# claude-14w (review round 2, quality/security finding): PROJECT_DIR is
+# ALWAYS (re)computed fresh from $1 here — an already-exported PROJECT_DIR in
+# the environment is deliberately ignored at top level. Generic-sounding names
+# like PROJECT_DIR are exactly the kind of thing an operator's shell, a CI
+# job, a devcontainer, or a wrapper script might already have exported; if we
+# preferred an inherited value unconditionally, a plain
+# `./run-overnight.sh /some/other/project` would silently ignore its own `$1`
+# and operate on whatever stale PROJECT_DIR happened to be set — a surprising,
+# hard-to-diagnose regression, and (since PROJECT_DIR feeds mkdir/paths below)
+# unwanted env-influenced path surface.
+#
+# The ONE caller that legitimately needs to hand a worker subprocess the
+# exact PROJECT_DIR main already resolved is main's own parallel launch block
+# (below), which re-sources this file in a brand-new `bash -c` process whose
+# own $1 is that worker's SELF_PATH/args tuple, NOT a project directory — so
+# recomputing from $1 there would try to `cd` into a script path and abort
+# the worker outright. That path is signaled via the distinctly-named
+# _OVERNIGHT_IS_WORKER=1 + _OVERNIGHT_WORKER_PROJECT_DIR, NOT via PROJECT_DIR
+# itself, so normal top-level invocations remain immune to environment
+# pollution under the generic name.
 PROJECT_DIR="$(cd "${1:-$PWD}" && pwd)" || exit 1
+# Only main's own parallel launch block sets _OVERNIGHT_IS_WORKER=1 (along
+# with _OVERNIGHT_WORKER_PROJECT_DIR/_OVERNIGHT_WORKER_RUN_ID, set just below
+# once RUN_ID is computed) before re-sourcing this file for a worker
+# subprocess — see that block's docstring. Everyone else (a normal top-level
+# invocation, and the test suite's own `source`ing of this file, neither of
+# which sets _OVERNIGHT_IS_WORKER) gets the freshly-computed value above,
+# regardless of what happens to be exported under the generic PROJECT_DIR
+# name.
+if [ "${_OVERNIGHT_IS_WORKER:-0}" = "1" ]; then
+  PROJECT_DIR="$_OVERNIGHT_WORKER_PROJECT_DIR"
+fi
 MAX_ITERATIONS="${MAX_ITERATIONS:-20}"
 RUN_TIMEOUT="${RUN_TIMEOUT:-90m}"
 MAX_CONSEC_FAILURES="${MAX_CONSEC_FAILURES:-3}"
@@ -173,20 +213,26 @@ MAX_TOTAL_COST_USD="${MAX_TOTAL_COST_USD:-50}"
 PARALLEL_WORKERS="${PARALLEL_WORKERS:-1}"
 WORKTREE_BASE="${WORKTREE_BASE:-$PROJECT_DIR/.overnight-worktrees}"
 
-# ── Signal handling (claude-23n): two-stage Ctrl+C cancel ───────────────────
+# ── Signal handling (claude-23n / claude-14w): two-stage Ctrl+C cancel ──────
 # 1st Ctrl+C: stop launching new iterations, let the in-flight claude finish,
 #   then exit. 2nd Ctrl+C: hard-kill the in-flight claude (+ its `timeout`
 #   wrapper) right now. Either way: skip the end-of-night /analyze-telemetry
 #   pass, but still merge worker summaries (finalize) + check_telemetry_health,
 #   and exit non-zero. Installed as an actual `trap` only inside the
 #   BASH_SOURCE guard in main (below) — sourcing this file for tests must not
-#   install a trap in the sourcing shell. These three globals plus
+#   install a trap in the sourcing shell. These globals plus
 #   register_pgid/deregister_pgid/run_in_pgroup/finalize (defined further
-#   down, all side-effect-free to merely *source*) are the shared contract:
-#   this bead wires only the single-worker path; parallel-mode coordination
-#   across worker subshells (each `run_worker ... &` gets its own forked copy
-#   of these globals, which this bead deliberately does not reconcile) is
-#   claude-14w's scope.
+#   down, all side-effect-free to merely *source*) are the shared contract.
+#   claude-23n wired the single-worker path, where run_worker executes
+#   directly inside main's own process, so these globals (being ordinary bash
+#   variables) are naturally shared with the trap. claude-14w extends this to
+#   PARALLEL_WORKERS>1: each worker there is a genuinely SEPARATE process
+#   (its own private copy of every global below), so main's trap coordinates
+#   with them via two channels that DO cross process boundaries instead: the
+#   shared _OVERNIGHT_STOP_FLAG_FILE (graceful) and `kill -TERM -- -<pgid>`
+#   against each worker's own registered process group (hard-kill) — see
+#   run_worker_in_pgroup(), _overnight_worker_term_handler(), and the
+#   parallel launch block in main for the full mechanism.
 _OVERNIGHT_INTERRUPT_COUNT=0
 _OVERNIGHT_GRACEFUL_STOP=0
 _OVERNIGHT_PGIDS=()
@@ -198,6 +244,18 @@ _OVERNIGHT_FINALIZED=0
 # for the hard-kill path — overridable for tests, not documented as a public
 # knob.
 _OVERNIGHT_KILL_GRACE_SECS="${_OVERNIGHT_KILL_GRACE_SECS:-5}"
+# claude-14w: the ANALOGOUS grace period, but for a parallel worker leader's
+# OWN local cleanup of its own nested claude/timeout session (see
+# _overnight_worker_term_handler() below) when it gets SIGTERM'd by main's
+# hard-kill. Deliberately much shorter than _OVERNIGHT_KILL_GRACE_SECS above:
+# main's outer grace/escalation loop polls whether each worker's pgid is
+# still alive and SIGKILLs it once ITS grace period elapses. If the worker
+# leader were still mid-cleanup (waiting on ITS OWN inner grace period) when
+# main's outer grace expires, main could SIGKILL the worker leader before it
+# finishes tearing down its own nested grandchild, orphaning it. Keeping this
+# knob meaningfully smaller than the outer one gives the inner cleanup room
+# to always finish first.
+_OVERNIGHT_WORKER_KILL_GRACE_SECS="${_OVERNIGHT_WORKER_KILL_GRACE_SECS:-2}"
 
 # ── OpenTelemetry: metrics + logs from every claude run → OTLP collector ────
 OTEL_ENABLED="${OTEL_ENABLED:-1}"
@@ -213,10 +271,70 @@ if [ "$OTEL_ENABLED" = "1" ]; then
   export OTEL_LOGS_EXPORT_INTERVAL="${OTEL_LOGS_EXPORT_INTERVAL:-5000}"
 fi
 
-RUN_ID="$(date +%Y%m%d-%H%M%S)"
+# claude-14w (review round 2): RUN_ID is ALWAYS (re)computed fresh here too —
+# same reasoning as PROJECT_DIR above. RUN_ID is interpolated unescaped into
+# LOG_DIR (feeding mkdir -p/$SUMMARY) and into the git branch name
+# overnight/$RUN_ID-w<N>, so an inherited RUN_ID under the generic name would
+# be new path/ref-name surface an operator's shell, CI job, or wrapper script
+# could influence. Only a worker subprocess (_OVERNIGHT_IS_WORKER=1, set by
+# main's parallel launch block below, together with _OVERNIGHT_WORKER_RUN_ID
+# carrying the exact value main computed) adopts an inherited identity —
+# without this, a worker would stamp its OWN fresh `date` timestamp, landing
+# its logs, its session markers, and its OTEL_RESOURCE_ATTRIBUTES run.id
+# under a DIFFERENT RUN_ID/LOG_DIR than the main run that spawned it —
+# silently splitting one run's telemetry/logs across two directories. The
+# inherited value is validated against a strict timestamp shape before use
+# (belt-and-suspenders against a corrupted/injected internal handoff — this
+# can never fire in normal operation since main always sets it from its own
+# `date` call just above).
+if [ "${_OVERNIGHT_IS_WORKER:-0}" = "1" ]; then
+  case "$_OVERNIGHT_WORKER_RUN_ID" in
+    [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9]) ;;
+    *)
+      echo "run-overnight.sh: internal error: _OVERNIGHT_WORKER_RUN_ID ('${_OVERNIGHT_WORKER_RUN_ID:-}') is not a YYYYMMDD-HHMMSS timestamp — refusing to trust it as RUN_ID." >&2
+      exit 1
+      ;;
+  esac
+  RUN_ID="$_OVERNIGHT_WORKER_RUN_ID"
+else
+  RUN_ID="$(date +%Y%m%d-%H%M%S)"
+fi
 LOG_DIR="$PROJECT_DIR/.overnight-logs/$RUN_ID"
 mkdir -p "$LOG_DIR"
 SUMMARY="$LOG_DIR/summary.log"
+# claude-14w: internal flag FILE (distinct from the user-facing $STOP_FILE —
+# do not conflate the two) that lets a graceful-stop request cross process
+# boundaries. _OVERNIGHT_GRACEFUL_STOP (below) is an in-memory flag that only
+# the process that sets it can see — fine for the single-worker path, where
+# run_worker executes directly inside main's own process, but useless for a
+# PARALLEL_WORKERS>1 worker leader, which is a SEPARATE process (see main's
+# parallel launch block) with its own private copy of every global. This
+# path is a pure function of LOG_DIR, which is itself now guaranteed
+# identical across main and every worker (see RUN_ID/PROJECT_DIR above), so
+# no separate export is needed for it to resolve to the same file everywhere.
+#
+# ACCEPTED RESIDUAL LIMITATION (claude-14w review, finding 2 — by design, not
+# a bug, same spirit as the MCP-trust-gate residual limitation documented
+# above): this file is checked purely by EXISTENCE, with no authenticity
+# check, and it lives under $LOG_DIR — same-UID writable by every worker's
+# own headless `claude -p` agent process. A misbehaving or prompt-injected
+# worker agent could therefore `touch` it directly and cause every sibling
+# worker (and the main launch loop) to halt gracefully after their current
+# iteration — a cross-worker griefing/DoS. There is no UID/sandbox boundary
+# between main and the worker agents in this environment to enforce against
+# that (every worker leader and its nested claude run as the same identity
+# as main), so an options that requires one is not achievable here. This is
+# NOT a new privilege, though: the pre-existing user-facing $STOP_FILE
+# mechanism already grants any worker/agent the identical "touch a file,
+# halt every worker" capability with no authenticity check either — this
+# flag file just extends the same, already-accepted exposure to the
+# in-process graceful-stop path. The mitigation actually taken (see the
+# graceful-stop check in run_worker's iteration loop, and the matching check
+# in main's parallel launch loop) is to make a flag-file-observed halt LOUD
+# in main's own top-level summary — distinguishable from a genuine
+# in-process operator Ctrl+C/SIGTERM — so a sabotaged night is visible
+# rather than silently indistinguishable from a clean one.
+_OVERNIGHT_STOP_FLAG_FILE="$LOG_DIR/.graceful-stop"
 
 WORKER_BUDGET="$(python3 -c "print(round($MAX_TOTAL_COST_USD / $PARALLEL_WORKERS, 2))")"
 
@@ -818,6 +936,35 @@ run_in_pgroup() { # run_in_pgroup <pgid-outvar> <logfile> -- <command...>
   printf -v "$__pgid_var" '%s' "$pid"
 }
 
+# run_worker_in_pgroup <pgid-outvar> <command...> — claude-14w. Same
+# `setsid ... &` + register_pgid() mechanism as run_in_pgroup() above (same
+# verified invariant: launching a non-job-controlled background child under
+# `setsid` makes the captured $! itself the new session/process-group
+# leader, with no extra fork layer in between — see run_in_pgroup's
+# docstring), used here to give each PARALLEL_WORKERS>1 worker LEADER its own
+# killable process group instead of the plain `run_worker ... & ` this
+# replaces (which left the worker in main's own pgid, immune to a targeted
+# `kill -TERM -- -<pgid>` and to the terminal's Ctrl+C alike — the exact
+# POSIX-async-list bug this bead exists to fix).
+#
+# Deliberately does NOT redirect stdout/stderr to a logfile the way
+# run_in_pgroup does: a worker leader's own output is just its wlog() calls
+# echoing to the terminal (each line is ALSO durably written to
+# worker-<N>.log by wlog itself), and pre-claude-14w that output was already
+# visible live on the terminal (plain `run_worker ... &` inherits the
+# parent's stdout). Forcing it through run_in_pgroup's logfile redirection
+# would silently take that live visibility away with no behavior upside —
+# so this is intentionally a separate, narrower helper rather than a second
+# call site reusing run_in_pgroup with a throwaway logfile.
+run_worker_in_pgroup() { # run_worker_in_pgroup <pgid-outvar> <command...>
+  local __pgid_var="$1"
+  shift 1
+  setsid "$@" &
+  local pid=$!
+  register_pgid "$pid"
+  printf -v "$__pgid_var" '%s' "$pid"
+}
+
 # assert_pgroup_invariant <leaderpid> <wsum> — claude-23n review F1. The
 # entire hard-kill path rests on an invariant that is TRUE in this sandbox
 # (verified empirically: see run_in_pgroup's docstring) but is an
@@ -851,6 +998,31 @@ assert_pgroup_invariant() { # assert_pgroup_invariant <leaderpid> <wsum>
   if [ "$childpgid" != "$leaderpid" ]; then
     wlog "$wsum" "WARNING: process-group teardown invariant broken — claude (pid $childpid) is in pgid $childpgid, NOT the setsid leader's pgid $leaderpid. A 2nd Ctrl+C's 'kill -TERM -- -$leaderpid' would only reach the idle timeout wrapper, not claude — claude would be orphaned and keep running/burning tokens after this script reports 'aborting now'. This means the setsid+timeout process-group behavior claude-23n verified empirically no longer holds in this environment; investigate the coreutils/util-linux versions before relying on the hard-kill path."
   fi
+}
+
+# assert_worker_pgroup_invariant <workerpid> — claude-14w. Same "verify, don't
+# just trust the docstring" philosophy as assert_pgroup_invariant() above,
+# but for the OTHER load-bearing invariant this bead introduces:
+# run_worker_in_pgroup's `setsid <cmd> &` must make the captured $! itself
+# the leader of a brand-new process group (pgid == pid), so main's
+# `kill -TERM -- -<pid>` on a 2nd Ctrl+C actually reaches the whole worker
+# session instead of a pgid the worker merely inherited from main (the exact
+# POSIX-async-list bug this bead exists to fix). Bounded, best-effort, never
+# aborts the run — only makes a broken invariant loud, matching
+# assert_pgroup_invariant's pattern (including its short, bounded poll: the
+# child may not have completed its setsid(2) call in the instant right after
+# `&` returns).
+assert_worker_pgroup_invariant() { # assert_worker_pgroup_invariant <workerpid>
+  local pid="$1" pgid="" tries=0
+  command -v ps >/dev/null 2>&1 || return 0
+  while [ "$tries" -lt 20 ]; do
+    pgid="$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d '[:space:]')"
+    [ -n "$pgid" ] || return 0  # process already gone — nothing to check
+    [ "$pgid" = "$pid" ] && return 0
+    sleep 0.1
+    tries=$((tries + 1))
+  done
+  log "WARNING: worker pid $pid is in pgid $pgid, NOT its own pid — the setsid session-leader invariant run_worker_in_pgroup() relies on does not hold in this environment. A 2nd Ctrl+C's 'kill -TERM -- -$pid' will not reach this worker's process group at all; it may keep running (and its own in-flight claude/timeout with it) unsupervised after this script reports 'aborting now'."
 }
 
 # finalize — merge each worker's per-worker summary log into the run's main
@@ -892,52 +1064,35 @@ _overnight_interrupted_during() { # _overnight_interrupted_during <pre-call-flag
   [ "$1" = "0" ] && [ "$_OVERNIGHT_GRACEFUL_STOP" = "1" ]
 }
 
-# _overnight_interrupt_handler — the INT/TERM trap body (claude-23n).
-# Registered via `trap` in main, inside the BASH_SOURCE guard below, so
-# `source`-ing this file for tests never installs a trap in the sourcing
-# shell (defining this function, like every other function in this file, is
-# side-effect-free). Two-stage Ctrl+C:
-#   1st signal: set the graceful-stop flag and return. run_worker's loop
-#     polls that flag (alongside its existing STOP_FILE check) and stops
-#     launching NEW iterations, but does NOT touch whatever claude/timeout is
-#     already in flight — it runs to completion.
-#   2nd signal: SIGTERM every registered pgid (tears down `timeout`+`claude`
-#     together — see run_in_pgroup's docstring), confirm-and-escalate to
-#     SIGKILL (claude-23n review F2 — see below), merge whatever per-worker
-#     summaries exist (finalize) + run check_telemetry_health, and exit
-#     non-zero. This intentionally skips the end-of-night /analyze-telemetry
-#     pass (mirrors the end-of-script guard on the graceful path in main).
-# Parallel-mode coordination (claude-14w) across worker subshells is out of
-# scope here: each `run_worker ... &` background job forks its own private
-# copy of _OVERNIGHT_PGIDS, so today only the single-worker path (run_worker
-# called directly, not backgrounded) is actually hard-killable from here —
-# see the PARALLEL_WORKERS>1 startup WARNING in main (claude-23n review F5).
-_overnight_interrupt_handler() {
-  _OVERNIGHT_INTERRUPT_COUNT=$((_OVERNIGHT_INTERRUPT_COUNT + 1))
-  if [ "$_OVERNIGHT_INTERRUPT_COUNT" -eq 1 ]; then
-    _OVERNIGHT_GRACEFUL_STOP=1
-    log "Interrupt received — finishing current iteration; press Ctrl+C again to abort now."
-    return
-  fi
-  if [ "${PARALLEL_WORKERS:-1}" -gt 1 ]; then
-    log "Second interrupt — aborting now. NOTE (claude-14w territory): PARALLEL_WORKERS=$PARALLEL_WORKERS — this hard-kill only reaches pgids registered in THIS shell; parallel workers running in their own subshells are NOT hard-killed by this and may keep running."
-  else
-    log "Second interrupt — aborting now."
-  fi
-  local pgid
+# _overnight_kill_registered_pgids <grace_secs> — claude-14w: factored out of
+# _overnight_interrupt_handler's 2nd-signal body (claude-23n review F2's
+# SIGTERM-then-confirm-then-SIGKILL logic), so BOTH main's own hard-kill trap
+# AND each parallel worker leader's own local TERM trap
+# (_overnight_worker_term_handler, below) call this exact logic instead of
+# duplicating it — same "factor it out" spirit as finalize(). This operates
+# on THIS PROCESS's own _OVERNIGHT_PGIDS array: since that array is an
+# ordinary bash global, calling this function from different processes
+# (main vs. a worker leader) naturally acts on that process's own registered
+# pgids with no cross-talk — main's registry holds worker leader pgids (and,
+# in single-worker mode, claude/timeout pgids directly); a worker leader's
+# own registry holds only ITS nested claude/timeout pgids (see
+# run_in_pgroup's docstring on why that's a separate, detached session that
+# main's own `kill -TERM -- -<workerpid>` cannot reach directly).
+#
+# SIGTERM every registered pgid, poll for up to <grace_secs> (bounded — must
+# never hang) confirming death, then SIGKILL any survivor. claude-23n review
+# F2: SIGTERM can be trapped, delayed, or missed mid-syscall by claude/timeout
+# — without confirming death and escalating, a survivor is silently orphaned
+# after the caller exits (still burning tokens, nothing watching the budget)
+# even though the operator was told "aborting now".
+_overnight_kill_registered_pgids() { # _overnight_kill_registered_pgids <grace_secs>
+  local grace_secs="${1:-$_OVERNIGHT_KILL_GRACE_SECS}" pgid waited=0
+  local -a alive_pgids=()
   for pgid in "${_OVERNIGHT_PGIDS[@]}"; do
     [ -n "$pgid" ] || continue
     kill -TERM -- "-$pgid" 2>/dev/null \
       || { kill -0 -- "-$pgid" 2>/dev/null && log "WARNING: kill -TERM -- -$pgid failed even though the group is still alive — will still attempt SIGKILL below."; }
   done
-  # claude-23n review F2: SIGTERM can be trapped, delayed, or missed
-  # mid-syscall by claude/timeout — without confirming death and escalating,
-  # a survivor is silently orphaned after this script exits (still burning
-  # tokens, with nothing watching the budget) while the operator was told
-  # "aborting now". Poll for up to _OVERNIGHT_KILL_GRACE_SECS (bounded — no
-  # unbounded wait), then SIGKILL any group still alive.
-  local grace_secs="${_OVERNIGHT_KILL_GRACE_SECS:-5}" waited=0
-  local -a alive_pgids=()
   while [ "$waited" -lt "$grace_secs" ]; do
     alive_pgids=()
     for pgid in "${_OVERNIGHT_PGIDS[@]}"; do
@@ -953,6 +1108,75 @@ _overnight_interrupt_handler() {
     kill -KILL -- "-$pgid" 2>/dev/null \
       || log "WARNING: kill -KILL -- -$pgid failed — it may already be gone, or this identity lacks permission to kill it. Check for an orphaned claude/timeout process manually."
   done
+}
+
+# _overnight_worker_term_handler — claude-14w: the TERM trap body installed
+# INSIDE each parallel worker leader's own re-sourced process (see
+# run_worker_in_pgroup()'s caller in main's parallel launch block), NOT in
+# main itself. Why a worker needs its OWN, separate trap rather than relying
+# on main's: main's hard-kill sends `kill -TERM -- -<workerpid>`, which
+# reaches every process IN the worker's own process group — including the
+# worker leader process itself — but NOT the worker's nested claude/timeout
+# pair, because run_in_pgroup's `setsid` call inside run_worker() succeeds
+# AGAIN there (setsid(2)'s restriction is "caller must not already be a
+# process-group leader" — the freshly-forked grandchild about to exec setsid
+# is not itself a leader, regardless of its ancestor being one), creating a
+# SECOND, fully detached session. So main's signal only ever reaches the
+# worker LEADER — this trap is what makes that leader, upon receiving it,
+# turn around and clean up its own nested session using its own,
+# process-local _OVERNIGHT_PGIDS registry (populated correctly already,
+# since register_pgid()/run_in_pgroup() just mutate whatever process calls
+# them — here, the worker leader's).
+#
+# Uses _OVERNIGHT_WORKER_KILL_GRACE_SECS (deliberately shorter than main's
+# own _OVERNIGHT_KILL_GRACE_SECS — see that variable's docstring for the
+# race this avoids), then exits immediately: this trap firing IS this
+# worker's entire hard-stop, there is no "finish the current iteration"
+# concept to fall back to once main has decided to hard-kill.
+_overnight_worker_term_handler() {
+  _overnight_kill_registered_pgids "$_OVERNIGHT_WORKER_KILL_GRACE_SECS"
+  exit 143  # 128 + SIGTERM(15): conventional signal-exit status
+}
+
+# _overnight_interrupt_handler — the INT/TERM trap body (claude-23n;
+# extended to parallel mode by claude-14w). Registered via `trap` in main,
+# inside the BASH_SOURCE guard below, so `source`-ing this file for tests
+# never installs a trap in the sourcing shell (defining this function, like
+# every other function in this file, is side-effect-free). Two-stage
+# Ctrl+C:
+#   1st signal: set the in-process graceful-stop flag (single-worker path:
+#     run_worker executes directly inside main, so this flag alone is
+#     enough) AND create the shared _OVERNIGHT_STOP_FLAG_FILE (parallel
+#     path: each worker is a separate process with no shared memory, so it
+#     polls for this file's existence instead — see run_worker's loop-top
+#     check). Either way: stop launching NEW iterations, but do NOT touch
+#     whatever claude/timeout is already in flight anywhere — it runs to
+#     completion.
+#   2nd signal: hard-kill. In single-worker mode, _OVERNIGHT_PGIDS (this
+#     process's registry) holds the in-flight claude/timeout pgid directly.
+#     In parallel mode, it holds each WORKER LEADER's pgid (registered by
+#     run_worker_in_pgroup() in main's parallel launch block) — SIGTERM'ing
+#     those reaches each worker leader, whose OWN local trap
+#     (_overnight_worker_term_handler, above) then recursively tears down
+#     that worker's nested claude/timeout session. Either way,
+#     _overnight_kill_registered_pgids (factored out below, claude-14w) does
+#     the SIGTERM-then-confirm-then-SIGKILL work; then merge whatever
+#     per-worker summaries exist (finalize) + run check_telemetry_health,
+#     and exit non-zero. This intentionally skips the end-of-night
+#     /analyze-telemetry pass (mirrors the end-of-script guard on the
+#     graceful path in main).
+_overnight_interrupt_handler() {
+  _OVERNIGHT_INTERRUPT_COUNT=$((_OVERNIGHT_INTERRUPT_COUNT + 1))
+  if [ "$_OVERNIGHT_INTERRUPT_COUNT" -eq 1 ]; then
+    _OVERNIGHT_GRACEFUL_STOP=1
+    if ! touch "$_OVERNIGHT_STOP_FLAG_FILE" 2>/dev/null; then
+      log "WARNING: could not create internal graceful-stop flag file $_OVERNIGHT_STOP_FLAG_FILE — any PARALLEL_WORKERS>1 worker (a separate process) will NOT see this graceful-stop request and may keep launching new iterations. The in-process worker path (PARALLEL_WORKERS<=1) is unaffected — it uses the in-memory flag above."
+    fi
+    log "Interrupt received — finishing current iteration; press Ctrl+C again to abort now."
+    return
+  fi
+  log "Second interrupt — aborting now."
+  _overnight_kill_registered_pgids "$_OVERNIGHT_KILL_GRACE_SECS"
   finalize
   check_telemetry_health
   exit 130
@@ -996,8 +1220,40 @@ run_worker() { # run_worker <index> <workdir>
     # (if any, from a previous pass through this loop) already ran to
     # completion before we got back here — nothing to shield/kill on this
     # path, that's the hard-kill (2nd signal) path in the trap itself.
+    #
+    # claude-14w: _OVERNIGHT_GRACEFUL_STOP alone only works when run_worker
+    # executes directly inside main's own process (PARALLEL_WORKERS<=1) —
+    # main's trap setting a plain bash variable is invisible to a genuinely
+    # separate PARALLEL_WORKERS>1 worker process. That's what the shared
+    # _OVERNIGHT_STOP_FLAG_FILE is for: main's trap creates it on the 1st
+    # signal (in addition to setting the in-memory flag), and every worker
+    # — in-process or out-of-process alike — polls for its existence here,
+    # same as the pre-existing $STOP_FILE check just above.
+    # claude-14w review (finding 2): distinguish the two ways this loop can
+    # observe a graceful-stop request, rather than folding them into one log
+    # line. _OVERNIGHT_GRACEFUL_STOP=1 in THIS process's own memory is only
+    # ever set by THIS process's own INT/TERM trap — i.e. a genuine operator
+    # Ctrl+C/SIGTERM landed on the process actually running this loop
+    # (always true in single-worker mode, since run_worker executes directly
+    # inside main). The stop-flag-FILE case is different: it is same-UID
+    # writable by every worker's own headless `claude -p` agent process (see
+    # _OVERNIGHT_STOP_FLAG_FILE's definition above for why, and why that's an
+    # accepted residual limitation — the same exposure the pre-existing
+    # user-facing $STOP_FILE already has), so a worker observing the file
+    # rather than its own in-process flag cannot tell "main asked me to stop"
+    # apart from "a sibling worker's agent touched this file itself." Log
+    # that case LOUDLY via log() (not just wlog()) so it lands directly in
+    # $SUMMARY as it happens — every worker process resolves the same
+    # $SUMMARY path (see RUN_ID/PROJECT_DIR docstrings), so this reaches the
+    # top-level summary an operator actually reads, not just a per-worker
+    # log that only surfaces at finalize()-merge time. This does NOT change
+    # the halt behavior itself, only its visibility.
     if [ "$_OVERNIGHT_GRACEFUL_STOP" = "1" ]; then
-      wlog "$wsum" "Graceful interrupt received — not launching a new iteration; halting."
+      wlog "$wsum" "Graceful interrupt received (operator signal in this process) — not launching a new iteration; halting."
+      break
+    elif [ -f "$_OVERNIGHT_STOP_FLAG_FILE" ]; then
+      wlog "$wsum" "Graceful interrupt received (stop-flag file observed) — not launching a new iteration; halting."
+      log "GRACEFUL STOP FLAG OBSERVED by worker $idx — halting after its current iteration. This worker's OWN in-process operator-signal flag was NOT set, so this stop was observed via $_OVERNIGHT_STOP_FLAG_FILE rather than a direct Ctrl+C/SIGTERM to this process. That file is same-UID writable by any worker's own agent (accepted residual limitation, documented at its definition) — if this run was not intentionally interrupted by the operator, treat this as a possible sibling-worker-triggered stop and inspect worker-$idx.log / that worker's iteration logs before trusting the rest of tonight's results."
       break
     fi
 
@@ -1199,7 +1455,7 @@ else
 fi
 log "Stop file: $STOP_FILE"
 if [ "$PARALLEL_WORKERS" -gt 1 ]; then
-  log "WARNING: two-stage Ctrl+C cancel (claude-23n) currently covers the single-worker path only — with PARALLEL_WORKERS=$PARALLEL_WORKERS, each run_worker forks its own private copy of the pgid registry, so this shell's trap CANNOT hard-kill in-flight parallel workers yet (tracked in claude-14w). A 2nd Ctrl+C will still merge whatever summaries exist and exit, but parallel claude/timeout processes may keep running afterward."
+  log "Two-stage Ctrl+C cancel (claude-14w) covers PARALLEL_WORKERS=$PARALLEL_WORKERS: each worker runs in its own setsid session; 1st Ctrl+C lets every worker finish its current iteration then halt, 2nd Ctrl+C hard-kills every worker's in-flight claude/timeout via its own local cleanup trap."
 fi
 
 # MCP trust gate (claude-9hl): fail closed BEFORE even the preflight probe —
@@ -1230,18 +1486,98 @@ else
   log "Parallel mode: workers use git worktrees under $WORKTREE_BASE on branches overnight/$RUN_ID-w<N>."
   log "REMINDER: parallel claiming is only safe if bd serves SHARED state (server mode); per-worktree .beads files do not see each other's claims."
   mkdir -p "$WORKTREE_BASE"
+
+  # claude-14w: each worker is re-launched as THIS SAME SCRIPT, re-sourced in
+  # a brand-new `setsid` session (own pgid) inside a fresh bash process, via
+  # run_worker_in_pgroup() — see that function's docstring for why a plain
+  # `run_worker "$w" "$WT" &` (the pre-claude-14w form) can never be
+  # hard-killed on its own: backgrounded like that, it stays in THIS shell's
+  # own pgid (POSIX async-list behavior) rather than getting one of its own.
+  #
+  # Resolve an ABSOLUTE path up front (rather than trusting a possibly
+  # relative $0/BASH_SOURCE[0] to still resolve correctly from whatever cwd
+  # the re-exec'd bash -c ends up with) so the worker's `source` always finds
+  # this exact file regardless of how this script itself was invoked
+  # (`./tools/run-overnight.sh`, `bash tools/run-overnight.sh`, an absolute
+  # path, ...).
+  SELF_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+
+  # claude-14w (review round 2): hand the worker its identity via
+  # distinctly-named internal variables, NOT the generic RUN_ID/PROJECT_DIR
+  # names — those two are ALWAYS recomputed fresh at top-of-file now (see
+  # their docstrings) so that a normal top-level invocation can never be
+  # derailed by an inherited environment value under a generic name. The
+  # worker subprocess recognizes _OVERNIGHT_IS_WORKER=1 and adopts
+  # _OVERNIGHT_WORKER_PROJECT_DIR/_OVERNIGHT_WORKER_RUN_ID instead of
+  # recomputing its own (RUN_ID) or mis-computing one from the wrapper's own
+  # unrelated $1 (PROJECT_DIR).
+  export _OVERNIGHT_IS_WORKER=1 _OVERNIGHT_WORKER_PROJECT_DIR="$PROJECT_DIR" _OVERNIGHT_WORKER_RUN_ID="$RUN_ID"
+
   pids=()
   for w in $(seq 1 "$PARALLEL_WORKERS"); do
+    # claude-14w review (finding 1): mirror run_worker's own loop-top
+    # graceful-stop check (above) here in the LAUNCH loop too. Workers are
+    # started with a `sleep 3` stagger between them (below), so a 1st
+    # Ctrl+C landing mid-launch has a window of up to
+    # PARALLEL_WORKERS*3 seconds during which — without this check — this
+    # loop would keep creating overnight/$RUN_ID-w<N> worktrees and
+    # spinning up brand-new worker-leader subprocesses, each of which only
+    # self-halts AFTER running its own (potentially expensive) baseline
+    # verify() + mcp_trust_gate() in run_worker(). That contradicts the
+    # documented "1st Ctrl+C: stop launching new work" semantics. Written as
+    # a single `if` with an explicit `||`-combined condition (not two
+    # separate `&&`-chained one-liners) so precedence can't accidentally
+    # make the break unconditional.
+    if [ "$_OVERNIGHT_GRACEFUL_STOP" = "1" ] || [ -f "$_OVERNIGHT_STOP_FLAG_FILE" ]; then
+      log "Graceful interrupt received — not launching worker $w or any further workers."
+      break
+    fi
     WT="$WORKTREE_BASE/w$w"
     if [ ! -d "$WT" ]; then
       git -C "$PROJECT_DIR" worktree add -b "overnight/$RUN_ID-w$w" "$WT" HEAD >>"$SUMMARY" 2>&1 \
         || { log "Worker $w: worktree creation failed — skipping."; continue; }
     fi
-    run_worker "$w" "$WT" &
-    pids+=($!)
+    # The `bash -c SCRIPT ARG0 ARG1 ARG2 ARG3` form: ARG0 becomes the new
+    # process's $0, ARG1/ARG2/ARG3 become its $1/$2/$3. ARG0 is deliberately
+    # a plain descriptive string, NOT $SELF_PATH — the BASH_SOURCE guard at
+    # the bottom of this file (which must NOT re-enter main here) compares
+    # `${BASH_SOURCE[0]} = ${0}`; BASH_SOURCE[0] inside the `source "$1"`
+    # below resolves to $SELF_PATH, so $0 must be some other string for the
+    # guard to reliably evaluate false. `source "$1"` (with no further args
+    # of its own) intentionally leaves $1/$2/$3 as inherited from THIS
+    # wrapper's own positional params for run_worker's call below to consume
+    # — that's fine even though run-overnight.sh's own top-level `$1` would
+    # normally mean "project dir", because _OVERNIGHT_IS_WORKER=1 (exported
+    # above) makes the top-of-file logic adopt
+    # _OVERNIGHT_WORKER_PROJECT_DIR instead of consulting `$1` at all (see
+    # PROJECT_DIR's docstring).
+    worker_pgid=""
+    run_worker_in_pgroup worker_pgid \
+      bash -c 'source "$1"; trap _overnight_worker_term_handler TERM; run_worker "$2" "$3"' \
+      "run-overnight-worker-w$w" "$SELF_PATH" "$w" "$WT"
+    assert_worker_pgroup_invariant "$worker_pgid"
+    pids+=("$worker_pgid")
     sleep 3
   done
-  wait "${pids[@]}" 2>/dev/null
+
+  # `wait PID1 PID2 ...` can return early (signal-derived exit status) the
+  # instant a trapped signal fires, even though some/all of those pids are
+  # still alive — same reasoning run_worker already applies to a single pgid
+  # (~1102 there), generalized here to N worker pids (claude-14w): re-wait on
+  # whichever ones are still actually alive until none are.
+  remaining_pids=("${pids[@]}")
+  while [ "${#remaining_pids[@]}" -gt 0 ]; do
+    wait "${remaining_pids[@]}" 2>/dev/null
+    still_alive=()
+    for p in "${remaining_pids[@]}"; do
+      kill -0 "$p" 2>/dev/null && still_alive+=("$p")
+    done
+    remaining_pids=("${still_alive[@]}")
+  done
+  for p in "${pids[@]}"; do
+    deregister_pgid "$p"
+  done
+
   log "Worker branches (merge or discard in the morning):"
   git -C "$PROJECT_DIR" branch --list "overnight/$RUN_ID-*" | sed 's/^/    /' | tee -a "$SUMMARY"
 fi
