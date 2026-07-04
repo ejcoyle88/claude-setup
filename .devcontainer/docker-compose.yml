@@ -116,6 +116,17 @@ services:
   otel-collector:
     image: otel/opentelemetry-collector-contrib:latest # pin a version once happy
     command: ["--config=/etc/otelcol/config.yaml"]
+    # claude-00p: this bind mount only gets the FILE onto disk in the running
+    # container -- otelcol reads config.yaml once at process start and does
+    # NOT hot-reload on change. Editing otel-collector-config.yaml after this
+    # container is already up does nothing until the process restarts: run
+    # `docker compose up -d --force-recreate otel-collector` (or otherwise
+    # restart/recreate this service) for the edit to actually take effect.
+    # A stale long-running container silently keeps executing its
+    # original in-memory config even though the on-disk file is correct --
+    # this bit claude-saz's metric_expiration fix (config on disk was right,
+    # but the container had been running since before the edit landed, so
+    # the fix was never actually exercised).
     volumes:
       - ./otel-collector-config.yaml:/etc/otelcol/config.yaml:ro
     depends_on:
@@ -167,6 +178,15 @@ services:
 
   prometheus:
     image: prom/prometheus:latest
+    # claude-00p: same caveat as otel-collector's bind mount above --
+    # Prometheus reads prometheus.yml once at process start and does NOT
+    # hot-reload it just because the bind-mounted file on disk changed.
+    # (Prometheus *can* reload via SIGHUP or its `/-/reload` endpoint when
+    # started with `--web.enable-lifecycle`, but this service isn't
+    # configured with that flag, so neither applies here.) Editing
+    # prometheus.yml after this container is already up has no effect until
+    # you run `docker compose up -d --force-recreate prometheus` (or
+    # otherwise restart/recreate this service).
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
     ports:
