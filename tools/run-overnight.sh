@@ -151,12 +151,17 @@
 #       cost is folded into the run's reported total spend, but is NOT checked
 #       against MAX_TOTAL_COST_USD (the budget loop has already exited by the
 #       time this runs). Immediately before this pass (when OTEL_ENABLED=1),
-#       check_telemetry_health() probes Prometheus's /-/healthy and the
-#       collector's OTLP port over the network and logs a WARNING into the
-#       summary if either is unreachable -- see that function for why (a
-#       bounded OOM-restart budget on those services, claude-saz round 3)
-#       and why it's a network probe rather than a `docker compose ps` (no
-#       docker socket in this container, deliberately). It also flags a
+#       check_telemetry_health() probes Prometheus's /-/healthy, the
+#       collector's OTLP port, and Loki's /ready over the network and logs a
+#       WARNING into the summary if any is unreachable -- see that function for
+#       why (a bounded OOM-restart budget on those services, claude-saz round 3
+#       for otel-collector/prometheus, claude-906 for loki) and why it's a
+#       network probe rather than a `docker compose ps` (no docker socket in
+#       this container, deliberately). The Loki probe matters even though
+#       nothing here talks to Loki directly during the loop: otel-collector's
+#       depends_on: loki condition is creation-time-only, so a mid-run loki
+#       OOM-park would otherwise silently drop log exports for the rest of the
+#       run with no other signal. It also flags a
 #       narrower drift class (claude-muk): a bind-mounted otel-collector/
 #       prometheus config edit (e.g. metric_expiration) that landed on disk
 #       AFTER the sidecar containers were last started -- otelcol/Prometheus
@@ -733,14 +738,23 @@ record_session_marker() { # record_session_marker <session_id>
 # privilege escalation (docker.sock access is root-equivalent on the host)
 # than the blind spot it would close.
 #
-# Instead, probe the same two symptoms this bead's telemetry pipeline lives
-# or dies by, over the plain compose network this container already uses to
+# Instead, probe the same symptoms this bead's telemetry pipeline lives or
+# dies by, over the plain compose network this container already uses to
 # export telemetry (see observability-stack's container-networking notes):
-# Prometheus's own /-/healthy, and whether anything is actually listening on
-# the collector's OTLP port. Both "restart budget exhausted" and "down for
-# some other reason" look identical from here: a reachable "no" -- which is
-# the operator-relevant signal (don't trust this run's telemetry) regardless
-# of cause.
+# Prometheus's own /-/healthy, whether anything is actually listening on the
+# collector's OTLP port, and (claude-906) Loki's own /ready. Both "restart
+# budget exhausted" and "down for some other reason" look identical from here:
+# a reachable "no" -- which is the operator-relevant signal (don't trust this
+# run's telemetry) regardless of cause.
+#
+# The Loki leg (claude-906) closes a specific silent-drop gap: otel-collector
+# depends_on: loki: condition: service_healthy is evaluated ONCE, at container
+# creation -- compose does not continuously enforce it. So if loki gets
+# OOM-parked mid-run by its own bounded restart:on-failure:5 budget (added
+# alongside its new deploy.resources.limits.memory cap, see
+# .devcontainer/docker-compose.yml), otel-collector itself keeps running and
+# keeps silently dropping every log export from that point on -- invisible
+# without a probe aimed at loki specifically.
 check_telemetry_health() {
   [ "$OTEL_ENABLED" = "1" ] || return 0
 
@@ -769,6 +783,31 @@ check_telemetry_health() {
     fi
   else
     log "Telemetry health: could not parse host/port from OTEL_EXPORTER_OTLP_ENDPOINT='$otlp_endpoint' — skipping otel-collector reachability check."
+  fi
+
+  # claude-906: loki now carries the same deploy.resources.limits.memory +
+  # restart: on-failure:5 shape as otel-collector/prometheus above (see
+  # .devcontainer/docker-compose.yml's loki comment) -- and review flagged the
+  # same bounded-restart-exhaustion risk, but with a sharper consequence here:
+  # otel-collector's depends_on: loki: condition: service_healthy is only
+  # evaluated at container CREATION time, not continuously enforced, so a
+  # mid-run loki OOM-park does NOT stop or restart otel-collector -- it just
+  # silently drops every log export for the rest of the run (the same
+  # silent-drop shape as a dead OTLP port above, just one hop further out and
+  # otherwise invisible without this probe). Same network-probe approach as
+  # Prometheus's /-/healthy above, and for the same no-docker-socket reason:
+  # hit loki's own /ready endpoint (the same one its in-container `loki
+  # -health` healthcheck targets -- see docker-compose.yml) over the plain
+  # compose network.
+  local loki_url="${LOKI_URL:-http://loki:3100}"
+  if command -v curl >/dev/null 2>&1; then
+    if curl -fsS --max-time 5 "$loki_url/ready" >/dev/null 2>&1; then
+      log "Telemetry health: Loki ($loki_url) OK."
+    else
+      log "TELEMETRY HEALTH WARNING: Loki ($loki_url/ready) did not respond ready at end of run. If tonight's logs (Grafana Explore / Loki) look sparse or truncated partway through, don't assume the run was just quiet -- check 'docker compose ps loki' and its restart count (it now has a memory cap + restart: on-failure:5; that budget may have been exhausted). Because otel-collector's depends_on: loki condition is only checked at container creation, a mid-run loki death does NOT stop otel-collector -- it silently drops log exports from that point on, which is exactly the gap this check exists to surface."
+    fi
+  else
+    log "Telemetry health: curl not found — skipping Loki /ready check."
   fi
 
   # claude-muk: config-vs-observed-behavior drift, a follow-up from

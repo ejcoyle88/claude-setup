@@ -263,6 +263,43 @@ services:
       timeout: 5s
       retries: 5
       start_period: 15s
+    # claude-906: follow-up from claude-saz's review -- otel-collector/
+    # prometheus/ollama/ollama-gpu above all have deploy.resources.limits.
+    # memory plus a bounded restart, but loki (and grafana below) had
+    # neither. Loki ingests the same OTLP log volume the collector forwards
+    # to it (see otel-collector's depends_on comment above) with no ceiling
+    # to catch unbounded growth -- a runaway ingest volume, or a genuinely
+    # bad config, could otherwise pressure the host silently via this
+    # service instead of otel-collector. No docker access in this sandbox to
+    # measure actual resident memory under this workload, so -- same
+    # precedent as otel-collector's 1g / prometheus's 2g above and the
+    # explicitly-"provisional" ollama 8g note -- 2g here is a
+    # reasoned-but-unmeasured provisional cap: loki buffers incoming log
+    # chunks in memory before flushing to its filesystem chunk store (no
+    # persistent volume configured here either, so an OOM-restart only costs
+    # in-flight/unflushed chunks, not durable state), and this stack's
+    # actual log volume is a single devcontainer's session output, not a
+    # fleet -- a comparable order of magnitude to prometheus's sample
+    # ingest rather than the collector's lighter label-set tracking. Revisit
+    # once a real overnight run's memory usage is known.
+    #
+    # Review follow-up: on-failure:5 is a BOUNDED restart budget, and
+    # otel-collector's depends_on: loki: condition: service_healthy above is
+    # only evaluated at container CREATION time -- compose does not
+    # continuously re-check it. So a genuine (non-buggy) log burst that
+    # exhausts all 5 restarts within Docker's quick-succession backoff window
+    # OOM-parks loki as "exited" for the rest of the run, and otel-collector
+    # does NOT stop or restart in response -- it just silently drops every
+    # subsequent log export. This is now caught, not silent: tools/
+    # run-overnight.sh's check_telemetry_health() (claude-906) probes loki's
+    # own /ready over the network at end-of-run (and on early Ctrl+C) and
+    # logs a WARNING if it's unreachable, the same pattern already used there
+    # for otel-collector/prometheus.
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+    restart: on-failure:5
 
   grafana:
     image: grafana/grafana:latest
@@ -283,6 +320,26 @@ services:
         condition: service_healthy
       loki:
         condition: service_healthy
+    # claude-906: same follow-up as loki above -- grafana had neither a
+    # memory cap nor a bounded restart. Unlike loki, grafana doesn't ingest
+    # or store the log/metric volume itself; it only serves the UI/API and
+    # queries loki+prometheus on demand, so its own working set is
+    # comparatively small and doesn't scale with ingest volume the way
+    # loki's does -- sized independently rather than copying loki's number.
+    # No docker access in this sandbox to measure actual usage, so -- same
+    # "provisional" precedent as loki/otel-collector/prometheus/ollama above
+    # -- 512m is a reasoned-but-unmeasured cap: generous for Grafana's own
+    # process plus a handful of dashboard queries, while still turning a
+    # genuine leak/misconfiguration into a visible, restarted failure
+    # instead of silent host pressure. No persistent volume configured (no
+    # user/session state survives a recreate here either), so an
+    # OOM-restart only costs in-flight UI state. Revisit once a real
+    # overnight run's memory usage is known.
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+    restart: on-failure:5
 
   # Domain/SNI-scoped forwarding proxy that fronts the ollama sidecars'
   # egress to registry.ollama.ai and the *.r2.cloudflarestorage.com blob
