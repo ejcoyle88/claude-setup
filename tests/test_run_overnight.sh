@@ -498,6 +498,230 @@ test_external_anchor_defeats_a_full_valid_self_committed_rewrite() {
   ext_anchor_teardown
 }
 
+# --- _duration_to_seconds / record_session_marker (claude-muk) ---
+# Pure-helper tests for the config-vs-observed-behavior drift check in
+# check_telemetry_health(): _duration_to_seconds parses the Go-style
+# durations this repo's otel-collector-config.yaml actually uses, and
+# record_session_marker is the breadcrumb-writer that check reads back at
+# end-of-run. Neither test spins up a real Prometheus/collector — that part
+# of the check is exercised structurally (bash -n/shellcheck, manual dry
+# runs), not here; see the bead's close notes for why (no live docker stack
+# in this sandbox).
+
+test_duration_to_seconds_parses_hours() {
+  local n; n="$(_duration_to_seconds "24h")"
+  assert "24h parses to 86400 seconds" "[ '$n' = '86400' ]"
+}
+
+test_duration_to_seconds_parses_minutes() {
+  local n; n="$(_duration_to_seconds "5m")"
+  assert "5m parses to 300 seconds" "[ '$n' = '300' ]"
+}
+
+test_duration_to_seconds_parses_compound() {
+  local n; n="$(_duration_to_seconds "1h30m")"
+  assert "1h30m parses to 5400 seconds" "[ '$n' = '5400' ]"
+}
+
+test_duration_to_seconds_rejects_unparseable() {
+  local n rc
+  n="$(_duration_to_seconds "bogus")"; rc=$?
+  assert "an unparseable duration prints nothing" "[ -z '$n' ]"
+  assert "an unparseable duration returns non-zero (caller must not treat as 0)" "[ '$rc' -ne 0 ]"
+}
+
+test_duration_to_seconds_rejects_empty() {
+  local n rc
+  n="$(_duration_to_seconds "")"; rc=$?
+  assert "an empty duration string prints nothing" "[ -z '$n' ]"
+  assert "an empty duration string returns non-zero" "[ '$rc' -ne 0 ]"
+}
+
+# Review round 1, finding 4: the parse loop must consume the WHOLE string —
+# trailing garbage after an otherwise-valid duration must not silently parse
+# as if it were clean, since this return value gates a security-relevant
+# comparison in check_telemetry_health().
+test_duration_to_seconds_rejects_trailing_garbage() {
+  local n rc
+  n="$(_duration_to_seconds "24hXYZ")"; rc=$?
+  assert "trailing garbage after a valid duration prints nothing" "[ -z '$n' ]"
+  assert "trailing garbage after a valid duration returns non-zero" "[ '$rc' -ne 0 ]"
+}
+
+test_duration_to_seconds_parses_seconds_only() {
+  local n; n="$(_duration_to_seconds "45s")"
+  assert "45s parses to 45 seconds" "[ '$n' = '45' ]"
+}
+
+# Review round 2, finding 1: a digit-only capture is NOT enough to rule out
+# bash `$(( ))` reading a leading zero as octal. "08"/"09" aren't even valid
+# octal digits, so pre-fix this raised a fatal "value too great for base"
+# error (which — in the marker-loop caller, not this subshell-isolated
+# unit test — kills the entire non-interactive script). Confirms base-10 is
+# forced: 08h must parse as 8 hours (28800s), not error and not silently
+# miscompute via octal.
+test_duration_to_seconds_handles_leading_zero_as_decimal_not_octal() {
+  local n; n="$(_duration_to_seconds "08h")"
+  assert "08h parses as decimal 8 hours = 28800 seconds, not an octal error/miscompute" "[ '$n' = '28800' ]"
+}
+
+test_record_session_marker_appends_epoch_and_session() {
+  LOG_DIR="$LOG_DIR_TEST" OTEL_ENABLED=1 record_session_marker "sess-abc"
+  assert "session-markers.log gets an '<epoch>|<session_id>' line" \
+    "grep -qE '^[0-9]+\|sess-abc\$' '$LOG_DIR_TEST/session-markers.log'"
+}
+
+test_record_session_marker_noop_when_otel_disabled() {
+  LOG_DIR="$LOG_DIR_TEST" OTEL_ENABLED=0 record_session_marker "sess-abc"
+  assert "no markers file written when OTEL_ENABLED=0" \
+    "[ ! -f '$LOG_DIR_TEST/session-markers.log' ]"
+}
+
+test_record_session_marker_noop_with_empty_session_id() {
+  LOG_DIR="$LOG_DIR_TEST" OTEL_ENABLED=1 record_session_marker ""
+  assert "no markers file written for an empty session id" \
+    "[ ! -f '$LOG_DIR_TEST/session-markers.log' ]"
+}
+
+# Review round 1, finding 1 (root-cause fix): a session id containing
+# anything outside [A-Za-z0-9_.-] — e.g. a `|` or a command-substitution
+# payload — must never reach the markers file, since check_telemetry_health()
+# later runs unvalidated-at-write-time arithmetic/PromQL-interpolation against
+# its contents.
+test_record_session_marker_rejects_invalid_characters() {
+  # shellcheck disable=SC2016  # single quotes are deliberate: this must stay
+  # a literal, unexpanded string — the whole point is proving the write-time
+  # validation rejects these characters as DATA, never letting them near
+  # expansion/evaluation.
+  LOG_DIR="$LOG_DIR_TEST" OTEL_ENABLED=1 record_session_marker 'sess|$(evil)'
+  assert "a session id with disallowed characters is not written to the markers file" \
+    "[ ! -f '$LOG_DIR_TEST/session-markers.log' ]"
+}
+
+# --- check_telemetry_health() config-drift selection, end-to-end (review
+# round 2, finding 2) ---
+# The pure-helper tests above cover _duration_to_seconds/record_session_marker
+# in isolation, but the newest-in-window marker-selection loop itself — added
+# in check_telemetry_health() — had no coverage. These two tests drive that
+# function for real: a fabricated .devcontainer/otel-collector-config.yaml
+# (metric_expiration: 10m, so the [120s, 600s) probe window is small and
+# deterministic) plus a fabricated session-markers.log, with `curl` shadowed
+# by a local shell function so no real network call happens and the exact
+# PromQL query sent is observable. Also doubles as the "malformed/leading-zero
+# lines don't crash the whole script" regression guard the security reviewer
+# asked for: the marker loop here runs directly in this process (no
+# subshell), so a reintroduced octal-arithmetic bug would abort this entire
+# test script, not just fail an assertion.
+
+test_check_telemetry_health_selects_newest_in_window_marker() {
+  mkdir -p "$TMPDIR_TEST/.devcontainer"
+  cat > "$TMPDIR_TEST/.devcontainer/otel-collector-config.yaml" <<'YAML'
+exporters:
+  prometheus:
+    metric_expiration: 10m
+YAML
+
+  local now; now="$(date +%s)"
+  {
+    echo "$(( now - 50 ))|sess-too-fresh"          # <120s: excluded
+    echo "$(( now - 400 ))|sess-older-in-window"    # in-window, but not newest
+    echo "$(( now - 200 ))|sess-newest-in-window"   # in-window, newest (smallest elapsed)
+    echo "$(( now - 700 ))|sess-past-expiration"    # >=600s (10m): excluded
+    echo "bogus-epoch|sess-malformed-epoch"         # non-numeric epoch: skipped
+    echo "0000000009|sess-leadingzero-epoch"        # leading-zero epoch: must not crash
+    echo "$(( now - 300 ))|sess|has|pipes"          # disallowed chars in session: skipped
+  } > "$LOG_DIR_TEST/session-markers.log"
+
+  local query_log="$TMPDIR_TEST/curl-queries.log"
+  : > "$query_log"
+
+  # Shadow the real `curl` binary for the duration of this test only —
+  # returns an empty Prometheus result vector for the config-drift query
+  # (simulating "vanished"), and fails everything else (the /-/healthy probe)
+  # since this test isn't exercising that path.
+  # shellcheck disable=SC2329  # it IS invoked — indirectly, by
+  # check_telemetry_health() calling the bare `curl` command below, which
+  # this function definition shadows; shellcheck can't see that dynamic
+  # dispatch statically.
+  curl() {
+    local arg query=""
+    for arg in "$@"; do
+      case "$arg" in
+        query=*) query="$arg" ;;
+      esac
+    done
+    if [ -n "$query" ]; then
+      echo "$query" >> "$CURL_STUB_QUERY_LOG"
+      echo '{"status":"success","data":{"resultType":"vector","result":[]}}'
+      return 0
+    fi
+    return 1
+  }
+
+  CURL_STUB_QUERY_LOG="$query_log" \
+    PROJECT_DIR="$TMPDIR_TEST" LOG_DIR="$LOG_DIR_TEST" SUMMARY="$LOG_DIR_TEST/summary.log" \
+    OTEL_ENABLED=1 PROM_URL="http://test-prom:9090" \
+    OTEL_EXPORTER_OTLP_ENDPOINT="http://127.0.0.1:1" \
+    check_telemetry_health >/dev/null 2>&1
+
+  unset -f curl
+
+  assert "the config-drift query targets the newest in-window marker (sess-newest-in-window)" \
+    "grep -q 'session_id=\"sess-newest-in-window\"' '$query_log'"
+  assert "too-fresh/older-in-window/past-expiration/malformed/leading-zero/pipe-bearing markers are never queried" \
+    "! grep -qE 'sess-(too-fresh|older-in-window|past-expiration|malformed-epoch|leadingzero-epoch)|has\\|pipes' '$query_log'"
+  assert "the drift WARNING names the correct (newest-in-window) session — proves the loop ran to completion despite the malformed/leading-zero/pipe-bearing lines above (no crash)" \
+    "grep -q 'TELEMETRY HEALTH WARNING: config/behavior drift detected — completed iteration session_id=sess-newest-in-window' '$LOG_DIR_TEST/summary.log'"
+}
+
+test_check_telemetry_health_no_candidates_in_window_is_not_flagged_as_drift() {
+  mkdir -p "$TMPDIR_TEST/.devcontainer"
+  cat > "$TMPDIR_TEST/.devcontainer/otel-collector-config.yaml" <<'YAML'
+exporters:
+  prometheus:
+    metric_expiration: 10m
+YAML
+
+  local now; now="$(date +%s)"
+  {
+    echo "$(( now - 50 ))|sess-too-fresh"       # <120s: excluded
+    echo "$(( now - 700 ))|sess-past-expiration" # >=600s (10m): excluded
+  } > "$LOG_DIR_TEST/session-markers.log"
+
+  local query_log="$TMPDIR_TEST/curl-queries-b.log"
+  : > "$query_log"
+
+  # shellcheck disable=SC2329  # see the identical note on the other test's
+  # curl() shadow above — invoked indirectly via check_telemetry_health().
+  curl() {
+    # Should never be reached for the config-drift probe in this scenario —
+    # if it is, this records it so the assertion below catches the regression.
+    local arg query=""
+    for arg in "$@"; do
+      case "$arg" in
+        query=*) query="$arg" ;;
+      esac
+    done
+    [ -n "$query" ] && echo "$query" >> "$CURL_STUB_QUERY_LOG"
+    return 1
+  }
+
+  CURL_STUB_QUERY_LOG="$query_log" \
+    PROJECT_DIR="$TMPDIR_TEST" LOG_DIR="$LOG_DIR_TEST" SUMMARY="$LOG_DIR_TEST/summary.log" \
+    OTEL_ENABLED=1 PROM_URL="http://test-prom:9090" \
+    OTEL_EXPORTER_OTLP_ENDPOINT="http://127.0.0.1:1" \
+    check_telemetry_health >/dev/null 2>&1
+
+  unset -f curl
+
+  assert "no marker in-window -> the config-drift PromQL query is never sent" \
+    "[ ! -s '$query_log' ]"
+  assert "the explicit 'nothing eligible to probe' skip line is logged" \
+    "grep -q 'config-drift check ran but had nothing eligible to probe' '$LOG_DIR_TEST/summary.log'"
+  assert "an all-stale/all-too-fresh markers file is NOT reported as drift" \
+    "! grep -q 'TELEMETRY HEALTH WARNING: config/behavior drift detected' '$LOG_DIR_TEST/summary.log'"
+}
+
 run_test test_count_zero_with_no_worker_logs
 run_test test_count_single_worker
 run_test test_count_multi_worker_sum
@@ -524,6 +748,20 @@ run_test test_external_anchor_writable_by_self_is_rejected_even_when_content_mat
 run_test test_external_anchor_writable_parent_dir_is_rejected
 run_test test_external_anchor_writable_grandparent_dir_is_rejected
 run_test test_external_anchor_defeats_a_full_valid_self_committed_rewrite
+run_test test_duration_to_seconds_parses_hours
+run_test test_duration_to_seconds_parses_minutes
+run_test test_duration_to_seconds_parses_compound
+run_test test_duration_to_seconds_rejects_unparseable
+run_test test_duration_to_seconds_rejects_empty
+run_test test_duration_to_seconds_rejects_trailing_garbage
+run_test test_duration_to_seconds_parses_seconds_only
+run_test test_duration_to_seconds_handles_leading_zero_as_decimal_not_octal
+run_test test_record_session_marker_appends_epoch_and_session
+run_test test_record_session_marker_noop_when_otel_disabled
+run_test test_record_session_marker_noop_with_empty_session_id
+run_test test_record_session_marker_rejects_invalid_characters
+run_test test_check_telemetry_health_selects_newest_in_window_marker
+run_test test_check_telemetry_health_no_candidates_in_window_is_not_flagged_as_drift
 
 rm -rf "$SOURCE_SCRATCH_DIR"
 

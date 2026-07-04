@@ -128,7 +128,16 @@
 #       summary if either is unreachable -- see that function for why (a
 #       bounded OOM-restart budget on those services, claude-saz round 3)
 #       and why it's a network probe rather than a `docker compose ps` (no
-#       docker socket in this container, deliberately).
+#       docker socket in this container, deliberately). It also flags a
+#       narrower drift class (claude-muk): a bind-mounted otel-collector/
+#       prometheus config edit (e.g. metric_expiration) that landed on disk
+#       AFTER the sidecar containers were last started -- otelcol/Prometheus
+#       read config once at process start and never hot-reload, so a stale
+#       container silently keeps the OLD behavior with no signal. Detected by
+#       symptom (a completed iteration's session_id vanishing from Prometheus
+#       well under the currently configured metric_expiration), not by
+#       docker-inspecting container start time (same no-docker-socket
+#       constraint as above).
 #   ANALYZE_MAX_TURNS=30     turn cap for the telemetry-analysis pass specifically.
 #   ANALYZE_TIMEOUT=20m      timeout for the telemetry-analysis pass specifically.
 #   MAX_TURNS=150            per-run agentic turn cap (claude --max-turns)
@@ -473,6 +482,69 @@ mcp_external_anchor_check() {
   return 0
 }
 
+# _duration_to_seconds <duration-string> — best-effort parser for the Go-style
+# durations this repo's configs actually use (h/m/s, e.g. "24h", "5m30s"; see
+# otel-collector-config.yaml's metric_expiration). Prints seconds to stdout on
+# success; prints nothing and returns 1 if the string doesn't parse — callers
+# must treat an empty result as "couldn't determine", not as 0 (0 would make
+# every drift check fire). Requires the ENTIRE string to be consumed by
+# recognized h/m/s tokens — "24hXYZ" (or any value sed left trailing junk on)
+# must fail, not silently parse as "24h", since this return value directly
+# gates a security-relevant comparison downstream.
+#
+# Review round 2, finding 1: `num` is digit-only (regex-captured) but that
+# does NOT exclude a leading zero — bash `$(( ))` treats a leading-zero
+# numeral as OCTAL, so a value like "08" (not a valid octal digit) would
+# raise a fatal "value too great for base" error that kills the whole script
+# in non-interactive bash (not just this function), and a value like "010"
+# (valid octal) would silently miscompute as 8 instead of 10. Force base-10
+# explicitly via `10#$num` in every arithmetic branch below so a leading zero
+# in a config file (or anywhere else this parser is ever pointed) can never
+# hit octal interpretation.
+_duration_to_seconds() {
+  local dur total=0 num unit
+  dur="$(printf '%s' "${1:-}" | tr -d '[:space:]')"
+  [ -n "$dur" ] || return 1
+  while [[ "$dur" =~ ^([0-9]+)(h|m|s) ]]; do
+    num="${BASH_REMATCH[1]}"; unit="${BASH_REMATCH[2]}"
+    case "$unit" in
+      h) total=$((total + 10#$num * 3600));;
+      m) total=$((total + 10#$num * 60));;
+      s) total=$((total + 10#$num));;
+    esac
+    dur="${dur#"${BASH_REMATCH[0]}"}"
+  done
+  if [ "$total" -gt 0 ] && [ -z "$dur" ]; then echo "$total"; else return 1; fi
+}
+
+# record_session_marker <session_id> — appends "<epoch>|<session_id>" to
+# $LOG_DIR/session-markers.log for each successfully completed iteration.
+# Purely a small breadcrumb trail for check_telemetry_health()'s claude-muk
+# drift check below: it needs to know when a given session_id's telemetry was
+# last legitimately produced, so it can ask "should this still be visible in
+# Prometheus right now, per the config on disk?" Cheap append; degrades to a
+# no-op if OTel is off or the session id is empty (nothing to mark).
+#
+# Root-cause validation (review round 1, finding 1): $LOG_DIR lives under
+# $PROJECT_DIR, which the very unattended worker this script's MCP trust gate
+# exists to constrain can write to. check_telemetry_health() later feeds a
+# marker's epoch field straight into bash arithmetic and its session field
+# straight into a PromQL query string, so a malformed/hostile line must never
+# reach the markers file in the first place — reject anything that isn't a
+# plain token up front, rather than trusting read-side validation alone.
+record_session_marker() { # record_session_marker <session_id>
+  [ "$OTEL_ENABLED" = "1" ] || return 0
+  local session="${1:-}"
+  [ -n "$session" ] || return 0
+  case "$session" in
+    *[!A-Za-z0-9_.-]*)
+      log "Telemetry health: refusing to record a session marker — session id contains unexpected characters (expected only [A-Za-z0-9_.-]): '${session:0:80}'"
+      return 0
+      ;;
+  esac
+  echo "$(date +%s)|$session" >> "$LOG_DIR/session-markers.log"
+}
+
 # check_telemetry_health — end-of-run visibility for a specific silent-data-
 # loss risk (claude-saz round 3): otel-collector and prometheus (in the
 # sidecar compose stack, .devcontainer/docker-compose.yml) now carry a
@@ -534,6 +606,140 @@ check_telemetry_health() {
     fi
   else
     log "Telemetry health: could not parse host/port from OTEL_EXPORTER_OTLP_ENDPOINT='$otlp_endpoint' — skipping otel-collector reachability check."
+  fi
+
+  # claude-muk: config-vs-observed-behavior drift, a follow-up from
+  # claude-mqp's verification pass. otelcol/Prometheus (see above) read their
+  # bind-mounted config (.devcontainer/otel-collector-config.yaml,
+  # .devcontainer/prometheus.yml) once at process start and do NOT hot-reload
+  # on file change. claude-saz bumped metric_expiration 5m -> 24h specifically
+  # so a completed iteration's session_id survives Prometheus for the whole
+  # run + the end-of-night analyze-telemetry pass -- but a collector container
+  # that was already running BEFORE that edit landed on disk keeps enforcing
+  # the OLD, much shorter expiration silently: nothing before this check ever
+  # surfaced that "config on disk" and "config actually in effect" had
+  # diverged, and claude-mqp only caught it by manually bisecting container
+  # start time against config-file mtime.
+  #
+  # This can't reuse that bisection here either: same as the docstring above
+  # explains for `docker compose ps`, this container has no docker
+  # socket/CLI, so there is no `docker inspect --format '{{.State.StartedAt}}'`
+  # to compare against a config mtime from in here.
+  #
+  # So probe the SYMPTOM instead of the root cause (more robust to whatever
+  # config knob causes the next version of this bug): among every session_id
+  # this run has completed (record_session_marker() above), find the NEWEST
+  # one that's old enough to judge yet still within the metric_expiration
+  # currently on disk, and if it's already gone from Prometheus, the running
+  # collector cannot be honoring the config on disk -- i.e. it predates it.
+  #
+  # Review round 1, finding 3: probing only the globally-oldest marker ages
+  # that marker's elapsed time past expiration_secs on a long run while
+  # fresher, still-in-window markers keep arriving -- silently going quiet
+  # exactly when this check matters most, indistinguishable from "never
+  # wired up". Walking every marker and taking the newest in-window one keeps
+  # this check live for the whole run instead of firing once near the start.
+  local markers="$LOG_DIR/session-markers.log"
+  if [ ! -s "$markers" ]; then
+    log "Telemetry health: no completed-iteration session markers recorded — skipping config-drift check (nothing to probe)."
+  elif ! command -v curl >/dev/null 2>&1; then
+    log "Telemetry health: curl not found — skipping config-drift check."
+  else
+    local otel_cfg="$PROJECT_DIR/.devcontainer/otel-collector-config.yaml"
+    local expiration_str expiration_secs
+    expiration_str="$(sed -n 's/^[[:space:]]*metric_expiration:[[:space:]]*\([^#[:space:]]*\).*/\1/p' "$otel_cfg" 2>/dev/null | head -n1)"
+    expiration_secs="$(_duration_to_seconds "$expiration_str")"
+    if [ -z "$expiration_secs" ]; then
+      log "Telemetry health: could not read/parse metric_expiration from $otel_cfg — skipping config-drift check."
+    else
+      # Review round 1, finding 1: $markers lives under $PROJECT_DIR, so a
+      # line here is only as trustworthy as the unattended worker writing it
+      # (the exact thing mcp_trust_gate elsewhere in this script exists to
+      # constrain). record_session_marker() already refuses to write a
+      # malformed line, but this loop re-validates on read too (defense in
+      # depth, and it's the only thing standing between a hand-edited/
+      # corrupted markers file and `elapsed=$((now - marked_epoch))` below --
+      # bash arithmetic recursively evaluates a variable's value, so an
+      # unvalidated field there is a command-injection vector, not just a
+      # `set -u` crash risk). Skip (don't warn on, don't crash on) any line
+      # that fails either check.
+      #
+      # Review round 2, finding 1: "all digits" alone is NOT enough — a
+      # leading zero (e.g. "08") makes bash's `$(( ))` treat the value as
+      # OCTAL, and "08"/"09" aren't even valid octal digits, so
+      # `$((now - epoch))` would raise a fatal "value too great for base"
+      # error that kills the whole script (not just this function) in
+      # non-interactive bash, silently skipping the end-of-night telemetry
+      # analysis and "Run complete" summary that run unconditionally after
+      # this. Force base-10 explicitly via `10#$epoch` so a leading zero can
+      # never be misread as octal, whether that's a hostile line or an
+      # entirely innocent one (e.g. a future caller formatting epochs
+      # zero-padded).
+      local now; now="$(date +%s)"
+      local epoch session elapsed best_elapsed="" best_session=""
+      local total_lines=0 valid_lines=0
+      while IFS='|' read -r epoch session; do
+        [ -n "$epoch" ] || [ -n "$session" ] || continue
+        total_lines=$((total_lines + 1))
+        case "$epoch" in
+          ''|*[!0-9]*) continue ;;
+        esac
+        case "$session" in
+          ''|*[!A-Za-z0-9_.-]*) continue ;;
+        esac
+        valid_lines=$((valid_lines + 1))
+        elapsed=$((now - 10#$epoch))
+        # Only judge sessions that (a) are well clear of scrape/export lag
+        # (10s scrape interval, 10s metric export interval — 120s is
+        # generous headroom, not a tight race) and (b) should still be
+        # within the configured expiration window; outside that window
+        # "missing" is expected, not drift. Among candidates, keep the
+        # smallest elapsed (i.e. newest) so the probe stays fresh all run.
+        if [ "$elapsed" -ge 120 ] && [ "$elapsed" -lt "$expiration_secs" ]; then
+          if [ -z "$best_elapsed" ] || [ "$elapsed" -lt "$best_elapsed" ]; then
+            best_elapsed="$elapsed"; best_session="$session"
+          fi
+        fi
+      done < "$markers"
+
+      if [ "$valid_lines" -eq 0 ]; then
+        log "Telemetry health: $total_lines session marker line(s) recorded, none parsed as a valid '<epoch>|<session_id>' entry — skipping config-drift check."
+      elif [ -z "$best_session" ]; then
+        # Explicit, distinguishable-from-crash log (finding 3): this pass DID
+        # run and DID have valid markers, they just all fell outside the
+        # [120s, expiration_secs) probe window right now (either too fresh,
+        # or the whole run has already outlasted metric_expiration).
+        log "Telemetry health: config-drift check ran but had nothing eligible to probe this pass ($valid_lines valid marker(s) recorded, all either <120s old or already past the configured metric_expiration=$expiration_str) — not drift, just no marker currently in-window."
+      else
+        local query_resp
+        query_resp="$(curl -fsS --max-time 5 --data-urlencode "query={session_id=\"$best_session\"}" "$prom_url/api/v1/query" 2>/dev/null)"
+        if [ -z "$query_resp" ]; then
+          log "Telemetry health: could not query $prom_url/api/v1/query — skipping config-drift check."
+        else
+          local verdict
+          verdict="$(printf '%s' "$query_resp" | python3 -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    result = data.get("data", {}).get("result", [])
+    print("present" if result else "missing")
+except Exception:
+    print("unknown")
+')"
+          case "$verdict" in
+            missing)
+              log "TELEMETRY HEALTH WARNING: config/behavior drift detected — completed iteration session_id=$best_session vanished from Prometheus ($prom_url) after only ${best_elapsed}s, well under the configured metric_expiration=$expiration_str in $otel_cfg. otelcol/Prometheus read that file once at process start and do NOT hot-reload — this means the running otel-collector/prometheus container predates the config on disk (container older than config — recreate needed): run 'docker compose up -d --force-recreate otel-collector prometheus' (or recreate the whole stack) so they pick up the current config, then re-run tonight's analysis once telemetry is trustworthy again."
+              ;;
+            present)
+              log "Telemetry health: config-drift check OK — session_id=$best_session (completed ${best_elapsed}s ago) still present in Prometheus, consistent with configured metric_expiration=$expiration_str."
+              ;;
+            *)
+              log "Telemetry health: could not parse Prometheus query response — skipping config-drift check."
+              ;;
+          esac
+        fi
+      fi
+    fi
   fi
 }
 
@@ -635,6 +841,7 @@ run_worker() { # run_worker <index> <workdir>
     fi
 
     consec=0; completed=$((completed + 1))
+    record_session_marker "$session"
     if [ -s "$ilog.result.txt" ]; then
       wlog "$wsum" "  Report: $(head -c 300 "$ilog.result.txt" | tr '\n' ' ')"
     fi
