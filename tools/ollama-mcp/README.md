@@ -109,6 +109,35 @@ was built in, so the retry path itself (an actual second round-trip to a real
 model) has only been exercised via hand-constructed good/bad JSON payloads
 against the pure validation function, not against a live model.
 
+### Progress notifications during generation
+
+The ~90s worst-case latency above (`claude-lp5`, a follow-up to
+`claude-r30.5`) is a risk if the *calling* MCP client's own tool-call timeout
+is at/near 60s: it could fire a hard client-side transport timeout before
+this server's own `isError: true` degradation ever gets a chance to return.
+Confirming the real deployed client's timeout comfortably exceeds ~90s, and
+getting empirical live-Ollama latency data to justify a tighter
+`RETRY_TIMEOUT_MS`, both require a live MCP client and a live Ollama instance
+that aren't available in this build sandbox — those two mitigations remain
+open/unverified.
+
+What *is* implemented here: while `generateStructured` awaits each of its
+`callOllamaGenerate` calls (the first attempt and, if needed, the retry),
+`summarize_file`/`extract`/`classify` send a `notifications/progress`
+(`src/progress.ts`'s `withPeriodicProgress`/`makeProgressNotifier`) every
+`PROGRESS_INTERVAL_MS` (12s) — well under both `GENERATE_TIMEOUT_MS` (60s) and
+`RETRY_TIMEOUT_MS` (30s) — so a compliant client that opted in (by attaching a
+`progressToken` to the request's `_meta`, per the MCP spec) keeps getting its
+own timeout clock reset across the combined worst case. Per spec, a
+`progressToken` is opt-in per request: if the caller didn't supply one, no
+notification is ever sent (`makeProgressNotifier` returns a no-op). This is a
+pure addition — it never changes a tool call's actual success/error/timeout
+outcome, only adds an out-of-band side channel alongside it. Unit tests for
+the timer/cadence logic and the opt-in gating live in `src/progress.test.ts`;
+like the retry path above, an actual compliant client resetting its timeout
+clock on a received notification hasn't been (and can't be, in this sandbox)
+verified end-to-end.
+
 ## Environment variables
 
 | Variable         | Default                 | Purpose                                                     |

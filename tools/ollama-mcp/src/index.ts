@@ -18,6 +18,12 @@ import * as readline from "node:readline";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
+import {
+  makeProgressNotifier,
+  NO_OP_PROGRESS_NOTIFIER,
+  type ProgressNotifier,
+  withPeriodicProgress,
+} from "./progress.js";
 import { type JsonSchema, parseAndValidateJson } from "./validate.js";
 
 /** Base URL of the Ollama server, e.g. "http://ollama:11434". No trailing slash. */
@@ -175,7 +181,7 @@ server.registerTool(
       ...lineRangeShape,
     },
   },
-  async ({ path, focus, startLine, endLine }) => {
+  async ({ path, focus, startLine, endLine }, extra) => {
     const slice = await readFileSlice(path, startLine, endLine);
     if (!slice.ok) {
       return { content: [{ type: "text", text: JSON.stringify({ error: slice.error }) }], isError: true };
@@ -189,11 +195,15 @@ server.registerTool(
       slice.content +
       "\n--- FILE CONTENT END ---";
 
-    const generated = await generateStructured(prompt, {
-      type: "object",
-      properties: { summary: { type: "string" } },
-      required: ["summary"],
-    });
+    const generated = await generateStructured(
+      prompt,
+      {
+        type: "object",
+        properties: { summary: { type: "string" } },
+        required: ["summary"],
+      },
+      makeProgressNotifier(extra),
+    );
     if (!generated.ok) {
       return { content: [{ type: "text", text: JSON.stringify({ error: generated.error }) }], isError: true };
     }
@@ -255,7 +265,7 @@ server.registerTool(
       ...lineRangeShape,
     },
   },
-  async ({ path, schema, startLine, endLine }) => {
+  async ({ path, schema, startLine, endLine }, extra) => {
     const slice = await readFileSlice(path, startLine, endLine);
     if (!slice.ok) {
       return { content: [{ type: "text", text: JSON.stringify({ error: slice.error }) }], isError: true };
@@ -269,7 +279,7 @@ server.registerTool(
       slice.content +
       "\n--- FILE CONTENT END ---";
 
-    const generated = await generateStructured(prompt, schema as JsonSchema);
+    const generated = await generateStructured(prompt, schema as JsonSchema, makeProgressNotifier(extra));
     if (!generated.ok) {
       return { content: [{ type: "text", text: JSON.stringify({ error: generated.error }) }], isError: true };
     }
@@ -311,7 +321,7 @@ server.registerTool(
       ...lineRangeShape,
     },
   },
-  async ({ pathOrText, isPath, labels, startLine, endLine }) => {
+  async ({ pathOrText, isPath, labels, startLine, endLine }, extra) => {
     let content: string;
     let truncated = false;
     let truncatedChars = 0;
@@ -337,11 +347,15 @@ server.registerTool(
       "Classify the following content into exactly one of these labels: " +
       `${JSON.stringify(labels)}.\n\n--- CONTENT START ---\n${content}\n--- CONTENT END ---`;
 
-    const generated = await generateStructured(prompt, {
-      type: "object",
-      properties: { label: { type: "string", enum: labels } },
-      required: ["label"],
-    });
+    const generated = await generateStructured(
+      prompt,
+      {
+        type: "object",
+        properties: { label: { type: "string", enum: labels } },
+        required: ["label"],
+      },
+      makeProgressNotifier(extra),
+    );
     if (!generated.ok) {
       return { content: [{ type: "text", text: JSON.stringify({ error: generated.error }) }], isError: true };
     }
@@ -714,9 +728,25 @@ type StructuredGenerateResult = { ok: true; value: Record<string, unknown> } | {
  * uses a shorter RETRY_TIMEOUT_MS rather than the first attempt's full
  * GENERATE_TIMEOUT_MS -- see that constant's doc comment for why (bounding
  * the combined worst-case latency of a single tool call).
+ *
+ * `notify` (bead claude-lp5) is invoked periodically -- see
+ * `withPeriodicProgress`/`PROGRESS_INTERVAL_MS` in `progress.ts` -- while
+ * each of `callOllamaGenerate`'s two calls (the first attempt and the
+ * retry) is in flight, so a compliant MCP client that requested progress
+ * notifications keeps getting its timeout clock reset across the combined
+ * ~90s worst case, instead of only finding out the call finished (or hit
+ * the server's own timeout) at the very end. Defaults to
+ * `NO_OP_PROGRESS_NOTIFIER` so this is safe to call without one (e.g. from
+ * a test) -- callers in this file always pass a real notifier built via
+ * `makeProgressNotifier`, which itself is a no-op unless the caller's
+ * request carried a `progressToken`.
  */
-async function generateStructured(prompt: string, schema: JsonSchema): Promise<StructuredGenerateResult> {
-  const first = await callOllamaGenerate(prompt, schema);
+async function generateStructured(
+  prompt: string,
+  schema: JsonSchema,
+  notify: ProgressNotifier = NO_OP_PROGRESS_NOTIFIER,
+): Promise<StructuredGenerateResult> {
+  const first = await withPeriodicProgress(callOllamaGenerate(prompt, schema), notify);
   if (!first.ok) {
     return { ok: false, error: first.error };
   }
@@ -725,7 +755,7 @@ async function generateStructured(prompt: string, schema: JsonSchema): Promise<S
     return firstResult;
   }
 
-  const retry = await callOllamaGenerate(prompt, schema, RETRY_TIMEOUT_MS);
+  const retry = await withPeriodicProgress(callOllamaGenerate(prompt, schema, RETRY_TIMEOUT_MS), notify);
   if (!retry.ok) {
     return {
       ok: false,
