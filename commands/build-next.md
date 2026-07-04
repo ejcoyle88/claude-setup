@@ -37,8 +37,8 @@ questions. Everything below applies as written, with these overrides:
 - **Commit per task.** After Step 4 closes a bead: `git add -A` and
   `git commit -m "<bead-id>: <one-line summary>"`. This is what keeps the next
   iteration's review diff scoped to one task. If blocking findings survive
-  Round 2, still commit (`git commit -m "wip(<bead-id>): unresolved review
-findings"`), leave the bead in progress, and file a follow-up bead listing
+  Round 2, still commit (`git add -A && git commit -m "wip(<bead-id>): unresolved
+review findings"`), leave the bead in progress, and file a follow-up bead listing
   the unresolved findings.
 - **Report tersely** — the final message lands in a log file, not a chat.
 
@@ -146,21 +146,51 @@ put under git, since diff-based review and rollback both depend on it.
    and the clearer fix.
 4. **If there are no blocking findings → go to Step 4.** The change is clean; do
    not spend a second cycle.
-5. Otherwise invoke **the same developer that implemented the bead** with the
+5. Otherwise, before invoking the developer, record a hash (or the literal
+   text) of the diff you just reviewed — Round 2 below checks the fix against
+   this. Then invoke **the same developer that implemented the bead** with the
    bead id, the changed files, and the blocking findings verbatim. Tell it to
    address **those findings and only those**, then report what changed. (Same
-   NEEDS-INPUT escalation applies.)
+   NEEDS-INPUT escalation applies.) **Round 2 is reached only from here** —
+   immediately after this developer-fix dispatch has returned — never merely
+   because Round 1 had blocking findings.
 
-**Round 2** (only reached if Round 1 had blocking findings)
+**Round 2** (gate: only entered right after Round 1, item 5's developer-fix
+dispatch has returned; skip straight to Step 4 per Round 1, item 4, if Round 1
+had no blocking findings in the first place — these two are one continuous
+condition, not independent paths)
 
-1. Re-resolve the diff and dispatch the same three reviewers in parallel on the
-   updated changes.
-2. Apply the same combined verification as Round 1 (CANNOT REVIEW check, with
+1. Re-resolve the diff and **compare it against the hash/text recorded in
+   Round 1, item 5** before dispatching anyone. If the diff is unchanged, the
+   developer-fix dispatch did not produce a delta — do not re-dispatch the
+   reviewers against a diff they already reviewed. Instead, treat it as a
+   failed fix: log/report that the fix dispatch produced no diff change, then
+   re-invoke the same developer once more with the same findings (first
+   occurrence for this bead), then re-resolve the diff and re-compare against
+   the same recorded hash/text before proceeding to item 2. If the diff still
+   hasn't changed (i.e., this branch is being entered a second time for this
+   bead), stop retrying and do not dispatch reviewers. Before escalating, commit
+   the abandoned diff using the WIP-commit convention from the Unattended mode
+   section's "Commit per task" bullet — applied here **regardless of mode**, a
+   deliberate carve-out from that section's "ignore this section entirely"
+   scoping for interactive mode, because cross-bead diff contamination is a
+   risk in both modes, not only unattended runs:
+   `git add -A && git commit -m "wip(<bead-id>): unresolved review findings —
+   fix dispatch produced no diff change"`, leaving the bead in progress — so
+   the abandoned diff is committed and labeled under its own bead id before
+   any other bead's `git add -A` can absorb it. Then escalate: in unattended
+   mode, per the defer handling in the Unattended mode section; in interactive
+   mode, surface this via
+   `AskUserQuestion` (developer's fix produced no diff change — retry,
+   investigate manually, or abandon?) rather than silently deferring.
+2. If the diff did change, dispatch the same three reviewers in parallel on
+   the updated changes.
+3. Apply the same combined verification as Round 1 (CANNOT REVIEW check, with
    its legitimate-bail-out exemption, plus the unconditional coverage-note
    check, capped at one re-dispatch per reviewer regardless of which condition
    failed), strip any `FILES REVIEWED:` line, then merge and filter to
    blocking findings as before.
-3. If blocking findings remain, invoke **the same developer** once more to
+4. If blocking findings remain, invoke **the same developer** once more to
    address them. Then **stop — do not run a third review.**
 
 ## Step 4 — Close out and report
