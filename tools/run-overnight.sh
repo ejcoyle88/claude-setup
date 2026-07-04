@@ -122,7 +122,13 @@
 #       pass, not agentic work) via ANALYZE_MAX_TURNS / ANALYZE_TIMEOUT; its
 #       cost is folded into the run's reported total spend, but is NOT checked
 #       against MAX_TOTAL_COST_USD (the budget loop has already exited by the
-#       time this runs).
+#       time this runs). Immediately before this pass (when OTEL_ENABLED=1),
+#       check_telemetry_health() probes Prometheus's /-/healthy and the
+#       collector's OTLP port over the network and logs a WARNING into the
+#       summary if either is unreachable -- see that function for why (a
+#       bounded OOM-restart budget on those services, claude-saz round 3)
+#       and why it's a network probe rather than a `docker compose ps` (no
+#       docker socket in this container, deliberately).
 #   ANALYZE_MAX_TURNS=30     turn cap for the telemetry-analysis pass specifically.
 #   ANALYZE_TIMEOUT=20m      timeout for the telemetry-analysis pass specifically.
 #   MAX_TURNS=150            per-run agentic turn cap (claude --max-turns)
@@ -467,6 +473,70 @@ mcp_external_anchor_check() {
   return 0
 }
 
+# check_telemetry_health — end-of-run visibility for a specific silent-data-
+# loss risk (claude-saz round 3): otel-collector and prometheus (in the
+# sidecar compose stack, .devcontainer/docker-compose.yml) now carry a
+# deploy.resources.limits.memory cap + restart: on-failure:5, added so an
+# unexpected metric-cardinality blow-up (e.g. from this same bead's
+# metric_expiration: 5m -> 24h change) gets OOM-killed and restarted loudly
+# instead of silently exhausting host memory. But on-failure:5 is a BOUNDED
+# restart budget -- if it's ever exhausted (or either service is down for any
+# other reason: bad config, host resource pressure, ...), nothing previously
+# surfaced that to the operator until a *gap* in the morning telemetry was
+# noticed after the fact, which is exactly the silent-data-loss failure mode
+# this bead exists to fix, just via a different cause than the original
+# premature-series-expiry bug.
+#
+# This can't be a `docker compose ps otel-collector prometheus` check: this
+# script runs inside the `devcontainer` compose service, which has no
+# /var/run/docker.sock mount and no docker CLI installed -- deliberately, per
+# the sandbox model (see .devcontainer/init-firewall.sh and
+# container-infra's least-privilege default) -- the container this script
+# runs in is the thing BEING managed by compose, not something with
+# reflexive access back to the engine that manages it. Handing it the docker
+# socket just to make this one check possible would be a far larger
+# privilege escalation (docker.sock access is root-equivalent on the host)
+# than the blind spot it would close.
+#
+# Instead, probe the same two symptoms this bead's telemetry pipeline lives
+# or dies by, over the plain compose network this container already uses to
+# export telemetry (see observability-stack's container-networking notes):
+# Prometheus's own /-/healthy, and whether anything is actually listening on
+# the collector's OTLP port. Both "restart budget exhausted" and "down for
+# some other reason" look identical from here: a reachable "no" -- which is
+# the operator-relevant signal (don't trust this run's telemetry) regardless
+# of cause.
+check_telemetry_health() {
+  [ "$OTEL_ENABLED" = "1" ] || return 0
+
+  local prom_url="${PROM_URL:-http://prometheus:9090}"
+  if command -v curl >/dev/null 2>&1; then
+    if curl -fsS --max-time 5 "$prom_url/-/healthy" >/dev/null 2>&1; then
+      log "Telemetry health: Prometheus ($prom_url) OK."
+    else
+      log "TELEMETRY HEALTH WARNING: Prometheus ($prom_url/-/healthy) did not respond healthy at end of run. If tonight's metrics look sparse or missing session_ids, don't assume the pipeline was just quiet -- check 'docker compose ps prometheus' and its restart count (it now has a memory cap + restart: on-failure:5; that budget may have been exhausted, or it may be down for another reason)."
+    fi
+  else
+    log "Telemetry health: curl not found — skipping Prometheus /-/healthy check."
+  fi
+
+  local otlp_endpoint="${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4317}"
+  local otlp_hostport="${otlp_endpoint#*://}"
+  local otlp_host="${otlp_hostport%%:*}"
+  local otlp_port="${otlp_hostport##*:}"
+  otlp_port="${otlp_port%%/*}"
+  if [ -n "$otlp_host" ] && [ -n "$otlp_port" ]; then
+    if (exec 3<>"/dev/tcp/$otlp_host/$otlp_port") 2>/dev/null; then
+      exec 3<&- 3>&- 2>/dev/null
+      log "Telemetry health: otel-collector OTLP port ($otlp_host:$otlp_port) accepting connections."
+    else
+      log "TELEMETRY HEALTH WARNING: otel-collector OTLP port ($otlp_host:$otlp_port) did not accept a connection at end of run. Exports since it went down were dropped SILENTLY — the OTel SDK does not retry-and-fail-loud on a dead endpoint (see this script's OTEL_ENABLED docs above). Check 'docker compose ps otel-collector' and its restart count (memory cap + restart: on-failure:5 — that budget may have been exhausted, or it may be down for another reason)."
+    fi
+  else
+    log "Telemetry health: could not parse host/port from OTEL_EXPORTER_OTLP_ENDPOINT='$otlp_endpoint' — skipping otel-collector reachability check."
+  fi
+}
+
 run_worker() { # run_worker <index> <workdir>
   local idx="$1" workdir="$2"
   local wsum="$LOG_DIR/worker-$idx.log"
@@ -657,6 +727,12 @@ fi
 for f in "$LOG_DIR"/worker-*.log; do
   [ -f "$f" ] && { echo "── $(basename "$f") ──" >> "$SUMMARY"; cat "$f" >> "$SUMMARY"; }
 done
+
+# claude-saz round 3: surface a dead otel-collector/prometheus BEFORE the
+# telemetry-analysis pass below, which queries both — so a WARNING here is
+# the operator's explanation for sparse/failed analysis output, not a
+# separate mystery to debug later.
+check_telemetry_health
 
 # End-of-night telemetry analysis: one fresh headless pass over the whole run's
 # telemetry + session artifacts, filing [token-efficiency] beads. Runs AFTER the

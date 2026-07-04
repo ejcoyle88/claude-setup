@@ -119,12 +119,51 @@ services:
     volumes:
       - ./otel-collector-config.yaml:/etc/otelcol/config.yaml:ro
     depends_on:
-      - loki
+      # claude-saz: wait for loki to actually be ready to accept OTLP log
+      # ingest, not just for its container to have started (Compose's plain
+      # depends_on default) -- otherwise the collector can start shipping
+      # the logs pipeline's batches at loki before it's serving, and those
+      # exports drop silently (see observability-stack's silent-drop
+      # footgun; there's no retry-and-fail-loud here). No analogous
+      # dependency on prometheus: prometheus scrapes THIS service, so the
+      # ordering that matters runs the other way.
+      loki:
+        condition: service_healthy
     # No host ports needed for the sandbox→collector path. Uncomment to let
     # host-side (non-container) claude sessions export here too:
     # ports:
     #   - "4317:4317"
     #   - "4318:4318"
+    #
+    # claude-saz: this image is `scratch`-based (just the binary + CA certs,
+    # no shell/wget/curl -- see the opentelemetry-collector-contrib
+    # Dockerfile), so it can't run a Docker HEALTHCHECK the way loki/
+    # prometheus do below without adding a probe extension/tool to the
+    # image. Left unaddressed here as out of scope (primary ask is loki);
+    # candidate follow-up if the collector's own readiness ever needs
+    # gating.
+    #
+    # claude-saz: bounded alongside metric_expiration going 5m -> 24h
+    # (otel-collector-config.yaml) -- that change makes the prometheus
+    # exporter's internal series registry hold every distinct label-set
+    # seen over a full 24h window (up from 5 minutes) and re-serve each
+    # still-live series' last value on every 10s scrape for that whole
+    # window, instead of letting it drop after a few minutes. Correctness
+    # fix, but unbounded: a metric set with higher cardinality than
+    # expected, or a longer-than-anticipated run, would otherwise pressure
+    # host memory silently instead of failing loudly. 1g is generous for
+    # this sandbox's actual cardinality (per-session/iteration labels from
+    # one devcontainer, not a fleet) while still turning a genuine
+    # cardinality blow-up into a visible, restarted failure -- mirrors the
+    # ollama/ollama-gpu services' deploy.resources.limits.memory pattern
+    # above. on-failure:5 restarts it (metrics are recoverable/derived, not
+    # state to preserve) but won't loop forever against a real
+    # misconfiguration.
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+    restart: on-failure:5
 
   prometheus:
     image: prom/prometheus:latest
@@ -132,12 +171,58 @@ services:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
     ports:
       - "9090:9090" # optional: raw metric spelunking from the host browser
+    # claude-saz: prom/prometheus ships on a busybox base (has wget, not
+    # curl) -- added for consistency with loki's new healthcheck below, so
+    # grafana's depends_on can wait for real readiness instead of just
+    # container-started.
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:9090/-/healthy"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    # claude-saz: same rationale as otel-collector's cap above -- the
+    # collector now re-serves each still-live series' last value on every
+    # 10s scrape for up to 24h instead of ~5m (metric_expiration in
+    # otel-collector-config.yaml), which is ~8,640 redundant samples per
+    # stale series over a run instead of ~30. That inflates Prometheus's
+    # in-memory head block/WAL for the run's duration with no cap to catch
+    # a runaway. 2g gives Prometheus itself (TSDB head block, query
+    # working set) more headroom than the collector needs, since it's
+    # accumulating samples rather than just tracking label-sets, while
+    # still failing loudly instead of silently pressuring the host.
+    # Persistent volume for the TSDB isn't configured here (ephemeral by
+    # design for this dev stack), so an OOM-restart only costs in-flight
+    # scrape history, not durable state.
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+    restart: on-failure:5
 
   loki:
     image: grafana/loki:latest
     # Image's default config; Loki 3.x accepts OTLP logs at /otlp out of the
     # box. If log ingest ever 400s, check `allow_structured_metadata` in the
     # Loki config.
+    #
+    # claude-saz: as of Loki 3.6, the image's base was switched to a
+    # distroless build with busybox (and so wget/curl/shell) removed
+    # entirely -- a wget/curl-based `/ready` healthcheck silently can't run
+    # at all on that image (see grafana/loki#20149, #19923). Loki 3.6 added
+    # a shell-free self-check specifically to replace that: `loki -health`
+    # hits its own `/ready` endpoint (default http://localhost:3100/ready)
+    # and exits 0/1 accordingly, with no external tool needed (see
+    # grafana/loki#20313). Since this service tracks `:latest`, use that
+    # native form rather than the wget one-liners still floating around in
+    # older docs/examples -- they'll silently never succeed on current
+    # images.
+    healthcheck:
+      test: ["CMD", "/usr/bin/loki", "-health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
 
   grafana:
     image: grafana/grafana:latest
@@ -151,8 +236,13 @@ services:
     ports:
       - "3000:3000" # the morning dashboard: http://localhost:3000
     depends_on:
-      - prometheus
-      - loki
+      # claude-saz: tightened alongside loki/prometheus's new healthchecks
+      # above -- grafana's datasource provisioning otherwise races both
+      # backends right after `docker compose up`.
+      prometheus:
+        condition: service_healthy
+      loki:
+        condition: service_healthy
 
   # Domain/SNI-scoped forwarding proxy that fronts the ollama sidecars'
   # egress to registry.ollama.ai and the *.r2.cloudflarestorage.com blob

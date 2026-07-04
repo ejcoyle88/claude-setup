@@ -18,6 +18,19 @@ processors:
 exporters:
   prometheus:
     endpoint: 0.0.0.0:9464
+    # claude-saz: default metric_expiration (5m) drops a series from the
+    # scrape endpoint once that series stops receiving updates -- e.g. once
+    # an overnight-run iteration's session ends and its metrics go quiet. An
+    # overnight run can span many hours across many iterations, so at 5m
+    # nearly every iteration's series is gone before Prometheus (10s scrape
+    # interval, see prometheus.yml) or analyze-telemetry ever reads it --
+    # only the most-recent session(s) survive to scrape time. 24h is
+    # comfortably above any single overnight run's total duration, so every
+    # iteration's series stays queryable for the whole run (and the
+    # post-run analyze-telemetry pass). Keep this above the max run
+    # duration; see prometheus.yml's scrape_interval comment for the other
+    # half of this relationship.
+    metric_expiration: 24h
   otlphttp/loki:
     endpoint: http://loki:3100/otlp
   # Uncomment while debugging to see everything in `docker compose logs otel-collector`:
