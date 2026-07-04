@@ -40,6 +40,43 @@
 #       Each worker is tagged via OTEL_RESOURCE_ATTRIBUTES (run.id, worker.id).
 #   STOP_FILE=<project>/.stop-overnight   touch to stop all workers gracefully
 #
+#   MCP trust gate (claude-9hl): headless `claude -p` auto-connects a
+#       project's .mcp.json MCP servers with NO trust prompt and no fail-closed
+#       behavior (verified in claude-1bz; see tools/ollama-mcp/README.md's
+#       "Headless/unattended trust behavior" section and
+#       anthropics/claude-code#5307). `--bare` would suppress this, but it also
+#       suppresses skill/command auto-discovery — and `/build-next` itself is
+#       a project skill (`commands/build-next.md`), so `--bare` would break
+#       the very command this loop exists to run. Instead: every headless
+#       `claude -p` launch in this script (preflight, each build-next
+#       iteration, the end-of-night telemetry-analysis pass) is gated by
+#       mcp_trust_gate(), which refuses to launch unless (a) the working
+#       tree's `.mcp.json` sha256 matches `.mcp.json.trusted-sha256`, AND
+#       (b) both files are actually git-tracked with NO uncommitted
+#       working-tree changes, AND (c) neither path is a symlink (git records
+#       a symlink's target string, never dereferencing it, so a committed
+#       clean symlink would otherwise dodge check (b) while sha256sum
+#       follows it) — a bytes-only comparison is self-computable by the very
+#       unattended agent this gate exists to constrain (it has commit access
+#       in $workdir and could rewrite .mcp.json + regenerate a matching hash
+#       without ever committing either). No `.mcp.json` present -> nothing
+#       to gate, launches proceed. An untracked/uncommitted/symlinked trust
+#       pair or a genuine hash mismatch all fail loud (abort before
+#       preflight; halt the worker mid-run) rather than silently
+#       auto-connecting an unreviewed MCP server.
+#       RESIDUAL LIMITATION: with the symlink vector closed, this still does
+#       not stop an agent with commit rights from committing its own
+#       rewritten `.mcp.json` plus a matching, freshly-committed hash each
+#       time — a complete fix needs a trust anchor the overnight agent
+#       cannot mutate (signed tag / protected-branch commit / out-of-band
+#       value). Recorded honestly, not built in this bead.
+#       To (re)trust a legitimate `.mcp.json` change: review the diff, then
+#         sha256sum .mcp.json | awk '{print $1}' > .mcp.json.trusted-sha256
+#         git add .mcp.json .mcp.json.trusted-sha256 && git commit
+#   SKIP_MCP_TRUST_CHECK=0   set 1 to bypass the gate (NOT recommended — this
+#       reintroduces the exact silent-auto-connect risk claude-1bz found;
+#       only for debugging, and only with a `.mcp.json` you already trust).
+#
 #   VERIFY_CMD=""            deterministic gate, e.g. "dotnet build && dotnet test"
 #       Runs in the workdir (a) once at startup — red baseline aborts the worker
 #       before any tokens are spent — and (b) after every claude run, BEFORE the
@@ -205,6 +242,84 @@ verify() { # verify <workdir> <worker-summary> <label> ; returns VERIFY_CMD stat
   return $st
 }
 
+# mcp_trust_gate <workdir> ; returns 0 (safe to launch headless claude -p) or
+# 1 (refuse). Auditable pre-trust check (claude-9hl) for claude-1bz's finding
+# that headless `claude -p` silently auto-connects a project's .mcp.json MCP
+# servers with no trust prompt and no fail-closed behavior. Fail-closed
+# equivalent of the interactive trust dialog: the working tree's .mcp.json
+# must sha256-match a committed .mcp.json.trusted-sha256, AND both files must
+# actually be tracked by git with no uncommitted working-tree changes — a
+# hash-only comparison is self-computable by the very `/build-next` agent
+# this loop runs unattended (or a prompt-injected tool call from an already-
+# connected MCP server), which has commit access inside $workdir: it could
+# rewrite .mcp.json, regenerate a matching hash, and never even commit either
+# file, and a bytes-only check would trust that. No .mcp.json present ->
+# nothing to auto-connect -> nothing to gate.
+#
+# Both paths must also be regular files, not symlinks: git records a
+# symlink's target *string* as its blob and never dereferences it, so a
+# committed, clean symlink would otherwise still pass the tracked+clean
+# check below while sha256sum happily follows it — one commit swapping
+# either path for a symlink into a writable location would let an agent
+# rewrite the pointed-to content indefinitely afterward with NO further
+# commits and NO git-diff signal, which is stealthier than (and was not
+# covered by) the residual limitation below. This is now rejected outright.
+#
+# RESIDUAL LIMITATION (by design, not a bug — see tools/ollama-mcp/README.md):
+# with the symlink vector closed, every rewrite this gate can be tricked by
+# still requires its own fresh, auditable commit. This defends against
+# accidental drift (stray hand-edit, bad merge) and mid-run tampering that
+# isn't committed. It does NOT defend against an agent that has commit
+# rights in $workdir deliberately committing its own rewritten .mcp.json
+# plus a matching, freshly-committed trust file each time — that requires
+# pinning trust to something the overnight agent cannot mutate (a signed
+# tag, a protected-branch commit, or a value held outside the workdir under
+# different credentials), which is out of scope for this bead.
+mcp_trust_gate() {
+  local workdir="$1" mcp_json trust_file actual expected f
+  [ "${SKIP_MCP_TRUST_CHECK:-0}" = "1" ] && return 0
+  mcp_json="$workdir/.mcp.json"
+  trust_file="$workdir/.mcp.json.trusted-sha256"
+  [ -f "$mcp_json" ] || return 0
+  # Reject symlinks outright. git stores a symlink's *target string* as its
+  # blob and never dereferences it, so a committed, clean symlink still
+  # passes the tracked+clean check below — while sha256sum DOES follow the
+  # link. One commit swapping either path for a symlink into a writable
+  # location would let an agent rewrite the pointed-to content indefinitely
+  # afterward with zero further commits and zero git-diff signal.
+  if [ -L "$mcp_json" ] || [ -L "$trust_file" ]; then
+    log "MCP TRUST GATE: refusing — .mcp.json / .mcp.json.trusted-sha256 must be regular files, not symlinks (a symlinked trust pair evades the tracked+clean check while sha256sum follows the link)."
+    return 1
+  fi
+  if [ ! -f "$trust_file" ]; then
+    log "MCP TRUST GATE: $mcp_json exists but $trust_file is missing — refusing headless claude -p launch (fail-closed; see tools/ollama-mcp/README.md 'Headless/unattended trust behavior'). After reviewing .mcp.json: sha256sum '$mcp_json' | awk '{print \$1}' > '$trust_file' && git -C '$workdir' add .mcp.json .mcp.json.trusted-sha256 && git -C '$workdir' commit."
+    return 1
+  fi
+  # Both paths must be genuinely git-tracked and committed — an untracked or
+  # locally-modified trust pair (however byte-correct) is not a reviewed
+  # commit, so it's not trusted. Closes the untracked-file hole (this repo's
+  # own .mcp.json.trusted-sha256 was untracked until this check existed) and
+  # the mid-run self-reauthorization hole (rewrite + regenerate hash without
+  # committing).
+  for f in .mcp.json .mcp.json.trusted-sha256; do
+    if ! git -C "$workdir" ls-files --error-unmatch "$f" >/dev/null 2>&1; then
+      log "MCP TRUST GATE: $workdir/$f is not tracked by git — refusing headless claude -p launch (fail-closed). A trust anchor must be a reviewed commit, not a file that merely exists on disk. After reviewing: git -C '$workdir' add .mcp.json .mcp.json.trusted-sha256 && git -C '$workdir' commit."
+      return 1
+    fi
+  done
+  if ! git -C "$workdir" diff --quiet HEAD -- .mcp.json .mcp.json.trusted-sha256 2>/dev/null; then
+    log "MCP TRUST GATE: .mcp.json and/or .mcp.json.trusted-sha256 have uncommitted working-tree changes in $workdir — refusing headless claude -p launch (fail-closed). Review the diff, then: git -C '$workdir' add .mcp.json .mcp.json.trusted-sha256 && git -C '$workdir' commit."
+    return 1
+  fi
+  actual="$(sha256sum "$mcp_json" | awk '{print $1}')"
+  expected="$(tr -d '[:space:]' < "$trust_file")"
+  if [ "$actual" != "$expected" ]; then
+    log "MCP TRUST GATE MISMATCH: $mcp_json sha256 ($actual) does not match committed $trust_file ($expected) — refusing headless claude -p launch. If this .mcp.json change is legitimate, review the diff, then: sha256sum '$mcp_json' | awk '{print \$1}' > '$trust_file' && git -C '$workdir' add .mcp.json .mcp.json.trusted-sha256 && git -C '$workdir' commit."
+    return 1
+  fi
+  return 0
+}
+
 run_worker() { # run_worker <index> <workdir>
   local idx="$1" workdir="$2"
   local wsum="$LOG_DIR/worker-$idx.log"
@@ -213,6 +328,13 @@ run_worker() { # run_worker <index> <workdir>
   # Baseline gate: never burn a night on an already-red build.
   if ! verify "$workdir" "$wsum" "w$idx-baseline"; then
     wlog "$wsum" "Baseline verification is RED in $workdir — aborting worker before spending tokens."
+    return 1
+  fi
+
+  # MCP trust gate (claude-9hl): refuse to launch headless claude -p at all
+  # if workdir's .mcp.json isn't a reviewed, committed-trusted config.
+  if ! mcp_trust_gate "$workdir"; then
+    wlog "$wsum" "MCP trust gate failed in $workdir — see summary log for details; aborting worker before spending tokens."
     return 1
   fi
 
@@ -247,6 +369,15 @@ run_worker() { # run_worker <index> <workdir>
         fi
         sleep "$SLEEP_BETWEEN"; continue
       fi
+    fi
+
+    # Re-check every iteration, not just at worker startup: a completed bead
+    # could legitimately (or not) have modified .mcp.json — committed or not —
+    # since the baseline check. Halt rather than launching on unreviewed drift
+    # or an uncommitted self-reauthorization.
+    if ! mcp_trust_gate "$workdir"; then
+      wlog "$wsum" "MCP trust gate failed mid-run (.mcp.json / .mcp.json.trusted-sha256 no longer a clean, committed, matching pair) — halting worker rather than launching an unreviewed MCP config."
+      break
     fi
 
     wlog "$wsum" "Iteration $i: $n ready bead(s); spent \$$spent of \$$WORKER_BUDGET. Launching claude..."
@@ -309,6 +440,16 @@ log "Permissions: $PERMISSION_FLAGS | OTel: $([ "$OTEL_ENABLED" = "1" ] && echo 
 [ -z "$VERIFY_CMD" ] && log "WARNING: VERIFY_CMD is empty — the deterministic verification gate is DISABLED. Set e.g. VERIFY_CMD='dotnet build && dotnet test'."
 log "Stop file: $STOP_FILE"
 
+# MCP trust gate (claude-9hl): fail closed BEFORE even the preflight probe —
+# preflight itself launches a headless claude -p, which auto-connects
+# .mcp.json MCP servers just as much as the real work loop does.
+# (mcp_trust_gate itself honors SKIP_MCP_TRUST_CHECK=1 as a documented,
+# NOT-recommended bypass.)
+if ! mcp_trust_gate "$PROJECT_DIR"; then
+  log "Aborting before preflight/loop — see MCP TRUST GATE message above. Override with SKIP_MCP_TRUST_CHECK=1 only if you understand the risk (claude-1bz)."
+  exit 1
+fi
+
 # Preflight: fail at launch, not silently all night. Auto mode in particular
 # needs v2.1.83+, a Team/Enterprise plan, and the Anthropic API provider.
 if [ "${SKIP_PREFLIGHT:-0}" != "1" ]; then
@@ -357,7 +498,9 @@ worker_spend="$(total_worker_spend "$LOG_DIR")"
 analyze_cost="0"
 if [ "$ANALYZE_TELEMETRY" = "1" ]; then
   completed_total="$(count_completed_iterations "$LOG_DIR")"
-  if [ "${completed_total:-0}" -gt 0 ]; then
+  if [ "${completed_total:-0}" -gt 0 ] && ! mcp_trust_gate "$PROJECT_DIR"; then
+    log "Skipping telemetry analysis — MCP trust gate failed (see MCP TRUST GATE message above); refusing to launch this headless claude -p pass too."
+  elif [ "${completed_total:-0}" -gt 0 ]; then
     log "Analyzing telemetry for run $RUN_ID ($completed_total iteration(s) completed)..."
     ANALYZE_LOG="$LOG_DIR/analyze-telemetry.log"
     ( cd "$PROJECT_DIR" && \

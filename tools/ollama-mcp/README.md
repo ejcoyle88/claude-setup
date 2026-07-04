@@ -344,22 +344,102 @@ practical exposure today is low — but the mechanism itself would auto-run
 *any* command a `.mcp.json` in this position of trust declared, reviewed or
 not.
 
-**Recommendation (not built — candidate follow-up):** an explicit, auditable
-pre-trust mechanism for headless/unattended runs, e.g.:
+**Built in `claude-9hl`: hash-diff pre-trust gate, not `--bare`.** Two
+candidates were on the table — a startup hash-diff check in
+`run-overnight.sh`, or `--bare` + explicit `--mcp-config` so headless runs
+never auto-discover the working tree's `.mcp.json` at all. `--bare` was
+investigated first (it's structurally stronger, per the original
+recommendation here) and rejected: per [Claude Code's skills
+docs](https://code.claude.com/docs/en/skills) and [headless-mode
+docs](https://code.claude.com/docs/en/headless), "custom commands have been
+merged into skills," and `--bare` explicitly skips auto-discovery of
+**hooks, skills, plugins, MCP servers, auto memory, and CLAUDE.md** — with no
+equivalent to `--mcp-config` for pinning an explicit skill/command set (only
+`--plugin-dir`, which would mean repackaging `/build-next` itself, its
+specialist subagents, and this repo's whole `.claude/` layout as a plugin —
+well beyond this bead's scope). `run-overnight.sh`'s entire reason to exist
+is launching `claude -p "/build-next --unattended"`; `/build-next` is a
+project skill (`commands/build-next.md`), so `--bare` would silently break
+the very command the overnight loop runs, in addition to closing the
+`.mcp.json` hole. Falling back to the documented alternative:
 
-- A `PRE_ITERATION_CMD`-style or startup check in `run-overnight.sh` that
-  diffs the working tree's `.mcp.json` against a known-good, explicitly
-  committed hash/allowlist (e.g. a `.mcp.json.trusted-sha256` file updated
-  only via deliberate, reviewed commits) and refuses to launch `claude -p` if
-  they don't match — giving headless runs a fail-closed gate equivalent to
-  the interactive trust prompt, without requiring a human to be present.
-- Alternatively, `--bare` plus explicit `--mcp-config` pointed at a
-  reviewed/pinned config for the overnight loop specifically, so unattended
-  runs never auto-discover *whatever* `.mcp.json` happens to be checked out
-  at the time.
+- **`mcp_trust_gate()` in `tools/run-overnight.sh`** computes the working
+  tree's `.mcp.json` sha256 and compares it against a committed
+  `.mcp.json.trusted-sha256` (repo root — currently trusting this repo's own
+  `ollama-mcp` entry). No `.mcp.json` present → nothing to gate, launches
+  proceed as before.
+- **The comparison is not bytes-only.** An earlier version of this gate only
+  compared file contents, which is self-computable by the very unattended
+  agent the gate exists to constrain: `/build-next` runs headlessly *with git
+  commit access inside the exact workdir being gated*, so nothing stopped it
+  (or a prompt-injected tool call from an already-connected MCP server) from
+  rewriting `.mcp.json`, regenerating a matching hash into
+  `.mcp.json.trusted-sha256`, and never committing either file — a
+  bytes-only gate would have trusted that. (This was concretely
+  demonstrated during review: `.mcp.json.trusted-sha256` was an *untracked*
+  file in this repo when the bytes-only version shipped, and the gate passed
+  anyway.) The gate now additionally requires, for **both**
+  `.mcp.json` and `.mcp.json.trusted-sha256`:
+  - `git ls-files --error-unmatch` succeeds (the path is actually tracked by
+    git), and
+  - `git diff --quiet HEAD --` is clean (no staged or unstaged
+    modifications relative to the last commit).
 
-Either approach is new scope beyond this bead; recorded here for whoever
-picks it up next.
+  Only once both files are genuinely tracked, clean, and hash-matching does
+  the gate pass.
+- **Symlinks are rejected outright.** A committed, *clean* symlink would
+  otherwise still pass the tracked+clean check above: git records a
+  symlink's target *string* as its blob and never dereferences it, so
+  `git diff --quiet HEAD` reports clean regardless of what the link
+  currently points at — while `sha256sum` *does* follow the link and hashes
+  whatever that is. One commit swapping `.mcp.json` and/or
+  `.mcp.json.trusted-sha256` for a symlink into a writable location would
+  let an agent rewrite the pointed-to content indefinitely afterward with
+  **zero further commits and zero git-diff signal** — stealthier than the
+  residual limitation below, which at least implies a fresh auditable commit
+  per rewrite. The gate now checks `[ -L "$mcp_json" ] || [ -L "$trust_file" ]`
+  and refuses if either path is a symlink, closing this specific vector.
+- The gate runs **before every headless `claude -p` launch** in the script:
+  the startup preflight probe, the per-worker baseline check, every
+  `/build-next` iteration (re-checked each loop, since a completed bead could
+  itself have modified `.mcp.json` — committed or not), and the end-of-night
+  `/analyze-telemetry` pass.
+- **To (re)trust a legitimate `.mcp.json` change:** review the diff, then
+  `sha256sum .mcp.json | awk '{print $1}' > .mcp.json.trusted-sha256 && git add .mcp.json .mcp.json.trusted-sha256 && git commit`.
+  This is a deliberate, reviewed commit — the same bar as any other change to
+  a shared, trust-bearing file.
+- **On mismatch/missing/untracked/dirty trust pair:** fails loud. The
+  top-level check aborts the whole run before the preflight probe ever
+  launches `claude`; the per-worker/per-iteration checks halt that worker
+  with a logged reason (`worker-N.log` and the run summary) rather than
+  proceeding.
+- **Escape hatch:** `SKIP_MCP_TRUST_CHECK=1` bypasses the gate entirely — not
+  recommended, since it reintroduces the exact risk this section describes;
+  it exists for debugging only, and only with a `.mcp.json` an operator
+  already trusts.
+- **Residual limitation, recorded honestly rather than implied-closed:** with
+  the symlink vector above closed, every remaining way to fool this gate
+  requires its own fresh, auditable commit — requiring a genuine git commit
+  stops *accidental* drift (a stray hand-edit, a bad merge) and
+  *uncommitted* mid-run tampering, but it does **not** stop an agent that
+  already has commit rights in the workdir from deliberately committing its
+  own rewritten `.mcp.json` plus a matching, freshly-committed trust file
+  — `/build-next`'s unattended mode explicitly commits per completed task,
+  so this is a real, not merely theoretical, gap. A complete fix needs a
+  trust anchor the overnight agent cannot mutate: a signed tag, a commit on
+  a protected branch the agent can't push to, or a value held outside the
+  workdir under different credentials (e.g. checked by the *human*
+  triggering the run, or fetched from a store the overnight process's own
+  git identity has no write access to). That out-of-band anchor is a larger
+  change than this bead's scope and is not built here.
+- Covered by `tests/test_run_overnight.sh` (`test_mcp_gate_*`), which
+  exercises the gate against fabricated git repos (committed-and-clean,
+  untracked-trust-file, uncommitted-rewrite/"self-reauthorization",
+  symlinked-`.mcp.json`, and genuine-hash-mismatch cases) without launching
+  `claude`, plus a regression
+  test that runs the gate against this repo's own real `.mcp.json` /
+  `.mcp.json.trusted-sha256` so a hash/file drift here fails at test time
+  instead of silently aborting an overnight run at 2am.
 
 ## Follow-ups not built in this bead
 
