@@ -1,0 +1,4 @@
+Release notes: Acme Widget Pro version 3.2.0, released on 2025-03-14 by the
+Widgets team. This release fixes the invoice PDF export bug and adds dark
+mode support for the mobile app. No further action is required from existing
+customers; the update is applied automatically on next app launch.
