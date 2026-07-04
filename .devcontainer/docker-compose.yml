@@ -113,8 +113,21 @@ services:
     depends_on:
       - otel-collector
 
+  # claude-9tc: UNVERIFIED TAG WARNING -- the four pins below (otel-collector,
+  # prometheus, loki, grafana) were chosen from changelog/release-page reading
+  # without docker/direct-registry access in this sandbox to confirm they
+  # actually resolve on Docker Hub. WebSearch turned up corroborating
+  # evidence for each (release notes, Docker Hub search snippets, layer-detail
+  # pages) but none of it is an authoritative registry response, and one
+  # search pass for otel/opentelemetry-collector-contrib:0.155.0 specifically
+  # surfaced only nightly-build tags (e.g. 0.155.0-nightly.<sha>) alongside
+  # the plain 0.155.0 pull command, so that one in particular is NOT
+  # confirmed. Before/during first CI run or dev use, run
+  # `docker compose -f .devcontainer/docker-compose.yml pull` (or
+  # `docker manifest inspect <image>` per tag) and fix any tag that 404s --
+  # don't assume these are correct.
   otel-collector:
-    image: otel/opentelemetry-collector-contrib:latest # pin a version once happy
+    image: otel/opentelemetry-collector-contrib:0.155.0 # claude-9tc: pinned (was :latest); see contrib releases for changelog before bumping
     command: ["--config=/etc/otelcol/config.yaml"]
     # claude-00p: this bind mount only gets the FILE onto disk in the running
     # container -- otelcol reads config.yaml once at process start and does
@@ -177,7 +190,13 @@ services:
     restart: on-failure:5
 
   prometheus:
-    image: prom/prometheus:latest
+    # claude-9tc: pinned to the (default, no-suffix) busybox-based build --
+    # the v3.13.0 tag's own Dockerfile (not Dockerfile.distroless) still
+    # builds FROM quay.io/prometheus/busybox-${OS}-${ARCH} and labels the
+    # variant "busybox" -- distroless remains opt-in via a -distroless tag
+    # suffix -- so the wget-based healthcheck below keeps working. See
+    # https://github.com/prometheus/prometheus/blob/v3.13.0/Dockerfile.
+    image: prom/prometheus:v3.13.0
     # claude-us6: explicit command overrides the image's default CMD
     # (`--config.file=/etc/prometheus/prometheus.yml
     # --storage.tsdb.path=/prometheus`, per the upstream Dockerfile's
@@ -241,7 +260,13 @@ services:
     restart: on-failure:5
 
   loki:
-    image: grafana/loki:latest
+    # claude-9tc: pinned to the latest 3.6.x patch (3.6.12); 3.6.0 is the
+    # earliest release in this minor line to ship the shell-free `loki
+    # -health` self-check the healthcheck below uses, so anything in the
+    # 3.6.x line satisfies it. A newer 3.7.x line is also out; if bumping
+    # past 3.6.x, re-verify grafana/loki#20313 (the -health flag) still
+    # applies before moving this pin.
+    image: grafana/loki:3.6.12
     # Image's default config; Loki 3.x accepts OTLP logs at /otlp out of the
     # box. If log ingest ever 400s, check `allow_structured_metadata` in the
     # Loki config.
@@ -253,10 +278,10 @@ services:
     # a shell-free self-check specifically to replace that: `loki -health`
     # hits its own `/ready` endpoint (default http://localhost:3100/ready)
     # and exits 0/1 accordingly, with no external tool needed (see
-    # grafana/loki#20313). Since this service tracks `:latest`, use that
-    # native form rather than the wget one-liners still floating around in
-    # older docs/examples -- they'll silently never succeed on current
-    # images.
+    # grafana/loki#20313). Since this service is pinned to grafana/loki:3.6.12
+    # (Loki 3.6+), use that native form rather than the wget one-liners still
+    # floating around in older docs/examples -- they'll silently never
+    # succeed on current images.
     healthcheck:
       test: ["CMD", "/usr/bin/loki", "-health"]
       interval: 10s
@@ -302,7 +327,7 @@ services:
     restart: on-failure:5
 
   grafana:
-    image: grafana/grafana:latest
+    image: grafana/grafana:13.1.0 # claude-9tc: pinned (was :latest)
     environment:
       # Local-only convenience: no login. Don't expose this beyond localhost.
       GF_AUTH_ANONYMOUS_ENABLED: "true"
