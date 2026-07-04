@@ -178,6 +178,26 @@ services:
 
   prometheus:
     image: prom/prometheus:latest
+    # claude-us6: explicit command overrides the image's default CMD
+    # (`--config.file=/etc/prometheus/prometheus.yml
+    # --storage.tsdb.path=/prometheus`, per the upstream Dockerfile's
+    # ENTRYPOINT/CMD), so both of those are carried over unchanged here
+    # alongside the new retention flag -- dropping them would silently
+    # revert config.file/storage.tsdb.path to... the same defaults, in this
+    # case, but that's incidental, not guaranteed, so keep them explicit
+    # rather than relying on it. --storage.tsdb.retention.time=2d bounds
+    # on-disk TSDB growth to match this stack's ~24h single-run design
+    # intent (metric_expiration in otel-collector-config.yaml, the 2g
+    # memory cap above -- both claude-saz) with a little headroom over
+    # exactly 24h, instead of the image's 15d default. Matters because the
+    # TSDB lives in the container's writable layer (no volume configured --
+    # ephemeral by design), so a devcontainer that survives across multiple
+    # overnight runs without recreation would otherwise keep accumulating
+    # on-disk data toward that 15d default.
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=2d
     # claude-00p: same caveat as otel-collector's bind mount above --
     # Prometheus reads prometheus.yml once at process start and does NOT
     # hot-reload it just because the bind-mounted file on disk changed.
