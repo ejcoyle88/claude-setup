@@ -257,7 +257,9 @@ sidecar is up and healthy.
 This server is registered at **project scope** via `.mcp.json`, which is
 checked into the repo — so it's on by default for anyone who clones this repo
 and trusts its project MCP config (Claude Code will prompt to approve
-project-scoped servers from an unfamiliar repo on first use).
+project-scoped servers from an unfamiliar repo on first use **in an
+interactive TTY session** — see "Headless/unattended trust behavior" below for
+the `-p`/headless exception, where no prompt occurs at all).
 
 To disable it for everyone who uses this repo (edits the tracked `.mcp.json`
 in your working tree — this is a shared-file change, not a personal one; it
@@ -290,6 +292,74 @@ registers its own MCP server also named `ollama-mcp` exposing tools also named
 would be silently auto-approved too, with no guarantee it has this server's
 path-confinement or local-only-egress properties. Be aware of this before
 opening an unfamiliar repo that defines its own project-scoped `.mcp.json`.
+
+### Headless/unattended trust behavior (claude-1bz)
+
+`tools/run-overnight.sh` runs unattended `claude -p ...` loops with no human
+present to answer an interactive "do you trust this folder / this project's
+`.mcp.json`?" prompt. `claude-1bz` verified empirically what happens to this
+server's registration in that situation, on a **fresh checkout that had never
+been opened by Claude Code before** (a `git worktree`, built via
+`npm install && npm run build` per the Build and run section above, with a
+project path absent from `~/.claude.json`'s `projects` map — i.e. genuinely
+untrusted).
+
+**Finding: headless/`-p` mode silently auto-connects the project's
+`.mcp.json` servers — it does not fail closed.** Both of the following were
+tested and both connected `ollama-mcp` with zero prompts:
+
+- `claude -p "..." --permission-mode auto --max-turns 1` (this repo's
+  `run-overnight.sh` default)
+- `claude -p "..." --max-turns 1` (no permission-mode flag at all — headless
+  mode's own default, `acceptEdits`)
+
+In both cases the `stream-json` `system`/`init` event reported
+`{"name":"ollama-mcp","status":"connected"}` and the session's tool list
+included the full `mcp__ollama-mcp__*` set
+(`ping`/`health`/`summarize_file`/`extract`/`classify`), all usable
+immediately, with no trust dialog shown and no interactive step blocking or
+skipping a tool grant. Notably, `~/.claude.json` also never gained a `projects` entry
+for the scratch checkout's path at all — this isn't "an approval got silently
+recorded"; the project-trust gate that the interactive TTY normally enforces
+appears not to be consulted for `.mcp.json` loading in `-p` mode at all.
+
+This matches Claude Code's documented and independently-reported behavior:
+non-interactive/headless mode has no path to render an interactive
+trust/onboarding dialog, so it bypasses the check rather than defaulting to
+deny — see the [headless-mode
+docs](https://code.claude.com/docs/en/headless) (`--bare` exists specifically
+to *not* auto-discover `.mcp.json`/hooks/skills at all) and
+[anthropics/claude-code#5307](https://github.com/anthropics/claude-code/issues/5307)
+("MCP Enablement Dialog Bypassed in Bypass Permission Mode").
+
+**Risk:** every fresh checkout of this repo that gets run through
+`run-overnight.sh` (or any other headless `claude -p` invocation) will spawn
+`node tools/ollama-mcp/dist/index.js` automatically, with no human ever
+exercising a trust decision over it — the committed `.mcp.json` is the only
+gate, and CI/overnight-loop checkouts don't discriminate between "this repo's
+own tooling" and "an unreviewed process execution declared by whoever last
+touched `.mcp.json`." For *this* repo's own `ollama-mcp` server that's a
+reviewed, path-confined, local-only-egress process (see above), so the
+practical exposure today is low — but the mechanism itself would auto-run
+*any* command a `.mcp.json` in this position of trust declared, reviewed or
+not.
+
+**Recommendation (not built — candidate follow-up):** an explicit, auditable
+pre-trust mechanism for headless/unattended runs, e.g.:
+
+- A `PRE_ITERATION_CMD`-style or startup check in `run-overnight.sh` that
+  diffs the working tree's `.mcp.json` against a known-good, explicitly
+  committed hash/allowlist (e.g. a `.mcp.json.trusted-sha256` file updated
+  only via deliberate, reviewed commits) and refuses to launch `claude -p` if
+  they don't match — giving headless runs a fail-closed gate equivalent to
+  the interactive trust prompt, without requiring a human to be present.
+- Alternatively, `--bare` plus explicit `--mcp-config` pointed at a
+  reviewed/pinned config for the overnight loop specifically, so unattended
+  runs never auto-discover *whatever* `.mcp.json` happens to be checked out
+  at the time.
+
+Either approach is new scope beyond this bead; recorded here for whoever
+picks it up next.
 
 ## Follow-ups not built in this bead
 
