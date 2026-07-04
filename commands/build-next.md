@@ -136,6 +136,8 @@ label if your beads workflow tags one — not from file extensions:
 - C# / .NET → `csharp-developer`
 - Rust → `rust-developer`
 - Angular / front-end (TypeScript) → `angular-developer`
+- Plain TypeScript/Node service, CLI, or library code (not Angular
+  front-end) → `node-developer`
 - Claude Code setup / config (a bead about the `.claude/` suite itself —
   agents, skills, commands, hooks, settings, CLAUDE.md) → `agent-improvement-developer`
 - Dev environment / containers / CI / observability (Dockerfile, compose,
