@@ -77,6 +77,32 @@
 #       reintroduces the exact silent-auto-connect risk claude-1bz found;
 #       only for debugging, and only with a `.mcp.json` you already trust).
 #
+#   MCP_EXTERNAL_TRUST_ANCHOR=""  (claude-o7u) out-of-band trust anchor that
+#       closes the residual gap the in-repo check above admits by design: a
+#       commit-capable overnight identity can always produce a fresh, clean,
+#       git-tracked, hash-matching `.mcp.json` + `.mcp.json.trusted-sha256`
+#       pair on its own, because both live inside $workdir where it has
+#       commit rights. Set this to an absolute path OUTSIDE the repo working
+#       tree, holding just the trusted sha256, that this identity cannot
+#       write — e.g. root-owned, mode 0444, created at container-build time
+#       or by the human operator before the run:
+#         sudo install -o root -g root -m 0444 /dev/stdin \
+#           /etc/claude-mcp-trust/mcp.trusted-sha256 \
+#           <<<"$(sha256sum .mcp.json | awk '{print $1}')"
+#       When set, every mcp_trust_gate() call additionally requires the
+#       anchor to exist as a non-symlink regular file, resolve outside
+#       $workdir (so no `git add`/`commit` run inside the repo can ever
+#       reach it), be unwritable by the identity running this script — the
+#       anchor file itself, and every ancestor directory from its parent up
+#       to `/` — checked directly rather than trusting the operator got
+#       permissions right; an anchor that turns out to be writable anywhere
+#       in that chain is REFUSED, since that provides none of the guarantee
+#       it exists for — and sha256-match `.mcp.json`. Unset
+#       (default): the in-repo check above still runs, but the residual
+#       self-reauthorization gap is NOT closed — see mcp_trust_gate()'s
+#       comment and tools/ollama-mcp/README.md's "Headless/unattended trust
+#       behavior" section.
+#
 #   VERIFY_CMD=""            deterministic gate, e.g. "dotnet build && dotnet test"
 #       Runs in the workdir (a) once at startup — red baseline aborts the worker
 #       before any tokens are spent — and (b) after every claude run, BEFORE the
@@ -269,12 +295,26 @@ verify() { # verify <workdir> <worker-summary> <label> ; returns VERIFY_CMD stat
 # with the symlink vector closed, every rewrite this gate can be tricked by
 # still requires its own fresh, auditable commit. This defends against
 # accidental drift (stray hand-edit, bad merge) and mid-run tampering that
-# isn't committed. It does NOT defend against an agent that has commit
-# rights in $workdir deliberately committing its own rewritten .mcp.json
-# plus a matching, freshly-committed trust file each time — that requires
-# pinning trust to something the overnight agent cannot mutate (a signed
-# tag, a protected-branch commit, or a value held outside the workdir under
-# different credentials), which is out of scope for this bead.
+# isn't committed. It does NOT by itself defend against an agent that has
+# commit rights in $workdir deliberately committing its own rewritten
+# .mcp.json plus a matching, freshly-committed trust file each time — that
+# requires pinning trust to something the overnight agent cannot mutate.
+#
+# CLOSED, OPT-IN, VIA claude-o7u: if MCP_EXTERNAL_TRUST_ANCHOR is set, this
+# function also calls mcp_external_anchor_check() (below), which requires an
+# additional sha256 anchor living OUTSIDE $workdir (so no commit made inside
+# the repo can ever reach it) and unwritable by the identity running this
+# script. A signed-tag or protected-branch anchor was considered instead
+# (see the bead) but rejected for THIS repo's environment specifically: this
+# repo's own commits are already GPG-signed with a key this same identity
+# holds unprompted (`git log --show-signature`), and there is no CI/server-
+# side branch protection reachable from a plain local git repo — so both
+# would be self-satisfiable by the very identity they're meant to constrain.
+# An out-of-workdir, permission-restricted file is the one anchor this
+# sandbox can actually enforce without new external infrastructure. Left
+# unset (the default — this mechanism cannot be provisioned with real
+# separate credentials from inside an unattended run itself, only by a human
+# or a build step with root), the limitation above stands undiminished.
 mcp_trust_gate() {
   local workdir="$1" mcp_json trust_file actual expected f
   [ "${SKIP_MCP_TRUST_CHECK:-0}" = "1" ] && return 0
@@ -315,6 +355,113 @@ mcp_trust_gate() {
   expected="$(tr -d '[:space:]' < "$trust_file")"
   if [ "$actual" != "$expected" ]; then
     log "MCP TRUST GATE MISMATCH: $mcp_json sha256 ($actual) does not match committed $trust_file ($expected) — refusing headless claude -p launch. If this .mcp.json change is legitimate, review the diff, then: sha256sum '$mcp_json' | awk '{print \$1}' > '$trust_file' && git -C '$workdir' add .mcp.json .mcp.json.trusted-sha256 && git -C '$workdir' commit."
+    return 1
+  fi
+  # claude-o7u: opt-in out-of-band layer. In-repo trust alone (above) is
+  # self-satisfiable by this identity; skip unless an external anchor is
+  # configured (see MCP_EXTERNAL_TRUST_ANCHOR docs at the top of this file).
+  if [ -n "${MCP_EXTERNAL_TRUST_ANCHOR:-}" ]; then
+    mcp_external_anchor_check "$workdir" "$actual" || return 1
+  fi
+  return 0
+}
+
+# mcp_external_anchor_check <workdir> <expected-sha256> — the claude-o7u
+# out-of-band trust layer, called by mcp_trust_gate() only when
+# MCP_EXTERNAL_TRUST_ANCHOR is set. Returns 0 only if the anchor:
+#   (a) exists and is a plain, non-symlink regular file;
+#   (b) resolves to a path OUTSIDE $workdir — so no `git add`/`commit` run
+#       inside the repo being gated can ever reach it (a path pointed
+#       *inside* $workdir would just be another in-repo file this identity
+#       can commit, defeating the entire point);
+#   (c) is NOT writable by the identity running this script, and neither is
+#       ANY ancestor directory from the anchor's parent up to / (a writable
+#       file could be overwritten directly; a writable immediate parent
+#       lets it be unlinked and recreated; a writable grandparent-or-higher
+#       lets the whole anchor_dir be renamed aside and replaced wholesale —
+#       so every ancestor is checked, not just the immediate parent) —
+#       checked directly rather than trusted, so a misconfigured anchor
+#       that happens to be writable anywhere in its ancestry is loudly
+#       REJECTED rather than silently accepted as if it provided real
+#       separation; and
+#   (d) sha256-matches the .mcp.json content mcp_trust_gate() just verified
+#       against the in-repo pair (passed in as <expected-sha256> so this
+#       function doesn't re-read/re-hash it).
+mcp_external_anchor_check() {
+  local workdir="$1" expected="$2" anchor="${MCP_EXTERNAL_TRUST_ANCHOR:-}"
+  local anchor_dir_resolved real_anchor real_workdir actual_anchor d walk_root
+  # _MCP_ANCHOR_WALK_ROOT_TEST_ONLY: internal test seam, NOT a documented
+  # user-facing env var and not part of this script's normal operation —
+  # defaults to "/" (the real filesystem root) always, in every real
+  # invocation. It exists solely because tests/test_run_overnight.sh runs
+  # as the same unprivileged `node` identity this whole mechanism exists to
+  # constrain, with no real root available in this sandbox (see `sudo -l`:
+  # scoped to one firewall script, nothing broader) to build a genuinely
+  # root-owned ancestor chain — every writable-by-`node` tmpdir the test
+  # suite can create sits under /tmp, which is itself world-writable, so an
+  # unbounded walk to the true "/" would (correctly, but untestably here)
+  # refuse every fixture the tests can construct. Overriding this variable
+  # would weaken the real security property, so it is deliberately
+  # undocumented outside this comment and this file's tests.
+  walk_root="${_MCP_ANCHOR_WALK_ROOT_TEST_ONLY:-/}"
+  if [ ! -e "$anchor" ]; then
+    log "MCP TRUST GATE: MCP_EXTERNAL_TRUST_ANCHOR='$anchor' does not exist — refusing headless claude -p launch. An operator with write access this identity lacks must create it, e.g.: sudo install -o root -g root -m 0444 /dev/stdin '$anchor' <<<\"\$(sha256sum '$workdir/.mcp.json' | awk '{print \$1}')\""
+    return 1
+  fi
+  if [ -L "$anchor" ]; then
+    log "MCP TRUST GATE: MCP_EXTERNAL_TRUST_ANCHOR='$anchor' is a symlink — refusing (same rationale as the in-repo pair: git-style tracked+clean reasoning doesn't even apply here, but a symlink still lets the pointed-to content change without the anchor path itself changing)."
+    return 1
+  fi
+  if [ ! -f "$anchor" ]; then
+    log "MCP TRUST GATE: MCP_EXTERNAL_TRUST_ANCHOR='$anchor' is not a regular file — refusing."
+    return 1
+  fi
+  real_workdir="$(cd "$workdir" 2>/dev/null && pwd -P)"
+  if [ -z "$real_workdir" ]; then
+    log "MCP TRUST GATE: could not resolve real path for workdir '$workdir' — refusing rather than guessing."
+    return 1
+  fi
+  # Resolve (and validate) the anchor's containing directory BEFORE
+  # concatenating the basename back on: if the inner `cd` fails,
+  # anchor_dir_resolved is "" and we catch that here. (Concatenating
+  # "/$(basename "$anchor")" onto an empty resolved-dir string, as an
+  # earlier version of this check did, produces a non-empty path like
+  # "/anchor.sha256" that slips past an emptiness guard on $real_anchor —
+  # failing closed only by downstream coincidence, not by design.)
+  anchor_dir_resolved="$(cd "$(dirname "$anchor")" 2>/dev/null && pwd -P)"
+  if [ -z "$anchor_dir_resolved" ]; then
+    log "MCP TRUST GATE: could not resolve MCP_EXTERNAL_TRUST_ANCHOR='$anchor' directory — refusing rather than guessing."
+    return 1
+  fi
+  real_anchor="$anchor_dir_resolved/$(basename "$anchor")"
+  case "$real_anchor" in
+    "$real_workdir"|"$real_workdir"/*)
+      log "MCP TRUST GATE: MCP_EXTERNAL_TRUST_ANCHOR='$anchor' resolves inside the repo working tree ($real_workdir) — refusing. An anchor reachable from inside \$workdir is just another file this identity can git-commit; it must live entirely outside the repo to provide any out-of-band guarantee."
+      return 1
+      ;;
+  esac
+  if [ -w "$anchor" ]; then
+    log "MCP TRUST GATE: MCP_EXTERNAL_TRUST_ANCHOR='$anchor' is writable by the identity running this script ($(id -un 2>/dev/null || echo '?')) — refusing. An anchor this identity can write directly gives none of the separate-credential guarantee it exists for; fix ownership/permissions (e.g. a different owning user, mode 0444) so only a genuinely different identity can update it."
+    return 1
+  fi
+  # Walk EVERY ancestor directory up to / (not just the immediate parent):
+  # a writable grandparent (or higher) lets this identity `mv` the whole
+  # anchor_dir aside, `mkdir` a fresh replacement, drop a fake hash in it,
+  # and `chmod` it back read-only before the next gate check — an
+  # immediate-parent-only check would report "not writable" and pass
+  # despite the entire subtree having just been attacker-controlled.
+  d="$anchor_dir_resolved"
+  while true; do
+    if [ -w "$d" ]; then
+      log "MCP TRUST GATE: ancestor directory '$d' of MCP_EXTERNAL_TRUST_ANCHOR='$anchor' is writable by the identity running this script ($(id -un 2>/dev/null || echo '?')) — refusing. A writable ancestor anywhere above the anchor lets this identity replace the whole subtree (rename it aside, recreate it, drop a forged hash in, chmod back read-only) even if the anchor file and its immediate directory are themselves locked down; every directory from the anchor up to / must be unwritable by this identity."
+      return 1
+    fi
+    [ "$d" = "/" ] || [ "$d" = "$walk_root" ] && break
+    d="$(dirname "$d")"
+  done
+  actual_anchor="$(tr -d '[:space:]' < "$anchor" 2>/dev/null)"
+  if [ "$actual_anchor" != "$expected" ]; then
+    log "MCP TRUST GATE MISMATCH: MCP_EXTERNAL_TRUST_ANCHOR='$anchor' ($actual_anchor) does not match .mcp.json's actual sha256 ($expected) — refusing headless claude -p launch. Only an identity with write access to '$anchor' can update this anchor; that must be a deliberate, out-of-band action, not something this script or the agent it launches can do for itself."
     return 1
   fi
   return 0
@@ -435,9 +582,31 @@ run_worker() { # run_worker <index> <workdir>
 # `bash run-overnight.sh` still runs everything below exactly as before).
 if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
 
+# claude-o7u: _MCP_ANCHOR_WALK_ROOT_TEST_ONLY is an internal test-only seam
+# (see mcp_external_anchor_check()) that bounds the external-anchor
+# ancestor walk short of the real filesystem root — tests/test_run_overnight.sh
+# sets it because its scratch fixtures live under /tmp, which this
+# unprivileged identity can't otherwise make "unwritable all the way up"
+# without real root. It must NEVER affect a real invocation: unset it here,
+# before the first mcp_trust_gate call, so an inherited value (leaked from
+# a prior `source`d test run in the same shell, a sloppy CI step, etc.)
+# can't silently shrink the walk and reproduce the exact immediate-parent-
+# only bypass Finding 1 (claude-o7u round 1) closed. The test suite
+# `source`s this file rather than executing it, so this line never runs
+# under test.
+if [ -n "${_MCP_ANCHOR_WALK_ROOT_TEST_ONLY:-}" ]; then
+  log "WARNING: _MCP_ANCHOR_WALK_ROOT_TEST_ONLY was set in the environment ('$_MCP_ANCHOR_WALK_ROOT_TEST_ONLY') for this real run — this test-only seam must never be set outside tests/test_run_overnight.sh; it would bound the claude-o7u external-anchor ancestor walk short of the real filesystem root. Unsetting it now."
+  unset _MCP_ANCHOR_WALK_ROOT_TEST_ONLY
+fi
+
 log "Overnight run $RUN_ID: $PARALLEL_WORKERS worker(s), $MAX_ITERATIONS iters/worker, \$$MAX_TOTAL_COST_USD budget (\$$WORKER_BUDGET/worker), max-turns $MAX_TURNS/run."
 log "Permissions: $PERMISSION_FLAGS | OTel: $([ "$OTEL_ENABLED" = "1" ] && echo "on → $OTEL_EXPORTER_OTLP_ENDPOINT ($OTEL_EXPORTER_OTLP_PROTOCOL)" || echo "off")"
 [ -z "$VERIFY_CMD" ] && log "WARNING: VERIFY_CMD is empty — the deterministic verification gate is DISABLED. Set e.g. VERIFY_CMD='dotnet build && dotnet test'."
+if [ -z "${MCP_EXTERNAL_TRUST_ANCHOR:-}" ]; then
+  log "WARNING: MCP_EXTERNAL_TRUST_ANCHOR is not set (claude-o7u) — the MCP trust gate's in-repo check alone cannot stop this identity from committing its own rewritten .mcp.json + matching trust hash. Set MCP_EXTERNAL_TRUST_ANCHOR to a file outside the repo, unwritable by this identity, to close that gap."
+else
+  log "MCP external trust anchor (claude-o7u): $MCP_EXTERNAL_TRUST_ANCHOR"
+fi
 log "Stop file: $STOP_FILE"
 
 # MCP trust gate (claude-9hl): fail closed BEFORE even the preflight probe —

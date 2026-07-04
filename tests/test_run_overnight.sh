@@ -272,6 +272,232 @@ test_mcp_gate_bypass_flag_documented_and_working() {
     "SKIP_MCP_TRUST_CHECK=1 mcp_trust_gate '$TMPDIR_TEST'"
 }
 
+# --- MCP_EXTERNAL_TRUST_ANCHOR / mcp_external_anchor_check (claude-o7u) ---
+# claude-9hl's own residual limitation: the in-repo checks above require a
+# fresh commit, but nothing stops the very identity running this script from
+# making that commit itself (`/build-next --unattended` commits per
+# completed task). These tests exercise the opt-in out-of-band layer that
+# closes it — an anchor file that must live outside $workdir and be
+# unwritable by this identity. EXT_ANCHOR_DIR is a scratch dir created
+# OUTSIDE TMPDIR_TEST (sibling, not nested) so it's a genuine stand-in for
+# "outside the repo working tree"; cleaned up per-test since teardown() only
+# removes TMPDIR_TEST.
+
+ext_anchor_setup() { # ext_anchor_setup -> sets EXT_ANCHOR_DIR (a fresh scratch dir)
+  EXT_ANCHOR_DIR="$(mktemp -d)"
+}
+ext_anchor_teardown() {
+  chmod -R u+w "$EXT_ANCHOR_DIR" 2>/dev/null
+  rm -rf "$EXT_ANCHOR_DIR"
+}
+
+test_external_anchor_unset_does_not_change_existing_behavior() {
+  local content='{"mcpServers":{}}'
+  local hash; hash="$(printf '%s' "$content" | sha256sum | awk '{print $1}')"
+  mcp_git_init_committed "$TMPDIR_TEST" "$content" "$hash" >/dev/null 2>&1
+  assert "MCP_EXTERNAL_TRUST_ANCHOR unset -> gate behaves exactly as claude-9hl shipped it" \
+    "mcp_trust_gate '$TMPDIR_TEST'"
+}
+
+test_external_anchor_missing_fails_when_configured() {
+  local content='{"mcpServers":{}}'
+  local hash; hash="$(printf '%s' "$content" | sha256sum | awk '{print $1}')"
+  mcp_git_init_committed "$TMPDIR_TEST" "$content" "$hash" >/dev/null 2>&1
+  ext_anchor_setup
+  assert "in-repo pair valid but configured external anchor file doesn't exist -> refuses" \
+    "! MCP_EXTERNAL_TRUST_ANCHOR='$EXT_ANCHOR_DIR/nonexistent.sha256' mcp_trust_gate '$TMPDIR_TEST'"
+  ext_anchor_teardown
+}
+
+test_external_anchor_matches_and_locked_down_passes() {
+  local content='{"mcpServers":{}}'
+  local hash; hash="$(printf '%s' "$content" | sha256sum | awk '{print $1}')"
+  mcp_git_init_committed "$TMPDIR_TEST" "$content" "$hash" >/dev/null 2>&1
+  ext_anchor_setup
+  printf '%s' "$hash" > "$EXT_ANCHOR_DIR/anchor.sha256"
+  chmod 0444 "$EXT_ANCHOR_DIR/anchor.sha256"
+  chmod 0555 "$EXT_ANCHOR_DIR"
+  # _MCP_ANCHOR_WALK_ROOT_TEST_ONLY bounds the ancestor walk at
+  # EXT_ANCHOR_DIR (still checked itself, per the assertion below) instead
+  # of the true "/": every scratch dir this unprivileged test process can
+  # create lives under /tmp, which is itself world-writable, so an
+  # unbounded walk would (correctly) refuse every fixture the test suite
+  # can build here — see the internal-test-seam comment in
+  # mcp_external_anchor_check(). This does not weaken the real check; it
+  # only affects this test process when the var is explicitly set.
+  assert "in-repo pair valid + external anchor outside workdir, matching, unwritable -> gate passes" \
+    "_MCP_ANCHOR_WALK_ROOT_TEST_ONLY='$EXT_ANCHOR_DIR' MCP_EXTERNAL_TRUST_ANCHOR='$EXT_ANCHOR_DIR/anchor.sha256' mcp_trust_gate '$TMPDIR_TEST'"
+  chmod 0755 "$EXT_ANCHOR_DIR"
+  ext_anchor_teardown
+}
+
+test_external_anchor_content_mismatch_fails() {
+  local content='{"mcpServers":{}}'
+  local hash; hash="$(printf '%s' "$content" | sha256sum | awk '{print $1}')"
+  mcp_git_init_committed "$TMPDIR_TEST" "$content" "$hash" >/dev/null 2>&1
+  ext_anchor_setup
+  echo "0000000000000000000000000000000000000000000000000000000000000000" > "$EXT_ANCHOR_DIR/anchor.sha256"
+  chmod 0444 "$EXT_ANCHOR_DIR/anchor.sha256"
+  chmod 0555 "$EXT_ANCHOR_DIR"
+  # Bounded at EXT_ANCHOR_DIR (see comment in the previous test) so this
+  # exercises the content-mismatch path specifically, not an incidental
+  # /tmp-writability refusal.
+  assert "external anchor exists, outside workdir, unwritable, but content wrong -> refuses" \
+    "! _MCP_ANCHOR_WALK_ROOT_TEST_ONLY='$EXT_ANCHOR_DIR' MCP_EXTERNAL_TRUST_ANCHOR='$EXT_ANCHOR_DIR/anchor.sha256' mcp_trust_gate '$TMPDIR_TEST'"
+  chmod 0755 "$EXT_ANCHOR_DIR"
+  ext_anchor_teardown
+}
+
+test_external_anchor_inside_workdir_is_rejected() {
+  # The whole point of "external" is that it's unreachable from a commit
+  # made inside $workdir. Pointing the anchor AT a path inside the very repo
+  # being gated must be refused outright, even if it would otherwise be
+  # valid/matching/locked-down — otherwise "external" is just theater.
+  local content='{"mcpServers":{}}'
+  local hash; hash="$(printf '%s' "$content" | sha256sum | awk '{print $1}')"
+  mcp_git_init_committed "$TMPDIR_TEST" "$content" "$hash" >/dev/null 2>&1
+  printf '%s' "$hash" > "$TMPDIR_TEST/inside-repo-anchor.sha256"
+  chmod 0444 "$TMPDIR_TEST/inside-repo-anchor.sha256"
+  assert "anchor path resolving inside \$workdir is refused even though content matches" \
+    "! MCP_EXTERNAL_TRUST_ANCHOR='$TMPDIR_TEST/inside-repo-anchor.sha256' mcp_trust_gate '$TMPDIR_TEST'"
+  chmod u+w "$TMPDIR_TEST/inside-repo-anchor.sha256"
+}
+
+test_external_anchor_symlink_rejected() {
+  local content='{"mcpServers":{}}'
+  local hash; hash="$(printf '%s' "$content" | sha256sum | awk '{print $1}')"
+  mcp_git_init_committed "$TMPDIR_TEST" "$content" "$hash" >/dev/null 2>&1
+  ext_anchor_setup
+  printf '%s' "$hash" > "$EXT_ANCHOR_DIR/real.sha256"
+  chmod 0444 "$EXT_ANCHOR_DIR/real.sha256"
+  ln -s "$EXT_ANCHOR_DIR/real.sha256" "$EXT_ANCHOR_DIR/anchor-link.sha256"
+  assert "a symlinked external anchor is refused, not silently followed" \
+    "! MCP_EXTERNAL_TRUST_ANCHOR='$EXT_ANCHOR_DIR/anchor-link.sha256' mcp_trust_gate '$TMPDIR_TEST'"
+  ext_anchor_teardown
+}
+
+test_external_anchor_writable_by_self_is_rejected_even_when_content_matches() {
+  # This is the core property the whole mechanism rests on: an anchor this
+  # identity can write provides NO separation, no matter how correct its
+  # current content is (this identity could have just written that content
+  # itself, exactly the self-reauthorization move the gate exists to catch).
+  # The gate must refuse a writable anchor rather than trust it because the
+  # bytes happen to line up right now.
+  local content='{"mcpServers":{}}'
+  local hash; hash="$(printf '%s' "$content" | sha256sum | awk '{print $1}')"
+  mcp_git_init_committed "$TMPDIR_TEST" "$content" "$hash" >/dev/null 2>&1
+  ext_anchor_setup
+  printf '%s' "$hash" > "$EXT_ANCHOR_DIR/anchor.sha256"
+  # deliberately left writable (default mktemp -d / file perms)
+  assert "external anchor is writable by this identity -> refused even though content currently matches" \
+    "! MCP_EXTERNAL_TRUST_ANCHOR='$EXT_ANCHOR_DIR/anchor.sha256' mcp_trust_gate '$TMPDIR_TEST'"
+  ext_anchor_teardown
+}
+
+test_external_anchor_writable_parent_dir_is_rejected() {
+  # Even a read-only anchor FILE is not enough if its parent directory is
+  # writable: this identity could unlink and recreate the file (a directory
+  # write, not a file write) to the same effect as editing it in place.
+  local content='{"mcpServers":{}}'
+  local hash; hash="$(printf '%s' "$content" | sha256sum | awk '{print $1}')"
+  mcp_git_init_committed "$TMPDIR_TEST" "$content" "$hash" >/dev/null 2>&1
+  ext_anchor_setup
+  printf '%s' "$hash" > "$EXT_ANCHOR_DIR/anchor.sha256"
+  chmod 0444 "$EXT_ANCHOR_DIR/anchor.sha256"
+  # parent dir left writable (default mktemp -d perms, 0700 but owner-writable)
+  assert "external anchor file is read-only but its directory is writable -> refused (delete+recreate vector)" \
+    "! MCP_EXTERNAL_TRUST_ANCHOR='$EXT_ANCHOR_DIR/anchor.sha256' mcp_trust_gate '$TMPDIR_TEST'"
+  ext_anchor_teardown
+}
+
+test_external_anchor_writable_grandparent_dir_is_rejected() {
+  # A writable grandparent (or higher) is enough to replace the whole
+  # anchor_dir subtree even when the anchor FILE and its IMMEDIATE parent
+  # are both locked down: `mv locked locked.bak && mkdir locked && echo
+  # <fake> > locked/anchor.sha256 && chmod back` only ever needs write
+  # access on the grandparent, never on `locked` itself. The ancestor walk
+  # must catch this, not just check the immediate parent.
+  local content='{"mcpServers":{}}'
+  local hash; hash="$(printf '%s' "$content" | sha256sum | awk '{print $1}')"
+  mcp_git_init_committed "$TMPDIR_TEST" "$content" "$hash" >/dev/null 2>&1
+  ext_anchor_setup
+  mkdir "$EXT_ANCHOR_DIR/locked"
+  printf '%s' "$hash" > "$EXT_ANCHOR_DIR/locked/anchor.sha256"
+  chmod 0444 "$EXT_ANCHOR_DIR/locked/anchor.sha256"
+  chmod 0555 "$EXT_ANCHOR_DIR/locked"
+  # EXT_ANCHOR_DIR itself (the grandparent) is deliberately left writable
+  # (default mktemp -d perms) — anchor file and immediate parent are both
+  # locked down, but the grandparent is not.
+  assert "anchor file + immediate parent locked down, but a writable grandparent -> still refused" \
+    "! MCP_EXTERNAL_TRUST_ANCHOR='$EXT_ANCHOR_DIR/locked/anchor.sha256' mcp_trust_gate '$TMPDIR_TEST'"
+  chmod 0755 "$EXT_ANCHOR_DIR/locked"
+  ext_anchor_teardown
+}
+
+test_external_anchor_defeats_a_full_valid_self_committed_rewrite() {
+  # Scoped claim (narrowed per round-1 review, Finding 3 -- see git history
+  # for the earlier, overstated version): proves that a valid, clean,
+  # git-tracked, hash-matching in-repo COMMIT -- by itself, exercised
+  # perfectly, exactly what would fully satisfy claude-9hl's in-repo gate on
+  # its own per test_mcp_gate_passes_when_committed_and_clean_and_matching
+  # above -- does not flip the overall trust decision when a configured
+  # external anchor disagrees. Mechanically this exercises the same
+  # hash-mismatch path as test_external_anchor_content_mismatch_fails; the
+  # added value here is the explicit A/B: the SAME rewrite that the in-repo
+  # layer alone accepts (the control assertion below, reproducing
+  # claude-9hl's documented gap) is refused once the anchor is in play.
+  #
+  # NOT proven here (see README's honestly-disclosed residual limitation):
+  # this does not show the anchor resists a same-UID attacker who goes
+  # further and directly `chmod u+w`s + rewrites the anchor file itself --
+  # in this sandbox (no real root/second UID available), that IS possible,
+  # and mcp_external_anchor_check()'s writability checks exist to refuse an
+  # anchor an operator left writable, not to make an unwritable anchor
+  # un-chmod-able by its own owner.
+  local original='{"mcpServers":{"ollama-mcp":{"command":"node"}}}'
+  local original_hash; original_hash="$(printf '%s' "$original" | sha256sum | awk '{print $1}')"
+  mcp_git_init_committed "$TMPDIR_TEST" "$original" "$original_hash" >/dev/null 2>&1
+
+  # The external anchor is provisioned once, out of band, pinned to the
+  # ORIGINAL trusted content -- standing in for a root-owned file this
+  # identity has no write path to.
+  ext_anchor_setup
+  printf '%s' "$original_hash" > "$EXT_ANCHOR_DIR/anchor.sha256"
+  chmod 0444 "$EXT_ANCHOR_DIR/anchor.sha256"
+  chmod 0555 "$EXT_ANCHOR_DIR"
+
+  # Now simulate the exact attack claude-o7u is about: the (commit-capable)
+  # identity rewrites .mcp.json to add a server of its own choosing, AND
+  # performs a fully legitimate-looking commit of a matching trust hash --
+  # nothing about this commit is dirty, untracked, or a symlink.
+  local rewritten='{"mcpServers":{"ollama-mcp":{"command":"node"},"evil":{"command":"whatever"}}}'
+  local rewritten_hash; rewritten_hash="$(printf '%s' "$rewritten" | sha256sum | awk '{print $1}')"
+  ( cd "$TMPDIR_TEST" \
+    && printf '%s' "$rewritten" > .mcp.json \
+    && printf '%s' "$rewritten_hash" > .mcp.json.trusted-sha256 \
+    && git add .mcp.json .mcp.json.trusted-sha256 \
+    && git commit -q -m "self-authored rewrite + matching hash" )
+
+  # Confirm the in-repo layer ALONE (no external anchor configured) would
+  # have been fooled -- this is claude-9hl's documented residual limitation,
+  # reproduced here as a control before showing the fix.
+  assert "control: in-repo layer alone is fooled by a fully committed self-rewrite (the documented claude-9hl gap)" \
+    "mcp_trust_gate '$TMPDIR_TEST'"
+
+  # With the external anchor configured (still pinned to the ORIGINAL hash,
+  # because this identity never had write access to update it), the overall
+  # gate must now refuse -- proving the commit alone cannot flip the
+  # decision. Bounded at EXT_ANCHOR_DIR (see the walk-root comment in
+  # test_external_anchor_matches_and_locked_down_passes above) so this
+  # refusal is specifically the hash-mismatch this test is about, not an
+  # incidental /tmp-writability refusal.
+  assert "fix: with MCP_EXTERNAL_TRUST_ANCHOR configured, the same self-committed rewrite is refused" \
+    "! _MCP_ANCHOR_WALK_ROOT_TEST_ONLY='$EXT_ANCHOR_DIR' MCP_EXTERNAL_TRUST_ANCHOR='$EXT_ANCHOR_DIR/anchor.sha256' mcp_trust_gate '$TMPDIR_TEST'"
+
+  chmod 0755 "$EXT_ANCHOR_DIR"
+  ext_anchor_teardown
+}
+
 run_test test_count_zero_with_no_worker_logs
 run_test test_count_single_worker
 run_test test_count_multi_worker_sum
@@ -288,6 +514,16 @@ run_test test_mcp_gate_fails_on_uncommitted_self_reauthorization
 run_test test_mcp_gate_passes_on_committed_repo_files
 run_test test_mcp_gate_fails_when_mcp_json_is_a_symlink
 run_test test_mcp_gate_bypass_flag_documented_and_working
+run_test test_external_anchor_unset_does_not_change_existing_behavior
+run_test test_external_anchor_missing_fails_when_configured
+run_test test_external_anchor_matches_and_locked_down_passes
+run_test test_external_anchor_content_mismatch_fails
+run_test test_external_anchor_inside_workdir_is_rejected
+run_test test_external_anchor_symlink_rejected
+run_test test_external_anchor_writable_by_self_is_rejected_even_when_content_matches
+run_test test_external_anchor_writable_parent_dir_is_rejected
+run_test test_external_anchor_writable_grandparent_dir_is_rejected
+run_test test_external_anchor_defeats_a_full_valid_self_committed_rewrite
 
 rm -rf "$SOURCE_SCRATCH_DIR"
 

@@ -417,29 +417,114 @@ the very command the overnight loop runs, in addition to closing the
   recommended, since it reintroduces the exact risk this section describes;
   it exists for debugging only, and only with a `.mcp.json` an operator
   already trusts.
-- **Residual limitation, recorded honestly rather than implied-closed:** with
-  the symlink vector above closed, every remaining way to fool this gate
+- **Residual limitation as `claude-9hl` shipped it:** with the symlink
+  vector above closed, every remaining way to fool the in-repo gate alone
   requires its own fresh, auditable commit — requiring a genuine git commit
   stops *accidental* drift (a stray hand-edit, a bad merge) and
   *uncommitted* mid-run tampering, but it does **not** stop an agent that
   already has commit rights in the workdir from deliberately committing its
   own rewritten `.mcp.json` plus a matching, freshly-committed trust file
   — `/build-next`'s unattended mode explicitly commits per completed task,
-  so this is a real, not merely theoretical, gap. A complete fix needs a
-  trust anchor the overnight agent cannot mutate: a signed tag, a commit on
-  a protected branch the agent can't push to, or a value held outside the
-  workdir under different credentials (e.g. checked by the *human*
-  triggering the run, or fetched from a store the overnight process's own
-  git identity has no write access to). That out-of-band anchor is a larger
-  change than this bead's scope and is not built here.
-- Covered by `tests/test_run_overnight.sh` (`test_mcp_gate_*`), which
-  exercises the gate against fabricated git repos (committed-and-clean,
-  untracked-trust-file, uncommitted-rewrite/"self-reauthorization",
-  symlinked-`.mcp.json`, and genuine-hash-mismatch cases) without launching
-  `claude`, plus a regression
-  test that runs the gate against this repo's own real `.mcp.json` /
-  `.mcp.json.trusted-sha256` so a hash/file drift here fails at test time
-  instead of silently aborting an overnight run at 2am.
+  so this was a real, not merely theoretical, gap.
+
+**Closed (opt-in), `claude-o7u`: an out-of-band external trust anchor.**
+`claude-9hl` named three candidate fixes for the gap above: a signed git
+tag, a commit on a protected branch the overnight identity can't push to, or
+a value held outside the workdir under different credentials. All three
+were re-examined against what this sandbox can actually provision:
+
+- **Signed tag/commit — investigated and rejected for this repo.** Every
+  commit in this repo is already GPG-signed (`git log --show-signature`),
+  using a key this same overnight identity's environment holds with no
+  passphrase prompt (`gpg --list-secret-keys` finds the secret key,
+  unlocked). Verifying `git verify-tag`/`git verify-commit` against that
+  same key would be trivially self-satisfiable — the agent can just make
+  another signed tag. A signed-tag anchor only works if the signing key is
+  held somewhere the overnight identity genuinely cannot reach (a separate
+  keyring, a human's local machine, an HSM); none of that is provisioned
+  here, and faking it with the same ambient key would be worse than not
+  building it — a false sense of closure.
+- **Protected branch — not testable without real server-side enforcement.**
+  "Protected" is a property a git *server* (GitHub/GitLab branch protection)
+  enforces against push credentials; a plain local repo has no such
+  authority, and standing up that infrastructure (and a second, restricted
+  credential) is out of scope for this bead per its own sizing note.
+- **Out-of-workdir value under different permissions — built.** This is the
+  one anchor mechanism enforceable purely with what's already in the
+  sandbox: filesystem permissions and a UID (`node`, uid 1000) that this
+  repo's own `sudo -l` shows has **no general root access** (only a single
+  NOPASSWD entry for `/usr/local/bin/init-firewall.sh`) — a real, narrow
+  privilege boundary already in place, not one invented for this bead.
+
+  `MCP_EXTERNAL_TRUST_ANCHOR` (env var, see `tools/run-overnight.sh`'s
+  header comment) names an absolute path to a file holding just the trusted
+  sha256, provisioned by an operator/build step with write access this
+  identity lacks (e.g. `sudo install -o root -g root -m 0444 ...`). When
+  set, `mcp_trust_gate()` additionally requires the anchor to:
+  - exist as a plain, non-symlink regular file;
+  - resolve to a path **outside** `$workdir` (so no `git add`/`commit` run
+    inside the repo being gated can ever reach it — pointing the anchor at
+    a path inside the repo would just be another file this identity can
+    commit, which defeats the entire point, and the gate explicitly checks
+    and refuses this);
+  - be **unwritable by the identity running the script** — the anchor file
+    itself, and *every* ancestor directory from its parent up to `/` (a
+    writable immediate parent would let the file be deleted and recreated
+    even if the file's own permissions were read-only; a writable
+    grandparent-or-higher would let the whole anchor directory be renamed
+    aside and replaced wholesale, so the walk doesn't stop at the immediate
+    parent). The gate checks this directly with `[ -w ... ]` at every level
+    rather than trusting that an operator configured permissions correctly:
+    an anchor that turns out to be writable anywhere in that chain is
+    **refused outright**, even if its current content happens to match,
+    because a same-credential anchor provides none of the guarantee it
+    exists for; and
+  - sha256-match the working tree's actual `.mcp.json`.
+
+  **Unset (the default):** the in-repo checks above still run exactly as
+  `claude-9hl` shipped them, but the self-reauthorization gap is **not**
+  closed — this mechanism cannot be provisioned with genuinely separate
+  credentials from inside an unattended run itself; it requires a human or
+  a privileged build step to create the anchor beforehand. `run-overnight.sh`
+  logs a one-time warning at startup when it's unset, so this isn't a silent
+  downgrade.
+
+- **Residual limitation of the built mechanism, recorded honestly:** this
+  closes the gap *when properly provisioned* — an anchor that is genuinely
+  root-owned (or otherwise held by a different, unreachable identity) with
+  restrictive permissions. It does **not** self-provision that separation;
+  nothing in this sandbox can create a root-owned file without real root
+  access, so the test suite (below) can only simulate the "unwritable"
+  property via `chmod`, which the owning `node` user could technically
+  reverse (`chmod u+w`) since `chmod` only checks file *ownership*, not
+  current permission bits. In other words: the gate correctly *enforces*
+  the boundary once it exists, but *creating* a boundary this identity
+  truly cannot cross is an operational responsibility outside this script —
+  document it, provision it in the container build or by the human
+  triggering the run, and don't rely on `chmod`-only "protection" applied by
+  the same identity that's supposed to be constrained by it.
+- Covered by `tests/test_run_overnight.sh`: the original `test_mcp_gate_*`
+  suite (committed-and-clean, untracked-trust-file, uncommitted-rewrite/
+  "self-reauthorization", symlinked-`.mcp.json`, genuine-hash-mismatch, and a
+  regression test against this repo's own real `.mcp.json` /
+  `.mcp.json.trusted-sha256`), plus a new `test_external_anchor_*` suite
+  covering the anchor missing/mismatched/symlinked/inside-workdir/writable-
+  file/writable-parent-dir/writable-grandparent-dir cases (the writability
+  check walks *every* ancestor directory up to `/`, not just the immediate
+  parent — a writable grandparent-or-higher would otherwise let this
+  identity rename the whole anchor directory aside and replace it wholesale)
+  and `test_external_anchor_defeats_a_full_valid_self_committed_rewrite`,
+  which performs a fully legitimate, clean, git-tracked, hash-matching
+  commit of a rewritten `.mcp.json` (proving the in-repo layer alone would
+  be fooled, reproducing `claude-9hl`'s documented gap as a control) and
+  then shows the same rewrite is refused once an external anchor pinned to
+  the prior, trusted hash is configured. Scoped claim: this demonstrates
+  that a valid, clean, git-committed in-repo rewrite alone does not flip
+  the decision when the anchor disagrees — it does **not** demonstrate that
+  the anchor resists a same-UID attacker going one step further and
+  directly rewriting the anchor file itself, which (per the residual
+  limitation above) this sandbox cannot rule out without real separate
+  credentials.
 
 ## Follow-ups not built in this bead
 
