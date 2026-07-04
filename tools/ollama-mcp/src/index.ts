@@ -15,6 +15,7 @@ import { createReadStream } from "node:fs";
 import { open, realpath, stat } from "node:fs/promises";
 import * as path from "node:path";
 import * as readline from "node:readline";
+import { fileURLToPath } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
@@ -113,6 +114,15 @@ const server = new McpServer(
   },
 );
 
+/** Static payload for the `ping` tool -- a trivial transport reachability
+ * check that never contacts Ollama (see `health`/`checkOllamaHealth` for
+ * that). Pulled out of the inline handler below and exported so
+ * health.test.ts can exercise the actual production logic directly, rather
+ * than re-asserting a duplicated literal. */
+export function pingResult(): { ok: true } {
+  return { ok: true };
+}
+
 server.registerTool(
   "ping",
   {
@@ -122,7 +132,7 @@ server.registerTool(
     inputSchema: {},
   },
   async () => ({
-    content: [{ type: "text", text: JSON.stringify({ ok: true }) }],
+    content: [{ type: "text", text: JSON.stringify(pingResult()) }],
   }),
 );
 
@@ -384,7 +394,7 @@ server.registerTool(
   },
 );
 
-interface HealthResult {
+export interface HealthResult {
   reachable: boolean;
   host: string;
   model: string;
@@ -392,13 +402,26 @@ interface HealthResult {
 }
 
 /** GETs /api/tags on the configured Ollama host. Degrades gracefully: any
- * network error, non-2xx response, or timeout is reported, never thrown. */
-async function checkOllamaHealth(): Promise<HealthResult> {
+ * network error, non-2xx response, or timeout is reported, never thrown.
+ *
+ * Exported (bead claude-dha), along with two parameters that default to this
+ * module's real behavior and only exist so health.test.ts can exercise this
+ * function's actual logic -- not a re-implementation of it -- with a mocked
+ * `fetch` and a short timeout instead of the real network and
+ * HEALTH_CHECK_TIMEOUT_MS's 3s: `fetchImpl` (defaults to the global `fetch`)
+ * and `timeoutMs` (defaults to HEALTH_CHECK_TIMEOUT_MS), matching the same
+ * injectable-timeout pattern `callOllamaGenerate` already uses below. Neither
+ * parameter changes this function's behavior for its one real caller (the
+ * `health` tool handler above), which calls it with no arguments. */
+export async function checkOllamaHealth(
+  fetchImpl: typeof fetch = fetch,
+  timeoutMs: number = HEALTH_CHECK_TIMEOUT_MS,
+): Promise<HealthResult> {
   const base: HealthResult = { reachable: false, host: OLLAMA_HOST, model: OLLAMA_MODEL };
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), HEALTH_CHECK_TIMEOUT_MS);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const response = await fetch(`${OLLAMA_HOST}/api/tags`, { signal: controller.signal });
+    const response = await fetchImpl(`${OLLAMA_HOST}/api/tags`, { signal: controller.signal });
     if (!response.ok) {
       await response.body?.cancel();
       return { ...base, error: `HTTP ${response.status} ${response.statusText}` };
@@ -778,7 +801,17 @@ async function main() {
   console.error("ollama-mcp running on stdio");
 }
 
-main().catch((error) => {
-  console.error("ollama-mcp fatal error:", error);
-  process.exit(1);
-});
+// Only start the stdio server when this module is the process entry point
+// (`node dist/index.js`, matching package.json's `start` script), not when
+// it's merely `import`ed -- e.g. by health.test.ts (bead claude-dha), which
+// needs `checkOllamaHealth`/`pingResult` without also connecting a real
+// StdioServerTransport (which would hang the test runner listening on
+// stdin). `process.argv[1]` is the entry script's path; comparing it against
+// this module's own resolved path is the standard ESM equivalent of
+// CommonJS's `require.main === module`.
+if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  main().catch((error) => {
+    console.error("ollama-mcp fatal error:", error);
+    process.exit(1);
+  });
+}
