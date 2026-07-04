@@ -18,20 +18,59 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   ca-certificates \
   && apt-get clean && rm -rf /var/lib/apt/lists/*
 
+# claude-241: setpriv-drop-args.sh is the single source of truth for the
+# SETPRIV_DROP array -- COPY'd here, before the guard below, so the guard can
+# source the SAME file ollama-entrypoint.sh sources at runtime instead of a
+# separately hand-typed (and driftable) copy of the same args.
+COPY setpriv-drop-args.sh /usr/local/bin/setpriv-drop-args.sh
+
 # setpriv (util-linux) drops NET_ADMIN/NET_RAW before ollama serve starts
-# (see ollama-entrypoint.sh) -- util-linux is Essential on Debian/Ubuntu so
-# it should already be present; fail the BUILD loudly here instead of
-# discovering it's missing at container start. Beyond just existing, setpriv
-# must also ACCEPT the exact drop args ollama-entrypoint.sh invokes it with --
-# a prior regression used cap_-prefixed names (e.g. cap_net_admin) that
-# setpriv rejects; only the UN-prefixed form (net_admin/net_raw) is valid.
-# Running the real invocation with a harmless `true` payload proves both
-# existence and argument-acceptance in one shot: dropping an already-absent
-# capability still exits 0 (works regardless of this build container's own
-# cap set), so only a rejected cap NAME/flag fails the build here -- exactly
-# the class of error that otherwise slips through to a runtime failure.
-RUN setpriv --bounding-set=-net_admin,-net_raw --inh-caps=-net_admin,-net_raw true || \
-  { echo "ERROR: setpriv rejected the cap-drop args ollama-entrypoint.sh depends on (--bounding-set=-net_admin,-net_raw --inh-caps=-net_admin,-net_raw); check setpriv is installed from util-linux and its cap names are un-prefixed (net_admin/net_raw, not cap_net_admin/cap_net_raw)"; exit 1; }
+# (see ollama-entrypoint.sh, which sources setpriv-drop-args.sh above) --
+# util-linux is Essential on Debian/Ubuntu so it should already be present;
+# fail the BUILD loudly here instead of discovering it's missing at container
+# start. Beyond just existing, setpriv must also ACCEPT the drop args in that
+# shared file -- a prior regression used cap_-prefixed names (e.g.
+# cap_net_admin) that setpriv rejects; only the UN-prefixed form
+# (net_admin/net_raw) is valid. This sources setpriv-drop-args.sh itself (the
+# exact file ollama-entrypoint.sh sources at runtime -- not a re-typed copy
+# that could diverge from it) and runs the real invocation against it with a
+# harmless `true` payload, proving existence, sourceability, AND
+# argument-acceptance for the ACTUAL runtime args in one shot: dropping an
+# already-absent capability still exits 0 (works regardless of this build
+# container's own cap set), so only a rejected cap NAME/flag -- or a failure
+# to source the file at all -- fails the build here, exactly the classes of
+# error that would otherwise slip through to a runtime failure. `set -euo
+# pipefail` is required for that guarantee: without it, a failed `.` source
+# (missing file, bad COPY, permissions, a syntax error introduced into
+# setpriv-drop-args.sh) would NOT abort the script, and the command actually
+# run would silently degrade to a bare `setpriv true` -- which trivially
+# succeeds and reports "passed" with the guard never having actually checked
+# anything. NOTE: `set -u` alone does NOT close this gap the way it looks like
+# it should -- verified locally with bash 5.2/setpriv 2.38.1 (matching this
+# image's util-linux): `"${SETPRIV_DROP[@]}"` on a totally-unset array is
+# exempt from nounset in bash, the same carve-out `$@` gets (an unset SCALAR
+# does trip -u; an unset ARRAY referenced via [@]/[*] does not) -- so a source
+# that succeeds but never actually declares SETPRIV_DROP (e.g. a wrong var
+# name, or a truncated-but-syntactically-valid file) would still silently
+# expand to zero words even under `-u`. The explicit `-eq 0` count check below
+# is what actually enforces "SETPRIV_DROP must be non-empty after sourcing";
+# `-eu` guards the other failure modes (missing file, bad source, non-zero
+# exit from setpriv itself). A correctly-populated array still expands fine
+# under `-u` (this is only an issue for genuinely unset/empty arrays). Uses
+# `bash -c` explicitly (not the default `/bin/sh`) because SETPRIV_DROP is a
+# bash array -- bash is already a hard runtime dependency of this image via
+# ollama-entrypoint.sh's own `#!/bin/bash` shebang, so this adds no new tool.
+RUN bash -c ' \
+    set -euo pipefail; \
+    . /usr/local/bin/setpriv-drop-args.sh; \
+    if [ "${#SETPRIV_DROP[@]}" -eq 0 ]; then \
+      echo "ERROR: setpriv-drop-args.sh sourced cleanly but left SETPRIV_DROP empty/undeclared -- check the file was COPYd correctly and still assigns the array" >&2; \
+      exit 1; \
+    fi; \
+    if ! setpriv "${SETPRIV_DROP[@]}" true; then \
+      echo "ERROR: setpriv rejected the cap-drop args in setpriv-drop-args.sh (${SETPRIV_DROP[*]}) that ollama-entrypoint.sh depends on at runtime; check setpriv is installed from util-linux and its cap names are un-prefixed (net_admin/net_raw, not cap_net_admin/cap_net_raw)" >&2; \
+      exit 1; \
+    fi'
 
 COPY firewall-common.sh /usr/local/bin/firewall-common.sh
 COPY ollama-init-firewall.sh /usr/local/bin/ollama-init-firewall.sh

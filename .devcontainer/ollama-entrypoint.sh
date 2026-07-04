@@ -8,7 +8,12 @@
 # non-devcontainer-CLI services).
 set -euo pipefail
 
-readonly SETPRIV_DROP=(--bounding-set=-net_admin,-net_raw --inh-caps=-net_admin,-net_raw)
+# claude-241: SETPRIV_DROP lives in setpriv-drop-args.sh, sourced here rather
+# than retyped, so Dockerfile.ollama's build-time setpriv guard (which sources
+# the same file) tests the exact args this script actually uses -- not a
+# separate hand-typed copy that could silently drift from this one.
+# shellcheck source=setpriv-drop-args.sh
+. /usr/local/bin/setpriv-drop-args.sh
 
 # Fail-closed gate: whether the firewall has already been applied AND this
 # process has already been re-exec'd through setpriv (see the re-exec below)
