@@ -722,6 +722,80 @@ YAML
     "! grep -q 'TELEMETRY HEALTH WARNING: config/behavior drift detected' '$LOG_DIR_TEST/summary.log'"
 }
 
+# --- check_telemetry_health() Loki /ready probe (claude-e1z, follow-up from
+# claude-906's round-2 review) ---
+# claude-906 added a Loki /ready leg to check_telemetry_health() (see the
+# block comment directly above that function in tools/run-overnight.sh) to
+# close a silent-log-drop bug: Loki can get OOM-parked mid-run by its own
+# bounded restart:on-failure:5 budget, and because otel-collector's
+# depends_on: loki: condition: service_healthy is only evaluated once, at
+# container creation (compose does not enforce it continuously), a mid-run
+# Loki death silently drops every log export from that point on with nothing
+# else surfacing it. That branch shipped with no direct test of its own — the
+# two tests above only exercise the config-drift marker-selection logic and
+# happen to fail the Loki probe as an unasserted side effect. These two drive
+# check_telemetry_health() for real with LOKI_URL pointed at a fake host and
+# `curl` shadowed to answer only the /ready probe deterministically (no
+# session-markers.log is written, so the config-drift-query leg short-
+# circuits on its own "nothing to probe" skip before it ever calls curl with
+# a query= argument — one less thing this shadow needs to discriminate; the
+# pre-existing Prometheus /-/healthy leg is left to fail harmlessly and
+# unasserted, same as the two tests above), so a future refactor that removes
+# or miswires the Loki branch fails CI instead of going unnoticed.
+
+test_check_telemetry_health_loki_ready_ok() {
+  # shellcheck disable=SC2329  # it IS invoked — indirectly, by
+  # check_telemetry_health() calling the bare `curl` command, which this
+  # function definition shadows; shellcheck can't see that dynamic dispatch
+  # statically.
+  curl() {
+    local arg
+    for arg in "$@"; do
+      case "$arg" in
+        */ready) return 0 ;;
+      esac
+    done
+    return 1  # Prometheus /-/healthy (or any stray query= call) fails harmlessly; not asserted here.
+  }
+
+  LOKI_URL="http://test-loki:3100" \
+    PROJECT_DIR="$TMPDIR_TEST" LOG_DIR="$LOG_DIR_TEST" SUMMARY="$LOG_DIR_TEST/summary.log" \
+    OTEL_ENABLED=1 PROM_URL="http://test-prom:9090" \
+    OTEL_EXPORTER_OTLP_ENDPOINT="http://127.0.0.1:1" \
+    check_telemetry_health >/dev/null 2>&1
+
+  unset -f curl
+
+  assert "a responsive Loki /ready logs the OK line" \
+    "grep -q 'Telemetry health: Loki (http://test-loki:3100) OK.' '$LOG_DIR_TEST/summary.log'"
+}
+
+test_check_telemetry_health_loki_ready_down() {
+  # shellcheck disable=SC2329  # see the identical note on the previous
+  # test's curl() shadow above — invoked indirectly via
+  # check_telemetry_health().
+  curl() {
+    local arg
+    for arg in "$@"; do
+      case "$arg" in
+        */ready) return 1 ;;
+      esac
+    done
+    return 1
+  }
+
+  LOKI_URL="http://test-loki:3100" \
+    PROJECT_DIR="$TMPDIR_TEST" LOG_DIR="$LOG_DIR_TEST" SUMMARY="$LOG_DIR_TEST/summary.log" \
+    OTEL_ENABLED=1 PROM_URL="http://test-prom:9090" \
+    OTEL_EXPORTER_OTLP_ENDPOINT="http://127.0.0.1:1" \
+    check_telemetry_health >/dev/null 2>&1
+
+  unset -f curl
+
+  assert "an unresponsive Loki /ready logs the TELEMETRY HEALTH WARNING naming the /ready URL" \
+    "grep -q 'TELEMETRY HEALTH WARNING: Loki (http://test-loki:3100/ready) did not respond ready at end of run.' '$LOG_DIR_TEST/summary.log'"
+}
+
 run_test test_count_zero_with_no_worker_logs
 run_test test_count_single_worker
 run_test test_count_multi_worker_sum
@@ -762,6 +836,8 @@ run_test test_record_session_marker_noop_with_empty_session_id
 run_test test_record_session_marker_rejects_invalid_characters
 run_test test_check_telemetry_health_selects_newest_in_window_marker
 run_test test_check_telemetry_health_no_candidates_in_window_is_not_flagged_as_drift
+run_test test_check_telemetry_health_loki_ready_ok
+run_test test_check_telemetry_health_loki_ready_down
 
 rm -rf "$SOURCE_SCRATCH_DIR"
 
