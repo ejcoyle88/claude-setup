@@ -252,6 +252,51 @@ connected, then try the `ping` and `health` tools, followed by
 `summarize_file`/`extract`/`classify` against a real file once the `ollama`
 sidecar is up and healthy.
 
+### `dist/` build provenance — verify before trusting
+
+`dist/index.js` is the actual binary `.mcp.json` auto-launches
+(`node tools/ollama-mcp/dist/index.js`), but `dist/` is git-ignored (see
+`tools/ollama-mcp/.gitignore`) and deliberately not committed — only `src/`
+goes through code review and shows up in `git diff`. That means **trusting
+this repo's `.mcp.json` only reviews `src/`; it says nothing about whether
+the `dist/index.js` sitting on disk in your checkout was actually produced
+from that reviewed `src/`.** A stale build left over from an earlier commit,
+a local edit made directly to a `.js` file under `dist/`, or a `tsc` run
+against a compromised/tampered transitive dependency would all execute
+automatically the next time this server connects, with no diff ever showing
+it.
+
+Before trusting `ollama-mcp` in a new checkout (or after pulling changes that
+touch `tools/ollama-mcp/src/`), rebuild and verify:
+
+```bash
+cd tools/ollama-mcp
+npm install
+npm run build     # compiles the currently checked-out src/ -> dist/
+npm run verify     # rebuilds src/ into a scratch dir and sha256-diffs it against dist/
+```
+
+`npm run verify` (`scripts/verify-dist.mjs`, dependency-free — only Node
+built-ins) runs a second, independent `tsc` build into a temporary directory
+and compares every compiled `.js` file's sha256 against what's currently in
+`dist/`. It exits non-zero and prints exactly which files are missing, extra,
+or content-mismatched if `dist/` doesn't match a fresh build of `src/` — or
+if `dist/` doesn't exist at all. A clean `npm run verify` means "what
+`.mcp.json` would execute right now is exactly what this checkout's reviewed
+`src/` produces," which is the actual property worth checking, not merely
+"`dist/` is newer than `src/` by file mtime" (mtimes are trivially spoofable
+and don't prove content matches).
+
+This is a manual, explicit check — deliberately **not** wired into
+`postinstall` or CI. There's no CI workflow that touches
+`tools/ollama-mcp/` today, this is a low-value internal dev tool (not a
+production supply chain), and running an extra full `tsc` pass on every
+`npm install` would surprise anyone who just wants dependencies installed.
+Run `npm run verify` yourself as a deliberate step — right after
+`npm run build` in a fresh checkout, and again any time you're about to trust
+`.mcp.json` in a checkout where `dist/` predates a `src/` change you haven't
+personally rebuilt from.
+
 ### Enabling/disabling the offload
 
 This server is registered at **project scope** via `.mcp.json`, which is
