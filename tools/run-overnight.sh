@@ -173,6 +173,32 @@ MAX_TOTAL_COST_USD="${MAX_TOTAL_COST_USD:-50}"
 PARALLEL_WORKERS="${PARALLEL_WORKERS:-1}"
 WORKTREE_BASE="${WORKTREE_BASE:-$PROJECT_DIR/.overnight-worktrees}"
 
+# ── Signal handling (claude-23n): two-stage Ctrl+C cancel ───────────────────
+# 1st Ctrl+C: stop launching new iterations, let the in-flight claude finish,
+#   then exit. 2nd Ctrl+C: hard-kill the in-flight claude (+ its `timeout`
+#   wrapper) right now. Either way: skip the end-of-night /analyze-telemetry
+#   pass, but still merge worker summaries (finalize) + check_telemetry_health,
+#   and exit non-zero. Installed as an actual `trap` only inside the
+#   BASH_SOURCE guard in main (below) — sourcing this file for tests must not
+#   install a trap in the sourcing shell. These three globals plus
+#   register_pgid/deregister_pgid/run_in_pgroup/finalize (defined further
+#   down, all side-effect-free to merely *source*) are the shared contract:
+#   this bead wires only the single-worker path; parallel-mode coordination
+#   across worker subshells (each `run_worker ... &` gets its own forked copy
+#   of these globals, which this bead deliberately does not reconcile) is
+#   claude-14w's scope.
+_OVERNIGHT_INTERRUPT_COUNT=0
+_OVERNIGHT_GRACEFUL_STOP=0
+_OVERNIGHT_PGIDS=()
+# claude-23n review F3: guards finalize() against a double-append if a 2nd
+# Ctrl+C lands during the normal end-of-script tail (which already called
+# finalize() once) — see finalize()'s docstring.
+_OVERNIGHT_FINALIZED=0
+# claude-23n review F2: bounded SIGTERM-then-SIGKILL grace period (seconds)
+# for the hard-kill path — overridable for tests, not documented as a public
+# knob.
+_OVERNIGHT_KILL_GRACE_SECS="${_OVERNIGHT_KILL_GRACE_SECS:-5}"
+
 # ── OpenTelemetry: metrics + logs from every claude run → OTLP collector ────
 OTEL_ENABLED="${OTEL_ENABLED:-1}"
 if [ "$OTEL_ENABLED" = "1" ]; then
@@ -743,14 +769,214 @@ except Exception:
   fi
 }
 
+# register_pgid <pgid> — adds a process-group id to the registry the
+# INT/TERM trap (installed in main, inside the BASH_SOURCE guard) hard-kills
+# on a second Ctrl+C. Called by run_in_pgroup() right after launch; callers
+# must deregister_pgid() once the iteration returns normally (nothing left to
+# hard-kill for it).
+register_pgid() { # register_pgid <pgid>
+  _OVERNIGHT_PGIDS+=("$1")
+}
+
+# deregister_pgid <pgid> — removes a process-group id from the registry.
+deregister_pgid() { # deregister_pgid <pgid>
+  local pgid="$1" kept=() p
+  for p in "${_OVERNIGHT_PGIDS[@]}"; do
+    [ "$p" = "$pgid" ] || kept+=("$p")
+  done
+  _OVERNIGHT_PGIDS=("${kept[@]}")
+}
+
+# run_in_pgroup <pgid-outvar> <logfile> -- <command...> — launches
+# "$@" (everything after the first two args) in the background under
+# `setsid`, so it becomes the leader of a brand-new session + process group
+# (pgid == its own pid) that the INT/TERM trap can hard-kill as a single
+# unit on a second Ctrl+C. Stdout+stderr of the launched command are
+# redirected to <logfile>.
+#
+# Verified empirically in this sandbox (util-linux 2.38 setsid, GNU
+# coreutils 9.1 `timeout`/`env`): under `setsid env --chdir=DIR VAR=VAL
+# timeout ... claude ...`, `env`/`timeout` exec in place (no extra fork), so
+# the pid `$!` captures here IS the new session/group leader's pid, and
+# `timeout`'s own forked child (claude) stays in THAT SAME new group rather
+# than a further-nested one — so a single `kill -TERM -- -<pgid>` tears down
+# `timeout`+`claude` together with no separate bookkeeping needed for the
+# grandchild.
+#
+# Stores the launched process's pid into the caller's variable named by
+# <pgid-outvar> and registers it via register_pgid(). The caller is
+# responsible for `wait`-ing on that pid (in a loop — see run_worker: a trap
+# firing during `wait` makes it return early with a signal-based status
+# while the process is still alive) and calling deregister_pgid() once the
+# iteration has actually finished.
+run_in_pgroup() { # run_in_pgroup <pgid-outvar> <logfile> -- <command...>
+  local __pgid_var="$1" __logfile="$2"
+  shift 2
+  setsid "$@" >"$__logfile" 2>&1 &
+  local pid=$!
+  register_pgid "$pid"
+  printf -v "$__pgid_var" '%s' "$pid"
+}
+
+# assert_pgroup_invariant <leaderpid> <wsum> — claude-23n review F1. The
+# entire hard-kill path rests on an invariant that is TRUE in this sandbox
+# (verified empirically: see run_in_pgroup's docstring) but is an
+# environment/version-dependent side effect of `timeout`'s internal
+# setpgid(0,0) call failing (because `setsid` already made it a session
+# leader), NOT a documented contract of `setsid`/`timeout`. If a future
+# coreutils/util-linux ever changes that internal behavior so `claude` lands
+# in its OWN group again, `kill -TERM -- -<pgid>` on a 2nd Ctrl+C would
+# silently reap only the idle `timeout` wrapper and ORPHAN `claude` — no
+# error, just a misleading "aborting now" while claude keeps running
+# unsupervised. Rather than trust the prose comment, check it at runtime:
+# poll briefly (bounded — this must never hang a real run) for the leader's
+# forked child to appear, and if its pgid doesn't match the leader pid,
+# log a loud WARNING. Never aborts the run over this — it only makes the
+# silent-failure mode loud, per the finding.
+assert_pgroup_invariant() { # assert_pgroup_invariant <leaderpid> <wsum>
+  local leaderpid="$1" wsum="$2" childpid="" childpgid="" tries=0
+  command -v pgrep >/dev/null 2>&1 || return 0
+  while [ "$tries" -lt 20 ]; do
+    childpid="$(pgrep -P "$leaderpid" 2>/dev/null | head -n1)"
+    [ -n "$childpid" ] && break
+    sleep 0.1
+    tries=$((tries + 1))
+  done
+  # Couldn't observe a child in time (already finished, or hasn't forked
+  # yet) — that's not itself evidence the invariant is broken, so stay quiet
+  # rather than false-alarm.
+  [ -n "$childpid" ] || return 0
+  childpgid="$(ps -o pgid= -p "$childpid" 2>/dev/null | tr -d '[:space:]')"
+  [ -n "$childpgid" ] || return 0
+  if [ "$childpgid" != "$leaderpid" ]; then
+    wlog "$wsum" "WARNING: process-group teardown invariant broken — claude (pid $childpid) is in pgid $childpgid, NOT the setsid leader's pgid $leaderpid. A 2nd Ctrl+C's 'kill -TERM -- -$leaderpid' would only reach the idle timeout wrapper, not claude — claude would be orphaned and keep running/burning tokens after this script reports 'aborting now'. This means the setsid+timeout process-group behavior claude-23n verified empirically no longer holds in this environment; investigate the coreutils/util-linux versions before relying on the hard-kill path."
+  fi
+}
+
+# finalize — merge each worker's per-worker summary log into the run's main
+# SUMMARY, for a single morning read. Factored out (claude-23n) so BOTH the
+# normal end-of-script path AND the hard-kill (2nd Ctrl+C) trap path call
+# this exact logic instead of duplicating it. Idempotent (claude-23n review
+# F3): a 2nd Ctrl+C landing during the normal end-of-script tail (which
+# already ran finalize() once, e.g. while check_telemetry_health's curl
+# calls are in flight) must not double-append every worker-*.log into
+# $SUMMARY.
+finalize() {
+  [ "$_OVERNIGHT_FINALIZED" = "1" ] && return 0
+  _OVERNIGHT_FINALIZED=1
+  local f
+  for f in "$LOG_DIR"/worker-*.log; do
+    [ -f "$f" ] && { echo "── $(basename "$f") ──" >> "$SUMMARY"; cat "$f" >> "$SUMMARY"; }
+  done
+}
+
+# _overnight_interrupted_during <pre-call-flag> — claude-23n review round 2
+# (F4 fix). _OVERNIGHT_GRACEFUL_STOP is STICKY: once the 1st Ctrl+C sets it,
+# it stays 1 for the rest of the run. That means a plain `[ "$_OVERNIGHT_
+# GRACEFUL_STOP" = "1" ]` check after a subprocess fails cannot distinguish
+# "this specific subprocess was killed by the signal" from "an earlier
+# signal set the flag, and this later, UNRELATED subprocess failed on its
+# own merits" — the latter is a real failure (e.g. a genuinely broken build
+# in the post-iteration verify() gate) that must still file its P0 bead /
+# real-failure warning, not be swallowed as "just an interrupt".
+#
+# Fix: callers snapshot _OVERNIGHT_GRACEFUL_STOP into a local IMMEDIATELY
+# BEFORE invoking the subprocess (verify() / mcp_trust_gate() / bash -c
+# "$PRE_ITERATION_CMD"), then pass that pre-call snapshot here after the
+# call returns nonzero. Only a 0->1 transition — flag was 0 going in, 1
+# coming out — means the interrupt landed DURING this specific call, so
+# only that case is attributed to the interrupt. If the flag was ALREADY 1
+# before the call started, this call's failure predates or is unrelated to
+# that earlier signal and must be treated as real.
+_overnight_interrupted_during() { # _overnight_interrupted_during <pre-call-flag>
+  [ "$1" = "0" ] && [ "$_OVERNIGHT_GRACEFUL_STOP" = "1" ]
+}
+
+# _overnight_interrupt_handler — the INT/TERM trap body (claude-23n).
+# Registered via `trap` in main, inside the BASH_SOURCE guard below, so
+# `source`-ing this file for tests never installs a trap in the sourcing
+# shell (defining this function, like every other function in this file, is
+# side-effect-free). Two-stage Ctrl+C:
+#   1st signal: set the graceful-stop flag and return. run_worker's loop
+#     polls that flag (alongside its existing STOP_FILE check) and stops
+#     launching NEW iterations, but does NOT touch whatever claude/timeout is
+#     already in flight — it runs to completion.
+#   2nd signal: SIGTERM every registered pgid (tears down `timeout`+`claude`
+#     together — see run_in_pgroup's docstring), confirm-and-escalate to
+#     SIGKILL (claude-23n review F2 — see below), merge whatever per-worker
+#     summaries exist (finalize) + run check_telemetry_health, and exit
+#     non-zero. This intentionally skips the end-of-night /analyze-telemetry
+#     pass (mirrors the end-of-script guard on the graceful path in main).
+# Parallel-mode coordination (claude-14w) across worker subshells is out of
+# scope here: each `run_worker ... &` background job forks its own private
+# copy of _OVERNIGHT_PGIDS, so today only the single-worker path (run_worker
+# called directly, not backgrounded) is actually hard-killable from here —
+# see the PARALLEL_WORKERS>1 startup WARNING in main (claude-23n review F5).
+_overnight_interrupt_handler() {
+  _OVERNIGHT_INTERRUPT_COUNT=$((_OVERNIGHT_INTERRUPT_COUNT + 1))
+  if [ "$_OVERNIGHT_INTERRUPT_COUNT" -eq 1 ]; then
+    _OVERNIGHT_GRACEFUL_STOP=1
+    log "Interrupt received — finishing current iteration; press Ctrl+C again to abort now."
+    return
+  fi
+  if [ "${PARALLEL_WORKERS:-1}" -gt 1 ]; then
+    log "Second interrupt — aborting now. NOTE (claude-14w territory): PARALLEL_WORKERS=$PARALLEL_WORKERS — this hard-kill only reaches pgids registered in THIS shell; parallel workers running in their own subshells are NOT hard-killed by this and may keep running."
+  else
+    log "Second interrupt — aborting now."
+  fi
+  local pgid
+  for pgid in "${_OVERNIGHT_PGIDS[@]}"; do
+    [ -n "$pgid" ] || continue
+    kill -TERM -- "-$pgid" 2>/dev/null \
+      || { kill -0 -- "-$pgid" 2>/dev/null && log "WARNING: kill -TERM -- -$pgid failed even though the group is still alive — will still attempt SIGKILL below."; }
+  done
+  # claude-23n review F2: SIGTERM can be trapped, delayed, or missed
+  # mid-syscall by claude/timeout — without confirming death and escalating,
+  # a survivor is silently orphaned after this script exits (still burning
+  # tokens, with nothing watching the budget) while the operator was told
+  # "aborting now". Poll for up to _OVERNIGHT_KILL_GRACE_SECS (bounded — no
+  # unbounded wait), then SIGKILL any group still alive.
+  local grace_secs="${_OVERNIGHT_KILL_GRACE_SECS:-5}" waited=0
+  local -a alive_pgids=()
+  while [ "$waited" -lt "$grace_secs" ]; do
+    alive_pgids=()
+    for pgid in "${_OVERNIGHT_PGIDS[@]}"; do
+      [ -n "$pgid" ] || continue
+      kill -0 -- "-$pgid" 2>/dev/null && alive_pgids+=("$pgid")
+    done
+    [ "${#alive_pgids[@]}" -eq 0 ] && break
+    sleep 1
+    waited=$((waited + 1))
+  done
+  for pgid in "${alive_pgids[@]}"; do
+    log "WARNING: pgid $pgid still alive ${grace_secs}s after SIGTERM — escalating to SIGKILL."
+    kill -KILL -- "-$pgid" 2>/dev/null \
+      || log "WARNING: kill -KILL -- -$pgid failed — it may already be gone, or this identity lacks permission to kill it. Check for an orphaned claude/timeout process manually."
+  done
+  finalize
+  check_telemetry_health
+  exit 130
+}
+
 run_worker() { # run_worker <index> <workdir>
   local idx="$1" workdir="$2"
   local wsum="$LOG_DIR/worker-$idx.log"
   local spent="0" consec=0 completed=0
 
   # Baseline gate: never burn a night on an already-red build.
+  local _pre_int="$_OVERNIGHT_GRACEFUL_STOP"
   if ! verify "$workdir" "$wsum" "w$idx-baseline"; then
-    wlog "$wsum" "Baseline verification is RED in $workdir — aborting worker before spending tokens."
+    # claude-23n review F4 (round 2 fix): verify() runs in this script's own
+    # foreground process group (only claude is setsid-shielded), so a
+    # Ctrl+C landing mid-verify kills it with a signal-derived nonzero
+    # status — that is NOT evidence of a real RED build. But the flag is
+    # sticky, so only a 0->1 transition DURING this specific call counts as
+    # "interrupted" — see _overnight_interrupted_during()'s docstring.
+    if _overnight_interrupted_during "$_pre_int"; then
+      wlog "$wsum" "WARNING: baseline verification failed while the interrupt landed during this specific check (not before it) — treating as an interrupt artifact, not a real RED build. Aborting worker gracefully."
+    else
+      wlog "$wsum" "Baseline verification is RED in $workdir — aborting worker before spending tokens."
+    fi
     return 1
   fi
 
@@ -764,6 +990,16 @@ run_worker() { # run_worker <index> <workdir>
   local i
   for i in $(seq 1 "$MAX_ITERATIONS"); do
     [ -f "$STOP_FILE" ] && wlog "$wsum" "Stop file present — halting." && break
+
+    # claude-23n: 1st Ctrl+C (or SIGTERM) sets this via the INT/TERM trap in
+    # main. Stop launching NEW iterations, but the in-flight claude/timeout
+    # (if any, from a previous pass through this loop) already ran to
+    # completion before we got back here — nothing to shield/kill on this
+    # path, that's the hard-kill (2nd signal) path in the trap itself.
+    if [ "$_OVERNIGHT_GRACEFUL_STOP" = "1" ]; then
+      wlog "$wsum" "Graceful interrupt received — not launching a new iteration; halting."
+      break
+    fi
 
     if [ "$(python3 -c "print(1 if $spent >= $WORKER_BUDGET else 0)")" = "1" ]; then
       wlog "$wsum" "Budget share (\$$WORKER_BUDGET) reached at \$$spent — halting."
@@ -783,7 +1019,18 @@ run_worker() { # run_worker <index> <workdir>
     local ilog="$LOG_DIR/$tag.log"
 
     if [ -n "$PRE_ITERATION_CMD" ]; then
+      local _pre_int_pic="$_OVERNIGHT_GRACEFUL_STOP"
       if ! ( cd "$workdir" && bash -c "$PRE_ITERATION_CMD" ) >>"$wsum" 2>&1; then
+        # claude-23n review F4 (round 2 fix): PRE_ITERATION_CMD runs in this
+        # script's own foreground process group (not setsid-shielded) — a
+        # Ctrl+C landing mid-command kills it with a signal-derived nonzero
+        # status. The flag is sticky, so only a 0->1 transition DURING this
+        # specific call counts as "interrupted" — see
+        # _overnight_interrupted_during()'s docstring.
+        if _overnight_interrupted_during "$_pre_int_pic"; then
+          wlog "$wsum" "WARNING: PRE_ITERATION_CMD failed while the interrupt landed during this specific run (not before it) — treating as an interrupt artifact, not a real command failure. Halting worker gracefully."
+          break
+        fi
         consec=$((consec + 1))
         wlog "$wsum" "PRE_ITERATION_CMD failed ($consec consecutive) — skipping claude launch this iteration."
         if [ "$consec" -ge "$MAX_CONSEC_FAILURES" ]; then
@@ -798,20 +1045,66 @@ run_worker() { # run_worker <index> <workdir>
     # could legitimately (or not) have modified .mcp.json — committed or not —
     # since the baseline check. Halt rather than launching on unreviewed drift
     # or an uncommitted self-reauthorization.
+    local _pre_int_mcp="$_OVERNIGHT_GRACEFUL_STOP"
     if ! mcp_trust_gate "$workdir"; then
-      wlog "$wsum" "MCP trust gate failed mid-run (.mcp.json / .mcp.json.trusted-sha256 no longer a clean, committed, matching pair) — halting worker rather than launching an unreviewed MCP config."
+      # claude-23n review F4 (round 2 fix): mcp_trust_gate's git calls run in
+      # this script's own foreground process group — a Ctrl+C landing
+      # mid-check kills them with a signal-derived nonzero status, not a
+      # real trust failure. The flag is sticky, so only a 0->1 transition
+      # DURING this specific call counts as "interrupted" — see
+      # _overnight_interrupted_during()'s docstring. A misbehaving agent
+      # signaling itself right before an otherwise-legitimate trust-gate
+      # failure must NOT be able to suppress this WARNING / audit trail by
+      # that trick alone — it only works if the flag was still 0 when this
+      # call started.
+      if _overnight_interrupted_during "$_pre_int_mcp"; then
+        wlog "$wsum" "WARNING: MCP trust gate re-check failed while the interrupt landed during this specific check (not before it) — treating as an interrupt artifact, not a real trust failure. Halting worker gracefully."
+      else
+        wlog "$wsum" "MCP trust gate failed mid-run (.mcp.json / .mcp.json.trusted-sha256 no longer a clean, committed, matching pair) — halting worker rather than launching an unreviewed MCP config."
+      fi
       break
     fi
 
     wlog "$wsum" "Iteration $i: $n ready bead(s); spent \$$spent of \$$WORKER_BUDGET. Launching claude..."
 
-    ( cd "$workdir" && \
+    # claude-23n: launch under run_in_pgroup (setsid) instead of a plain
+    # subshell, so the trap can hard-kill this exact timeout+claude pair as a
+    # unit on a second Ctrl+C. `env --chdir=` replaces the subshell's `cd`
+    # (setsid execs straight into `env`, no shell needed to change directory
+    # or set the OTEL_RESOURCE_ATTRIBUTES env var). $PERMISSION_FLAGS is
+    # deliberately word-split into an array (unquoted, same as the original
+    # inline `$PERMISSION_FLAGS` expansion) since it may hold multiple flags.
+    local -a perm_flags=()
+    # shellcheck disable=SC2206  # intentional word-splitting, see above
+    perm_flags=($PERMISSION_FLAGS)
+
+    local pgid=""
+    run_in_pgroup pgid "$ilog" \
+      env --chdir="$workdir" \
       OTEL_RESOURCE_ATTRIBUTES="service.name=overnight-runner,run.id=$RUN_ID,worker.id=w$idx" \
       timeout "$RUN_TIMEOUT" claude -p "/build-next --unattended" \
-        $PERMISSION_FLAGS \
-        --output-format stream-json --verbose \
-        --max-turns "$MAX_TURNS" ) >"$ilog" 2>&1
-    local status=$?
+      "${perm_flags[@]}" \
+      --output-format stream-json --verbose \
+      --max-turns "$MAX_TURNS"
+
+    # claude-23n review F1: check the load-bearing pgroup invariant at
+    # runtime instead of only trusting the docstring — see
+    # assert_pgroup_invariant()'s comment. Bounded, best-effort, never
+    # aborts the run; only makes a broken invariant loud.
+    assert_pgroup_invariant "$pgid" "$wsum"
+
+    # `wait PGID` returns early (with a signal-derived exit status, e.g. 130)
+    # the instant a trapped signal (the 1st Ctrl+C) fires, even though the
+    # process is still running — re-wait until it's actually gone so a
+    # graceful interrupt truly lets the in-flight claude finish rather than
+    # this loop mistaking "wait was interrupted" for "claude exited".
+    local status
+    while true; do
+      wait "$pgid"
+      status=$?
+      kill -0 "$pgid" 2>/dev/null || break
+    done
+    deregister_pgid "$pgid"
 
     local parsed; parsed="$(parse_result "$ilog" "$ilog.result.txt")"
     local rstate cost turns session
@@ -834,9 +1127,23 @@ run_worker() { # run_worker <index> <workdir>
     fi
 
     # Deterministic gate: the model saying "tests pass" is not evidence.
+    # claude-23n review F4 (round 2 fix): the 1st Ctrl+C almost always lands
+    # during the long, setsid-shielded claude run above, setting the sticky
+    # _OVERNIGHT_GRACEFUL_STOP flag well BEFORE this verify() call even
+    # starts — that flag being "1" here says nothing about whether THIS
+    # verify() was itself hit by a signal. Snapshot it immediately before
+    # the call so a genuinely broken build (this gate's entire reason to
+    # exist) still gets its P0 bead even after an earlier, unrelated
+    # interrupt — a misbehaving agent must not be able to suppress this
+    # audit trail just by signaling the parent itself.
+    local _pre_int_verify="$_OVERNIGHT_GRACEFUL_STOP"
     if ! verify "$workdir" "$wsum" "$tag"; then
-      ( cd "$workdir" && bd create "Build/tests RED after overnight iteration $tag (commit $(git rev-parse --short HEAD 2>/dev/null)); verify log: $LOG_DIR/$tag.verify.log" -p 0 ) >>"$wsum" 2>&1
-      wlog "$wsum" "Verification gate failed — filed a P0 fix bead and halting worker (a broken build poisons later tasks)."
+      if _overnight_interrupted_during "$_pre_int_verify"; then
+        wlog "$wsum" "WARNING: post-iteration verification failed while the interrupt landed during this specific check (not before it) — treating as an interrupt artifact, not a real RED build. No P0 bead filed. Halting worker gracefully."
+      else
+        ( cd "$workdir" && bd create "Build/tests RED after overnight iteration $tag (commit $(git rev-parse --short HEAD 2>/dev/null)); verify log: $LOG_DIR/$tag.verify.log" -p 0 ) >>"$wsum" 2>&1
+        wlog "$wsum" "Verification gate failed — filed a P0 fix bead and halting worker (a broken build poisons later tasks)."
+      fi
       break
     fi
 
@@ -858,6 +1165,12 @@ run_worker() { # run_worker <index> <workdir>
 # idiom, not a behavior change for normal invocation (`./run-overnight.sh` or
 # `bash run-overnight.sh` still runs everything below exactly as before).
 if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
+
+# claude-23n: two-stage Ctrl+C cancel — see _overnight_interrupt_handler()'s
+# docstring above for the full semantics. Installed here (inside the
+# BASH_SOURCE guard), NOT at top level, so sourcing this file for tests never
+# installs a trap in the sourcing (test-runner) shell.
+trap _overnight_interrupt_handler INT TERM
 
 # claude-o7u: _MCP_ANCHOR_WALK_ROOT_TEST_ONLY is an internal test-only seam
 # (see mcp_external_anchor_check()) that bounds the external-anchor
@@ -885,6 +1198,9 @@ else
   log "MCP external trust anchor (claude-o7u): $MCP_EXTERNAL_TRUST_ANCHOR"
 fi
 log "Stop file: $STOP_FILE"
+if [ "$PARALLEL_WORKERS" -gt 1 ]; then
+  log "WARNING: two-stage Ctrl+C cancel (claude-23n) currently covers the single-worker path only — with PARALLEL_WORKERS=$PARALLEL_WORKERS, each run_worker forks its own private copy of the pgid registry, so this shell's trap CANNOT hard-kill in-flight parallel workers yet (tracked in claude-14w). A 2nd Ctrl+C will still merge whatever summaries exist and exit, but parallel claude/timeout processes may keep running afterward."
+fi
 
 # MCP trust gate (claude-9hl): fail closed BEFORE even the preflight probe —
 # preflight itself launches a headless claude -p, which auto-connects
@@ -931,14 +1247,17 @@ else
 fi
 
 # Merge per-worker summaries into the main one for a single morning read.
-for f in "$LOG_DIR"/worker-*.log; do
-  [ -f "$f" ] && { echo "── $(basename "$f") ──" >> "$SUMMARY"; cat "$f" >> "$SUMMARY"; }
-done
+# claude-23n: factored into finalize() so the hard-kill (2nd Ctrl+C) trap
+# path above calls this exact logic instead of duplicating it.
+finalize
 
 # claude-saz round 3: surface a dead otel-collector/prometheus BEFORE the
 # telemetry-analysis pass below, which queries both — so a WARNING here is
 # the operator's explanation for sparse/failed analysis output, not a
-# separate mystery to debug later.
+# separate mystery to debug later. claude-23n: run unconditionally on an
+# interrupted run too (see the "Agreed semantics" for the two-stage Ctrl+C
+# cancel) — telemetry health is still worth knowing about even on a cut-short
+# night, unlike the /analyze-telemetry mining pass skipped below.
 check_telemetry_health
 
 # End-of-night telemetry analysis: one fresh headless pass over the whole run's
@@ -946,9 +1265,14 @@ check_telemetry_health
 # loop (so the run's OTel data has flushed) and only if any iteration completed.
 # Bounded tighter than a full build iteration (ANALYZE_MAX_TURNS/ANALYZE_TIMEOUT,
 # not MAX_TURNS/RUN_TIMEOUT) since it's a read-only mining pass, not agentic work.
+# claude-23n: skipped entirely on ANY Ctrl+C/SIGTERM (graceful or hard) — an
+# operator-requested early stop means "cut the night short", not "keep going
+# with one more headless claude -p pass to mine it."
 worker_spend="$(total_worker_spend "$LOG_DIR")"
 analyze_cost="0"
-if [ "$ANALYZE_TELEMETRY" = "1" ]; then
+if [ "$_OVERNIGHT_GRACEFUL_STOP" = "1" ]; then
+  log "Interrupted — skipping end-of-night telemetry analysis."
+elif [ "$ANALYZE_TELEMETRY" = "1" ]; then
   completed_total="$(count_completed_iterations "$LOG_DIR")"
   if [ "${completed_total:-0}" -gt 0 ] && ! mcp_trust_gate "$PROJECT_DIR"; then
     log "Skipping telemetry analysis — MCP trust gate failed (see MCP TRUST GATE message above); refusing to launch this headless claude -p pass too."
@@ -976,6 +1300,11 @@ if [ "$ANALYZE_TELEMETRY" = "1" ]; then
 fi
 total_reported_cost="$(awk -v w="$worker_spend" -v a="$analyze_cost" 'BEGIN { print w + a }')"
 log "Total reported cost this run: \$$total_reported_cost (workers: \$$worker_spend, telemetry analysis: \$$analyze_cost). NOTE: the analysis pass is not itself checked against MAX_TOTAL_COST_USD (the budget loop has already exited by the time it runs)."
+
+if [ "$_OVERNIGHT_GRACEFUL_STOP" = "1" ]; then
+  log "Run interrupted by operator (Ctrl+C/SIGTERM) after $_OVERNIGHT_INTERRUPT_COUNT signal(s). Review $LOG_DIR, 'bd ready', and any in-progress work before resuming."
+  exit 1
+fi
 
 log "Run complete. Review $LOG_DIR, 'bd ready', Question:/fix + [token-efficiency] beads, and any worker branches."
 
