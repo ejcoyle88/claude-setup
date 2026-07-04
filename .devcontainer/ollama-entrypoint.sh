@@ -15,6 +15,64 @@ set -euo pipefail
 # shellcheck source=setpriv-drop-args.sh
 . /usr/local/bin/setpriv-drop-args.sh
 
+# claude-kkc: fail fast, not silently-wrong, if SETPRIV_DROP came back from
+# setpriv-drop-args.sh empty or the wrong shape. This is the runtime twin of
+# claude-arv's build-time guard (which checks the cap NAMES Dockerfile.ollama's
+# setpriv invocation actually accepts) -- it doesn't re-validate cap names,
+# just guarantees the array this script is about to `exec setpriv` with
+# actually has the two flags setpriv-drop-args.sh is supposed to produce
+# (currently `--bounding-set=-net_admin,-net_raw --inh-caps=-net_admin,-net_raw`)
+# rather than empty or single-element garbage. An empty/short SETPRIV_DROP
+# would make the exec below either no-op (dropping nothing,
+# cap_net_admin/cap_net_raw left live for the rest of this container's life)
+# or fail outright -- an empty SETPRIV_DROP silently no-opping the drop was
+# exactly the claude-01t regression. Asserting its shape here, before it's
+# ever used, turns that class of bug back into an immediate, diagnosable
+# startup failure instead of a container that "works" with caps still live.
+(( ${#SETPRIV_DROP[@]} == 2 )) || {
+  echo "FATAL: SETPRIV_DROP misconfigured (expected 2 elements: --bounding-set=... and --inh-caps=...; got ${#SETPRIV_DROP[@]}: '${SETPRIV_DROP[*]:-<empty>}') -- refusing to start rather than exec setpriv with a no-op or invalid cap-drop." >&2
+  exit 1
+}
+
+# claude-kkc: bound the setpriv self-re-exec below (the `exec setpriv
+# "${SETPRIV_DROP[@]}" "$0" "$@"` further down, NOT the "hand off straight to
+# /bin/ollama" exec next to it -- that one never comes back through
+# caps_already_dropped() below and so can't loop) to a small number of
+# attempts. In the intended path this branch's exec runs at most once per
+# container lifetime: the reborn copy lands in caps_already_dropped()
+# returning true and never reaches this code again. But if
+# caps_already_dropped() never observes cleared CapBnd bits -- a bad cap name
+# reintroduced some other way, cap_add missing at runtime even though
+# Dockerfile.ollama's build-time guard passed, or a non-transient /proc read
+# failure -- the reborn copy comes back through this same "else" branch,
+# re-runs ollama-init-firewall.sh, and re-execs again -- forever, silently,
+# on every container start. That's exactly the crash-loop the
+# empty-SETPRIV_DROP regression (claude-01t) caused. This counter is carried
+# across `exec` via the environment (exec preserves the environment of the
+# process it replaces, so an exported var survives), turning what would
+# otherwise be an infinite loop into a bounded number of attempts with a
+# clear diagnostic instead of a silent hang/loop.
+: "${OLLAMA_ENTRYPOINT_REEXEC_DEPTH:=0}"
+
+# claude-kkc: OLLAMA_ENTRYPOINT_REEXEC_DEPTH is caller-suppliable (docker-compose
+# `environment:`, a `-e` override on `docker run`/`compose run`, or a
+# compromised parent process) and, unlike argv, is never sanitized by exec
+# argument passing. Bash arithmetic contexts recursively re-expand a
+# referenced variable's *value* as a new expression -- including command
+# substitution -- so feeding this straight into the `(( ... ))` below, while
+# still root with NET_ADMIN/NET_RAW live, would let a value like
+# '$(some_command)' execute arbitrary code before the cap-drop. This is the
+# same "caller-suppliable input drives security-relevant control flow" class
+# the __post_firewall argv sentinel comment above warns about, just via env
+# instead of argv. Validating the shape here -- mirroring the
+# `[[ "$capbnd" =~ ^[0-9a-fA-F]+$ ]]` guard caps_already_dropped() applies to
+# capbnd below -- closes both that injection vector and a quieter one: a
+# pre-set negative value (e.g. -1000000) would take that many iterations to
+# trip the `>= 2` bound this diff exists to enforce. Reset-to-0 (not fatal)
+# on a bad value, consistent with how capbnd degrades on a bad read rather
+# than aborting immediately.
+[[ "$OLLAMA_ENTRYPOINT_REEXEC_DEPTH" =~ ^(0|[1-9][0-9]{0,2})$ ]] || OLLAMA_ENTRYPOINT_REEXEC_DEPTH=0
+
 # Fail-closed gate: whether the firewall has already been applied AND this
 # process has already been re-exec'd through setpriv (see the re-exec below)
 # is decided from ACTUAL KERNEL STATE -- this process's capability bounding
@@ -83,6 +141,20 @@ else
     exec setpriv "${SETPRIV_DROP[@]}" /bin/ollama "$@"
   fi
 
+  # See the OLLAMA_ENTRYPOINT_REEXEC_DEPTH comment near the top of this
+  # script for why this specific exec (and only this one) needs a depth
+  # guard. Check BEFORE incrementing/exec'ing again, so the diagnostic below
+  # reports the number of re-exec attempts actually taken so far, and this
+  # script exits instead of handing off to yet another copy of itself.
+  if (( OLLAMA_ENTRYPOINT_REEXEC_DEPTH >= 2 )); then
+    echo "FATAL: caps_already_dropped() never observed cleared CapBnd bits after ${OLLAMA_ENTRYPOINT_REEXEC_DEPTH} setpriv re-exec attempt(s) -- check that cap_add (NET_ADMIN, NET_RAW) is actually granted to this service in docker-compose.yml, and that SETPRIV_DROP (setpriv-drop-args.sh) uses correct, un-prefixed capability names. Refusing to re-exec again to avoid an infinite firewall-reapply/cap-drop loop." >&2
+    exit 1
+  fi
+  # Exported (not just set) so it survives the `exec` below: exec replaces
+  # this process's image but keeps its environment, and the reborn copy's
+  # `: "${OLLAMA_ENTRYPOINT_REEXEC_DEPTH:=0}"` above only seeds a default --
+  # it won't clobber a value already inherited from the environment.
+  export OLLAMA_ENTRYPOINT_REEXEC_DEPTH=$(( OLLAMA_ENTRYPOINT_REEXEC_DEPTH + 1 ))
   exec setpriv "${SETPRIV_DROP[@]}" "$0" "$@"
 fi
 
