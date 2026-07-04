@@ -44,6 +44,10 @@ questions. Everything below applies as written, with these overrides:
   (naming, internal structure — not schema, public API, data, or security),
   adopt the recommendation, proceed, and record the assumption in the bead's
   close summary.
+- **Infeasible → defer immediately, same iteration.** See Step 1's "Infeasible
+  bead" handling below — it applies unchanged here; unattended mode adds
+  nothing on top of it (no `AskUserQuestion` either way, since infeasibility
+  isn't ambiguity — see that section for why).
 - **Commit per task.** After Step 4 closes a bead: `git add -A` and
   `git commit -m "<bead-id>: <one-line summary>"`. This is what keeps the next
   iteration's review diff scoped to one task. If blocking findings survive
@@ -75,6 +79,53 @@ If anything material in the bead is underspecified, resolve it **now** with
 each question give context and a recommendation, recommended option first,
 labelled "(Recommended)". Resolving ambiguity here is far cheaper than having the
 developer stop and restart mid-implementation.
+
+**Infeasible bead → defer, don't re-litigate.** If the selected bead cannot be
+worked in *this* environment — it needs a capability this session lacks (a
+docker socket, a GUI, specific hardware, network reach to something
+unreachable from here) — that's **infeasible**, a different failure mode from
+"materially underspecified" above (an infeasible bead is perfectly well
+specified; it just can't be done here). Handle it in the same iteration you
+notice it, before selecting a replacement:
+
+1. Defer it: `bd defer <id> --until=+7d` — a fixed default duration, not a
+   per-bead judgment call. **This needs `Bash(bd defer:*)` in this command's
+   `allowed-tools` frontmatter (line 7), which is not currently present** — a
+   maintainer must add it before this step is actually executable. Until then,
+   record in your report that you judged the bead infeasible and the intended
+   defer command, and flag the missing grant, rather than silently treating
+   the bead as handled. Verified empirically against the live `bd` CLI:
+   `bd defer` only moves the issue's `status` from `in_progress` to `deferred`
+   (a frozen-category status per `bd statuses`, which is what actually drops
+   it from `bd ready`) — it does **not** touch `assignee`, so Step 1's
+   `--claim` survives a defer on its own and step 2 below is still required.
+2. Release the claim: `bd update <id> --assignee ""` — clears the assignee
+   Step 1's `--claim` set, mirroring the Ambiguity path's "release your claim"
+   above. This uses `Bash(bd update:*)`, already granted, so no new frontmatter
+   entry is needed for this part. Do this regardless of whether the
+   `Bash(bd defer:*)` grant above has landed yet: an unassigned-but-still-
+   `in_progress` bead is still better than one left claimed indefinitely, and
+   once defer *is* runnable this is what keeps the bead from looking claimed
+   while it's frozen.
+3. **Gate on whether step 1 actually ran.** Clearing `assignee` alone does not
+   drop a bead from `bd ready` — only the `status` change from a successful
+   `bd defer` does (see the empirical note above). So:
+   - If `bd defer` succeeded: re-run (or reuse) `bd ready --json` — the
+     deferred bead no longer appears, so the next-highest-priority bead
+     surfaces on its own — and select it as normal.
+   - If `bd defer` is blocked (tool not yet granted) or otherwise fails: do
+     **not** re-run `bd ready`/select a replacement. The exact same bead would
+     simply resurface at the top and the orchestrator would re-select,
+     re-judge, and re-"handle" it in a tight loop. Instead, stop this
+     iteration and report the bead as blocked-infeasible (per the report note
+     in step 1), so a human can defer or otherwise resolve it out of band.
+
+Do this immediately, not "next time": skipping the defer and just moving on
+mentally leaves the same infeasible bead at the top of `bd ready` on the very
+next iteration, so it re-pays the full selection cost (`bd ready`/`bd show` +
+reasoning turns) every iteration until someone finally defers it. This applies
+regardless of `--unattended` — feasibility doesn't depend on who's watching
+(see the Unattended mode section's cross-reference to here).
 
 ## Step 2 — Route and implement
 
