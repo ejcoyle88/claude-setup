@@ -105,6 +105,31 @@ session logs and file `[token-efficiency]` beads.
 
 ## Footguns (learned the hard way)
 
+- **Prometheus-exported cost/token metrics under-count subagent (Task-tool)
+  turns — treat them as orchestrator-weighted, not authoritative, for a run's
+  total spend.** Claude Code's OTel docs describe `claude_code.cost.usage` /
+  `claude_code.token.usage` as carrying a `query_source` attribute
+  (`main`/`subagent`/`auxiliary`) under the *same* `session.id`, implying
+  subagent turns should roll up into the same session's exported counters.
+  Measured behavior doesn't match that: run `20260704-154326` (claude-hqg)
+  saw Prometheus capture $4.80 of an actual $50.28 run spend (~10%), and one
+  iteration alone logged $0.575 in Prometheus vs $14.07 CLI-reported (~4%)
+  after ~286 sonnet subagent turns. Multiple upstream `anthropics/claude-code`
+  feature requests (e.g. per-subagent token-usage visibility) corroborate that
+  subagent/Task-tool usage isn't reliably surfaced through the CLI's own
+  telemetry today. This is CLI-instrumentation behavior, not something fixable
+  from this repo's collector/Prometheus config — don't spend time widening
+  batch/sampling config chasing it. The authoritative cost source for a run is
+  the session artifacts (`*.result.txt` / `worker-*.log`, which read
+  `total_cost_usd` from the CLI's own stream-json result event), which
+  `/analyze-telemetry` (`commands/analyze-telemetry.md`) already treats as
+  ground truth — Prometheus there is for ratio-based signals (cache-hit
+  share) only, never a run's total-cost figure, and even those ratios are
+  only directional for the captured (orchestrator-weighted) subset: it's
+  not yet verified whether that cache-hit ratio also holds for the missing
+  subagent turns, which are typically short-lived fresh contexts likely to
+  skew it, so treat cache-erosion findings that hinge on this ratio as
+  unconfirmed until checked against session-artifact/stream-json cache stats.
 - **Exports drop silently if nothing is listening at the endpoint.** There is
   no error, no retry-and-fail-loud — the SDK just swallows it. If a metric
   never shows up in Grafana, don't assume the pipeline is broken; first rule
@@ -153,3 +178,7 @@ session logs and file `[token-efficiency]` beads.
   bring-up stage without a tracked follow-up.
 - A new service added to the pipeline without wiring it into
   `depends_on` and, if it serves data, the Grafana datasource provisioning.
+- A telemetry-consuming skill/command/dashboard reporting a Prometheus cost or
+  token-volume sum as a run's authoritative total — it under-counts
+  subagent/Task-tool turns (measured ~4-10% capture); session artifacts
+  (`*.result.txt` / `worker-*.log`) are the authoritative source.

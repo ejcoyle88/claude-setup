@@ -39,6 +39,30 @@ is noise.
   / `curl -sf http://loki:3100/-/ready`); if unreachable (or not permitted),
   proceed on session artifacts alone and say so in the report — do not fail.
 
+  **KNOWN GAP (claude-hqg): `sum(claude_code_cost_usage_USD_total)` and the
+  token-volume counters are NOT authoritative for a run's total cost.**
+  Measured at run `20260704-154326`: Prometheus captured $4.80 of the run's
+  actual $50.28 spend (~10%), and iter 1's session alone logged $0.575 in
+  Prometheus vs $14.07 CLI-reported (~4%) — that iteration ran ~286 sonnet
+  subagent (Task-tool) turns whose cost/token usage did not show up under the
+  session's Prometheus series in proportion to what the CLI itself reported.
+  Session artifacts (`*.result.txt` / `worker-*.log`, which read
+  `total_cost_usd` straight from the CLI's own stream-json result event) ARE
+  reliable and remain the sole source for total-cost figures in this report —
+  never substitute or reconcile against a Prometheus cost sum. Prometheus can
+  still be used for *ratio*-based signals that don't depend on absolute
+  volume (e.g. cacheRead-vs-fresh-input share for cache-erosion pattern #2
+  below), but treat those ratios as directional for the captured
+  (largely orchestrator-only) population only — it is NOT yet verified
+  whether that ratio is representative of subagent-turn behavior too, and
+  subagent/Task-tool turns are typically short-lived fresh contexts with
+  different cache-hit characteristics than a long-lived orchestrator
+  session, so the captured subset may well be skewed rather than
+  representative. Flag any finding that hinges heavily on this ratio as
+  unconfirmed until checked against session-artifact/stream-json cache
+  stats for at least one run, and never quote or report a Prometheus-derived
+  dollar total or token-volume total as the run's cost.
+
 Note: Claude Code's `/usage` per-session skill/subagent/MCP breakdown is NOT
 retrievable after the fact (it's a live TUI of the current session). Approximate
 that attribution from OTel tool/model events in Loki and the stream-json logs;
@@ -69,9 +93,14 @@ Correlate cost against what happened. High-value patterns:
 
 1. Resolve the run dir; parse every `*.result.txt` / `worker-*.log` into a
    per-iteration table (bead, cost, turns, session, outcome). Compute median and
-   flag outliers.
-2. Probe Prometheus/Loki; if up, pull per-run cost, token-by-type (cache ratio),
-   and tool-call distribution to explain the outliers.
+   flag outliers. This table's cost column is the run's authoritative cost —
+   report the run total from it, not from Prometheus (see the known gap above).
+2. Probe Prometheus/Loki; if up, pull token-by-type (cache ratio) and tool-call
+   distribution to help explain the outliers. Do not pull a Prometheus cost
+   figure and present it as (or reconcile it against) the run's total cost —
+   it under-counts subagent/Task-tool turns by roughly an order of magnitude
+   (see the known gap above) and will make a correct session-artifact total
+   look wrong.
 3. For each finding: state the evidence (numbers + which iteration/session),
    the likely cause, and a SPECIFIC fix mapped to an owning agent
    (`agent-improvement-developer` for skill/description/allowlist/prompt changes;

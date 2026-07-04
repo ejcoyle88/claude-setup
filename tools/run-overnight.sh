@@ -171,6 +171,20 @@
 #       well under the currently configured metric_expiration), not by
 #       docker-inspecting container start time (same no-docker-socket
 #       constraint as above).
+#   NOTE (claude-hqg): Prometheus's claude_code_cost_usage_USD_total /
+#       token-volume counters are NOT authoritative for a run's total cost --
+#       they under-count subagent (Task-tool) turns (measured ~4-10% capture
+#       of actual spend across run 20260704-154326; see
+#       skills/observability-stack/SKILL.md's footgun list for detail). This
+#       is Claude Code CLI instrumentation behavior, not a bug in this
+#       runner's OTel wiring or the collector config below -- don't chase it
+#       by changing OTEL_METRIC_EXPORT_INTERVAL or the collector's batch
+#       processor. /analyze-telemetry already treats the *.result.txt /
+#       worker-*.log session artifacts (which read total_cost_usd from the
+#       CLI's own stream-json result event, same as $spent below) as the
+#       authoritative cost source and uses Prometheus only for ratio signals
+#       (e.g. cache-hit share) -- keep it that way if this file or that
+#       command ever changes.
 #   ANALYZE_MAX_TURNS=30     turn cap for the telemetry-analysis pass specifically.
 #   ANALYZE_TIMEOUT=20m      timeout for the telemetry-analysis pass specifically.
 #   MAX_TURNS=150            per-run agentic turn cap (claude --max-turns)
