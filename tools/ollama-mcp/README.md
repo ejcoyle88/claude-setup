@@ -526,6 +526,24 @@ were re-examined against what this sandbox can actually provision:
   limitation above) this sandbox cannot rule out without real separate
   credentials.
 
+## Measured token savings
+
+`claude-r30.7` drove real `summarize_file`/`extract`/`classify` calls against
+the live `ollama` sidecar (via the actual MCP client SDK, not a simulation)
+on real repo files, and compared the tokens that would otherwise enter
+Claude's context against the tool call's actual round-trip cost — including
+two real failures (an Ollama model-runner crash and an MCP-client timeout
+footgun) hit live in that session. See
+[`token-savings.md`](./token-savings.md) for the full numbers, what's
+measured vs. estimated, and a recommendation on which task classes are worth
+routing to ollama. Short version: classification and summarization of
+files that stay within `MAX_INPUT_CHARS` without crashing the sidecar are
+strongly net-positive (~90-94% token reduction, observed); small structured
+extraction is net-positive but thinner once the `schema` argument's own cost
+and retry risk are counted; large-file summarization that hits truncation on
+a resource-constrained sidecar was, in that session, unreliable enough to
+sometimes cost more than it saves.
+
 ## Follow-ups not built in this bead
 
 - **Glob support.** The design doc mentioned "a file path / glob"; this bead
