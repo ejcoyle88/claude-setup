@@ -11,7 +11,7 @@
  * confined to WORKSPACE_ROOT (see `resolveWorkspacePath`) -- no absolute
  * path, `../` traversal, or symlink can read a file outside it.
  */
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { open, readFile, realpath, stat, unlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -105,8 +105,15 @@ const GENERATE_LOCK_PATH = path.join(
  * release. */
 const GENERATE_LOCK_STALE_MS = 3 * 60_000;
 
+/** `token` is a per-acquisition random identity (see `acquireGenerateLock`'s
+ * doc comment) -- the caller must pass it back to `releaseGenerateLock` so a
+ * late release can verify it still owns the lock before deleting anything
+ * (claude-6ll review finding: an unconditional unlink in the release path let
+ * a stale-but-still-running holder delete a *different*, legitimately
+ * reclaimed lock out from under a new holder -- see releaseGenerateLock's doc
+ * comment for the fix). */
 type LockAcquireResult =
-  | { state: "acquired" }
+  | { state: "acquired"; token: string }
   | { state: "unavailable" }
   | { state: "busy"; heldForMs: number };
 
@@ -728,98 +735,214 @@ async function readLineRange(filePath: string, start: number, endLine?: number):
 
 type GenerateResult = { ok: true; response: string } | { ok: false; error: string };
 
-/** Attempts to atomically create GENERATE_LOCK_PATH via the `wx` open flag
- * (fails with EEXIST if the file already exists) -- the standard
- * dependency-free pattern for a filesystem-based mutex, since file creation
- * with O_EXCL is atomic at the OS level (no separate exists-check-then-create
- * race). On success, writes this process's pid + acquisition time into the
- * file (used by a subsequent blocked caller to judge staleness) and reports
- * "acquired" -- the caller must call `releaseGenerateLock` when done. On
- * EEXIST, reads the existing lock's age: if it's older than
- * GENERATE_LOCK_STALE_MS, assumes the prior holder crashed without
- * releasing, reclaims it (unlink + one retry of the create), and otherwise
- * reports "busy" with how long the current holder has held it (surfaced in
- * the caller-facing error message so a busy response is diagnosable, not
- * just "try again"). Never throws: any unexpected lock-mechanics failure
- * (permissions, a missing/unwritable tmpdir, ...) reports "unavailable" so
- * the caller falls back to today's pre-claude-6ll behavior (proceed without
- * cross-process coordination) rather than making every generate call fail
- * because an ancillary coordination mechanism broke -- this lock is a
- * best-effort mitigation for measured contention, not a correctness
- * boundary this tool depends on to function at all. */
-async function acquireGenerateLock(): Promise<LockAcquireResult> {
-  const tryCreate = async (): Promise<"acquired" | "exists" | "unavailable"> => {
+/** Shape written into the lock file at acquire time and read back by a
+ * blocked caller (to judge staleness) or by `releaseGenerateLock` (to verify
+ * ownership before deleting). `token` is a fresh `randomUUID()` per
+ * acquisition -- see `acquireGenerateLock`/`releaseGenerateLock`'s doc
+ * comments for why this exists (claude-6ll review finding: without it,
+ * release couldn't tell "my lock" from "someone else's lock that now happens
+ * to sit at the same path"). */
+interface LockHolder {
+  pid?: number;
+  acquiredAt?: number;
+  token?: string;
+}
+
+/** Options accepted by `acquireGenerateLock`/`releaseGenerateLock` purely for
+ * lock.test.ts's benefit, matching the same injectable-parameter pattern
+ * `checkOllamaHealth` already uses (see its doc comment): `lockPath` and
+ * `staleMs` default to this module's real `GENERATE_LOCK_PATH`/
+ * `GENERATE_LOCK_STALE_MS`, and `isPidAlive` defaults to a real
+ * `process.kill(pid, 0)` liveness check. None of these change
+ * `callOllamaGenerate`'s behavior, which calls both functions with no
+ * options. */
+export interface GenerateLockOptions {
+  lockPath?: string;
+  staleMs?: number;
+  isPidAlive?: (pid: number) => boolean;
+}
+
+/** Best-effort liveness check for a pid recorded in a lock file: sends
+ * signal 0 (per `process.kill`'s documented meaning -- no actual signal is
+ * delivered, only existence/permission is checked). `ESRCH` ("no such
+ * process") means the pid is definitely dead -- the recorded holder can
+ * never come back and finish releasing its own lock, so its lock should be
+ * treated as immediately stale regardless of how recently `acquiredAt`
+ * claims it was written (this is the fix for review finding #2: a
+ * self-reported timestamp alone can't be trusted to reflect a live holder).
+ * Any other error (most commonly `EPERM`, a live process this uid can't
+ * signal) is treated as "alive" -- the safer default, since falsely calling
+ * a live holder dead would let a second caller reclaim its lock and run
+ * concurrently, exactly the bug this whole lock exists to prevent. */
+function isPidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    if (error && typeof error === "object" && "code" in error && error.code === "ESRCH") {
+      return false;
+    }
+    return true;
+  }
+}
+
+/** Reads and loosely parses a lock file's contents, tolerating a
+ * missing/corrupt/unreadable file by returning `undefined` rather than
+ * throwing -- callers treat `undefined` the same as "indeterminate," which
+ * is always judged stale/reclaimable (safer than trusting an age or pid we
+ * couldn't actually determine). */
+async function readLockHolder(lockPath: string): Promise<LockHolder | undefined> {
+  try {
+    const raw = JSON.parse(await readFile(lockPath, "utf8")) as Record<string, unknown>;
+    return {
+      pid: typeof raw.pid === "number" ? raw.pid : undefined,
+      acquiredAt: typeof raw.acquiredAt === "number" ? raw.acquiredAt : undefined,
+      token: typeof raw.token === "string" ? raw.token : undefined,
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+/** Attempts to atomically create the lock file via the `wx` open flag (fails
+ * with EEXIST if the file already exists) -- the standard dependency-free
+ * pattern for a filesystem-based mutex, since file creation with O_EXCL is
+ * atomic at the OS level (no separate exists-check-then-create race). The
+ * file is created with an explicit `0o600` mode (review finding #2) rather
+ * than Node's default (`0o666` minus umask) -- on a host where `tmpdir()` is
+ * shared by more than one local uid, a default-mode lock file would be
+ * writable/forgeable by any other local process. On success, writes this
+ * process's pid, acquisition time, and a fresh per-acquisition `token`
+ * (`randomUUID()`) into the file and reports "acquired" with that token --
+ * the caller must pass the token back to `releaseGenerateLock` when done.
+ *
+ * On EEXIST, judges the existing holder stale (and reclaims it: unlink +
+ * one retry of the create) if *either*:
+ *   - its recorded pid is no longer alive (`isPidAlive`, review finding #2 --
+ *     a dead holder can never release its own lock, so age is irrelevant), or
+ *   - it's older than `staleMs` (default `GENERATE_LOCK_STALE_MS`) -- the
+ *     original crashed-holder heuristic, kept as a fallback for a holder
+ *     whose pid is still alive but wedged (e.g. this process is still
+ *     running, but its in-flight call has hung well past what a legitimate
+ *     call could ever take).
+ * Otherwise reports "busy" with how long the current holder has held it
+ * (surfaced in the caller-facing error message so a busy response is
+ * diagnosable, not just "try again"). Never throws: any unexpected
+ * lock-mechanics failure (permissions, a missing/unwritable tmpdir, ...)
+ * reports "unavailable" so the caller falls back to today's
+ * pre-claude-6ll behavior (proceed without cross-process coordination)
+ * rather than making every generate call fail because an ancillary
+ * coordination mechanism broke -- this lock is a best-effort mitigation for
+ * measured contention, not a correctness boundary this tool depends on to
+ * function at all. */
+export async function acquireGenerateLock(options: GenerateLockOptions = {}): Promise<LockAcquireResult> {
+  const lockPath = options.lockPath ?? GENERATE_LOCK_PATH;
+  const staleMs = options.staleMs ?? GENERATE_LOCK_STALE_MS;
+  const pidAlive = options.isPidAlive ?? isPidAlive;
+
+  const tryCreate = async (): Promise<
+    { result: "acquired"; token: string } | { result: "exists" } | { result: "unavailable" }
+  > => {
+    const token = randomUUID();
     try {
-      const handle = await open(GENERATE_LOCK_PATH, "wx");
+      const handle = await open(lockPath, "wx", 0o600);
       try {
-        await handle.writeFile(JSON.stringify({ pid: process.pid, acquiredAt: Date.now() }));
+        await handle.writeFile(JSON.stringify({ pid: process.pid, acquiredAt: Date.now(), token }));
       } finally {
         await handle.close();
       }
-      return "acquired";
+      return { result: "acquired", token };
     } catch (error) {
       if (error && typeof error === "object" && "code" in error && error.code === "EEXIST") {
-        return "exists";
+        return { result: "exists" };
       }
-      console.error(`ollama-mcp: could not acquire generate lock (${GENERATE_LOCK_PATH}), proceeding without it:`, error);
-      return "unavailable";
+      console.error(`ollama-mcp: could not acquire generate lock (${lockPath}), proceeding without it:`, error);
+      return { result: "unavailable" };
     }
   };
 
   const first = await tryCreate();
-  if (first !== "exists") {
-    return first === "acquired" ? { state: "acquired" } : { state: "unavailable" };
+  if (first.result !== "exists") {
+    return first.result === "acquired" ? { state: "acquired", token: first.token } : { state: "unavailable" };
   }
 
-  let acquiredAt: number | undefined;
-  try {
-    const holder = JSON.parse(await readFile(GENERATE_LOCK_PATH, "utf8")) as { acquiredAt?: unknown };
-    acquiredAt = typeof holder.acquiredAt === "number" ? holder.acquiredAt : undefined;
-  } catch {
-    // Unreadable/corrupt/already-removed lock file -- treated as
-    // indeterminate age below (Number.POSITIVE_INFINITY), which is always
-    // "stale" -- safer to reclaim an unreadable lock than to trust an age we
-    // couldn't determine and report "busy" against a lock that may not even
-    // reflect a live holder.
-  }
-  const heldForMs = acquiredAt === undefined ? Number.POSITIVE_INFINITY : Date.now() - acquiredAt;
+  const holder = await readLockHolder(lockPath);
+  const holderAlive = holder?.pid === undefined ? true : pidAlive(holder.pid);
+  const heldForMs = holder?.acquiredAt === undefined ? Number.POSITIVE_INFINITY : Date.now() - holder.acquiredAt;
+  const isStale = !holderAlive || heldForMs > staleMs;
 
-  if (heldForMs <= GENERATE_LOCK_STALE_MS) {
+  if (!isStale) {
     return { state: "busy", heldForMs };
   }
 
-  // Stale -- reclaim it. Best-effort unlink (another process may have won
-  // the same race and already removed/replaced it); either way, one more
-  // create attempt decides the outcome. If that retry still finds it
-  // occupied (another process reclaimed and re-acquired first), report
-  // "busy" rather than looping further -- bounded to a single reclaim
-  // attempt per call, same fail-fast philosophy as the rest of this lock.
+  // Stale -- reclaim it. Best-effort: re-read the file immediately before
+  // unlinking and only proceed if it's either gone already or still the same
+  // holder (by token) we just judged stale -- this narrows (without fully
+  // closing) the window where another process reclaimed the exact same
+  // stale lock a moment ago and this call would otherwise unlink *that*
+  // fresh, legitimate lock instead of the one it actually judged stale.
+  // Either way, one more create attempt decides the outcome; if that retry
+  // still finds it occupied (another process reclaimed and re-acquired
+  // first), report "busy" rather than looping further -- bounded to a single
+  // reclaim attempt per call, same fail-fast philosophy as the rest of this
+  // lock.
   try {
-    await unlink(GENERATE_LOCK_PATH);
+    const current = await readLockHolder(lockPath);
+    if (!current || current.token === holder?.token) {
+      await unlink(lockPath);
+    }
+    // else: someone else already reclaimed this exact lock since we judged
+    // it stale -- leave their fresh lock alone and let the retry below
+    // report "busy" against it.
   } catch {
     // Already gone / lost the race -- fall through to the retry below.
   }
   const retry = await tryCreate();
-  if (retry === "acquired") {
-    return { state: "acquired" };
+  if (retry.result === "acquired") {
+    return { state: "acquired", token: retry.token };
   }
-  if (retry === "unavailable") {
+  if (retry.result === "unavailable") {
     return { state: "unavailable" };
   }
   return { state: "busy", heldForMs: 0 };
 }
 
 /** Releases a lock previously acquired by `acquireGenerateLock` (only ever
- * called when that returned `{ state: "acquired" }` -- never for
+ * called when that returned `{ state: "acquired", token }` -- never for
  * "unavailable", which never created the file, or "busy", which never held
- * it). Best-effort: an already-missing file (e.g. reclaimed by another
- * process as stale while this call was still finishing, an edge case bounded
- * by GENERATE_LOCK_STALE_MS) is not an error worth surfacing. */
-async function releaseGenerateLock(): Promise<void> {
+ * it). `token` must be the exact value `acquireGenerateLock` returned for
+ * this acquisition.
+ *
+ * Before deleting anything, reads the file back and only unlinks it if its
+ * recorded `token` still matches this call's own `token` -- if the file is
+ * missing (e.g. reclaimed by another process as stale while this call was
+ * still finishing, an edge case bounded by `staleMs`) or its token belongs to
+ * a *different* acquisition, this is a no-op. This is the fix for review
+ * finding #1 (critical): the previous unconditional `unlink` deleted
+ * whatever currently sat at the lock path with no ownership check, so a
+ * holder whose call ran past `GENERATE_LOCK_STALE_MS` (without crashing --
+ * e.g. slow under memory pressure) could have its lock reclaimed by a second
+ * caller, finish, and then delete *that second caller's* still-live lock in
+ * its own `finally`, letting a third caller acquire immediately and run
+ * concurrently with the second -- silently defeating the mutual exclusion
+ * this lock exists to provide. Comparing tokens instead of blindly unlinking
+ * closes that hole: a late release from a reclaimed-out holder now correctly
+ * recognizes it no longer owns the lock and leaves the current legitimate
+ * holder's file untouched. */
+export async function releaseGenerateLock(token: string, options: GenerateLockOptions = {}): Promise<void> {
+  const lockPath = options.lockPath ?? GENERATE_LOCK_PATH;
   try {
-    await unlink(GENERATE_LOCK_PATH);
+    const holder = await readLockHolder(lockPath);
+    if (!holder || holder.token !== token) {
+      // Missing (already gone), or present but owned by a different
+      // acquisition (reclaimed out from under us) -- nothing of ours to
+      // remove either way. Silently skip rather than unlink a lock we don't
+      // currently own.
+      return;
+    }
+    await unlink(lockPath);
   } catch (error) {
-    console.error(`ollama-mcp: failed to release generate lock (${GENERATE_LOCK_PATH}), leaving it in place:`, error);
+    console.error(`ollama-mcp: failed to release generate lock (${lockPath}), leaving it in place:`, error);
   }
 }
 
@@ -896,7 +1019,7 @@ async function callOllamaGenerate(
   } finally {
     clearTimeout(timer);
     if (lock.state === "acquired") {
-      await releaseGenerateLock();
+      await releaseGenerateLock(lock.token);
     }
   }
 }

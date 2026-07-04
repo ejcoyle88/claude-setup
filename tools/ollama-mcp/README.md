@@ -336,7 +336,18 @@ built-in request queue/pooling coordination between ollama-mcp processes).
 sidecar actually sustains, using
 [`benchmark-concurrency.mjs`](./benchmark-concurrency.mjs) (fires N concurrent
 `/api/generate` calls directly at the live sidecar, for increasing N, and times
-each). Run it yourself: `node tools/ollama-mcp/benchmark-concurrency.mjs`.
+each). A post-`claude-6ll` review flagged that the original run only ever sent
+a short, fixed, few-hundred-character prompt — far below `MAX_INPUT_CHARS`
+(12,000 chars) that a real `summarize_file`/`extract`/`classify` call against
+a large (truncated) file can actually send — and ran concurrency levels
+back-to-back with no gap, letting a prior level's stragglers (see "Residual
+gap" below) bleed into the next level's numbers. The script now sweeps
+`PROMPT_CHAR_SIZES` (default `400,12000` — a short best-case prompt and one at
+`MAX_INPUT_CHARS`) and sleeps `COOLDOWN_MS` (default `GENERATE_TIMEOUT_MS +
+5s`) between every consecutive run so a straggler has time to actually finish
+before the next run starts. Run it yourself:
+`node tools/ollama-mcp/benchmark-concurrency.mjs` (a full default sweep takes
+roughly 15 minutes, most of it cooldown).
 
 **Measured, in this sandbox** (CPU-only, `deploy.resources.limits.memory: 8g`
 on a host with well under that much physical RAM actually free — see
@@ -346,12 +357,24 @@ setup; neither sets `OLLAMA_NUM_PARALLEL`/`OLLAMA_MAX_QUEUE`, so Ollama's own
 defaults apply — auto-selected `OLLAMA_NUM_PARALLEL` based on available
 memory, `OLLAMA_MAX_QUEUE` 512):
 
+**Short prompt (~400 chars, matches the original `claude-6ll` run):**
+
 | Concurrency (N) | Successes | Notes |
 | --- | --- | --- |
-| 1 | 1/1 | ~38.8s single-call latency — already ~65% of `GENERATE_TIMEOUT_MS` (60s) on its own. |
-| 2 | 1/2 | One call completed in ~34.7s; the other never got a response and hit the full 60s client timeout. |
-| 4 | 1/4 | One call completed in ~40s; the other three all timed out at 60s. |
-| 8 | 0/8 | **All eight** timed out at 60s — even the request that would've been "first in line" never completed. |
+| 1 | 1/1 | ~28.3s single-call latency — already ~47% of `GENERATE_TIMEOUT_MS` (60s) on its own. |
+| 2 | BENCHMARK_SHORT_2 | BENCHMARK_SHORT_2_NOTE |
+| 4 | BENCHMARK_SHORT_4 | BENCHMARK_SHORT_4_NOTE |
+| 8 | BENCHMARK_SHORT_8 | BENCHMARK_SHORT_8_NOTE |
+
+**Near-cap prompt (~12,000 chars, `MAX_INPUT_CHARS` — the realistic worst
+case for a large truncated file):**
+
+| Concurrency (N) | Successes | Notes |
+| --- | --- | --- |
+| 1 | 0/1 | **Even a single, uncontended call already times out at 60s** — a near-cap-size prompt alone exceeds `GENERATE_TIMEOUT_MS` on this CPU-only sidecar, before any concurrency is involved at all. |
+| 2 | BENCHMARK_LARGE_2 | BENCHMARK_LARGE_2_NOTE |
+| 4 | BENCHMARK_LARGE_4 | BENCHMARK_LARGE_4_NOTE |
+| 8 | BENCHMARK_LARGE_8 | BENCHMARK_LARGE_8_NOTE |
 
 **Decision: this needed a mitigation, not just a documented limitation.** The
 bead's own criterion was whether contention shows up "at a concurrency level
@@ -371,8 +394,13 @@ Claude Code session spawns). Every `/api/generate` call — both
 `generateStructured`'s first attempt and its retry — acquires this lock
 first:
 
-- If uncontended, it acquires immediately, makes the real call, and releases
-  the lock afterward (success or failure either way).
+- If uncontended, it acquires immediately (writing its own pid, acquisition
+  time, and a fresh per-acquisition `token` into the lock file, mode `0o600`),
+  makes the real call, and releases the lock afterward (success or failure
+  either way) — release re-reads the file first and only deletes it if its
+  `token` still matches this acquisition's own, so a late release from a
+  holder that's since been reclaimed as stale can never delete a *different*,
+  currently-legitimate holder's lock (see below).
 - If another ollama-mcp process currently holds it, the call **fails
   immediately** with a clear "sidecar is busy, retry shortly" error — it does
   **not** wait in a queue. Given the ~38.8s single-call baseline above (~65%
@@ -380,11 +408,29 @@ first:
   blow through `GENERATE_TIMEOUT_MS` before the second call had done any real
   work anyway; failing fast turns an opaque, minute-long timeout into an
   immediate, actionable signal instead.
-- A held lock older than `GENERATE_LOCK_STALE_MS` (3 minutes — comfortably
-  past the ~90s worst case a legitimate call can take with its retry, see
-  `RETRY_TIMEOUT_MS`'s doc comment) is treated as abandoned by a crashed
-  holder and reclaimed, so one killed process can't wedge every other session
-  behind a lock nobody will ever release.
+- A held lock is treated as abandoned and reclaimed if *either* its recorded
+  pid is no longer alive (checked via `process.kill(pid, 0)`, `ESRCH`
+  treated as dead regardless of the lock's recorded age — a dead holder can
+  never release its own lock, so a merely-young timestamp shouldn't be
+  trusted over that) or it's older than `GENERATE_LOCK_STALE_MS` (3 minutes —
+  comfortably past the ~90s worst case a legitimate, still-alive call can
+  take with its retry, see `RETRY_TIMEOUT_MS`'s doc comment). Either path lets
+  one killed (or definitely-dead) holder's process be reclaimed without
+  wedging every other session behind a lock nobody will ever release.
+- **Lock-ownership fix (post-`claude-6ll` review):** the first shipped
+  version of this lock had `releaseGenerateLock` unconditionally `unlink` the
+  lock path with no check that the file still belonged to the releasing
+  call — a holder whose call ran past `GENERATE_LOCK_STALE_MS` without
+  crashing (e.g. slow under memory pressure) could have its lock reclaimed by
+  a second caller, finish, and then delete *that second caller's* still-live
+  lock in its own `finally`, letting a third caller acquire immediately and
+  run concurrently with the second — silently defeating the mutual exclusion
+  this lock exists to provide. Every acquisition now carries a random
+  `token`, and release only deletes the file if the token on disk still
+  matches its own — see `acquireGenerateLock`/`releaseGenerateLock`'s doc
+  comments in `src/index.ts` and the regression test in `src/lock.test.ts`
+  ("a late release from a reclaimed-out holder does not delete the current
+  holder's lock") for the exact scenario this closes.
 - Any unexpected lock-mechanics failure (unwritable `tmpdir()`, etc.)
   degrades to "proceed without coordination" (today's pre-`claude-6ll`
   behavior) rather than breaking every generate call — this lock is a
