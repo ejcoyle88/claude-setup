@@ -137,17 +137,19 @@ even to chunk:
     size/shape to a single-shot summary rather than growing with the chunk
     count.
   - **`extract`**: each chunk is extracted against the caller-supplied
-    `schema` independently -- with its `required` array relaxed for these
-    per-chunk calls specifically (bead claude-d8u), since a required field's
-    real value may live in only one chunk and enforcing `required` on every
-    chunk invited a small model to hallucinate a placeholder on the chunks
-    that genuinely lack that data -- then merged: array-typed fields union
-    across chunks (duplicates removed, first-occurrence order kept);
-    object-typed fields merge recursively field-by-field; every other
-    (scalar) field takes the first chunk with a non-null value. The merged
-    result is then validated against the caller's *original* `schema`
-    (`required` intact), so the tool still errors if no chunk ever actually
-    supplied a required field's data. See `mergeExtractedChunks`'s and
+    `schema` independently -- with every `required` array relaxed for these
+    per-chunk calls specifically, at the top level and recursively through
+    every nested `properties`/`items` subschema (bead claude-d8u, extended to
+    the nested case by claude-417), since a required field's real value may
+    live in only one chunk and enforcing `required` on every chunk invited a
+    small model to hallucinate a placeholder on the chunks that genuinely
+    lack that data -- then merged: array-typed fields union across chunks
+    (duplicates removed, first-occurrence order kept); object-typed fields
+    merge recursively field-by-field; every other (scalar) field takes the
+    first chunk with a non-null value. The merged result is then validated
+    against the caller's *original* `schema` (`required` intact at every
+    level), so the tool still errors if no chunk ever actually supplied a
+    required field's data. See `mergeExtractedChunks`'s and
     `extractContent`'s doc comments in `src/index.ts` for the full policy.
   - **`classify`**: unlike the other two, this does *not* run every chunk
     through the model — a single classification label is usually

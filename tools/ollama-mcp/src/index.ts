@@ -2440,12 +2440,15 @@ type ExtractOutcome =
  * small model to hallucinate a placeholder on the chunks that genuinely
  * lack that data -- see `mergeExtractedChunks`'s doc comment for how that
  * placeholder could then win the merge over a later chunk's real value.
- * Once every chunk's result is merged, the combined result is validated
- * against the caller's *original* `schema` (`required` intact) -- so the
- * tool's overall contract is unchanged: the caller still gets an error
- * (rather than a partial result) if no chunk ever actually supplied a
- * required field's data, but a chunk that simply doesn't cover that field
- * is no longer pressured to fabricate one.
+ * `required` is relaxed at every nesting level, not just the schema's own
+ * top-level `required` array (bead claude-417) -- see
+ * `withoutRequiredForChunkMap`'s doc comment. Once every chunk's result is
+ * merged, the combined result is validated against the caller's *original*
+ * `schema` (`required` intact, at every level) -- so the tool's overall
+ * contract is unchanged: the caller still gets an error (rather than a
+ * partial result) if no chunk ever actually supplied a required field's
+ * data, but a chunk that simply doesn't cover that field is no longer
+ * pressured to fabricate one.
  *
  * `fetchImpl`/`lockOptions`/`delayFn` are threaded through purely for test
  * injection, same as `summarizeContent`'s (`delayFn` controls the pause
@@ -2513,18 +2516,62 @@ export async function extractContent(
   return { ok: true, data: merged, chunked: true, chunkCount: chunks.length };
 }
 
+/** Upper bound on `withoutRequiredForChunkMap`'s recursion depth -- mirrors
+ * `validate.ts`'s own `MAX_SCHEMA_DEPTH` guard (same rationale: `extract`'s
+ * `schema` argument is caller-supplied and otherwise open-ended). Past this
+ * depth, a nested `properties`/`items` subschema is left as-is (its own
+ * `required`, if any, is not stripped) rather than recursing further -- a
+ * pathologically/maliciously deep schema falls back to under-relaxing
+ * `required` at the deepest levels, not a `RangeError: Maximum call stack
+ * size exceeded` crash. In practice every per-chunk result is still checked
+ * by `parseAndValidateJson` against this same (relaxed) schema, and the
+ * merged result is re-validated against the caller's original schema by
+ * `extractContent` afterward, so this is defense in depth, not the primary
+ * guard. */
+const MAX_STRIP_REQUIRED_DEPTH = 20;
+
 /**
- * Returns a shallow copy of `schema` with its top-level `required` array
- * omitted, for `extractContent`'s per-chunk map calls (bead claude-d8u) --
- * never mutates `schema` itself, which the caller still needs afterward to
- * validate the final merged result (see `extractContent`'s doc comment).
- * Only the top-level `required` is stripped: the schemas this tool actually
- * sees are flat-ish and one level deep (see `validate.ts`'s header comment),
- * so a nested `properties[...].required` isn't a case this bead's fix needs
- * to cover.
+ * Returns a copy of `schema` with `required` omitted at every nesting level
+ * -- the top level, and recursively through nested `properties`/`items`
+ * subschemas, walked the same way `validateAgainstSchema` walks a schema to
+ * check it (bead claude-417, closing a gap left by claude-d8u's original
+ * top-level-only strip: a nested `properties.address.required`, for
+ * example, was still enforced per-chunk, reintroducing the same
+ * hallucination pressure this helper exists to relieve, one level down).
+ * Used for `extractContent`'s per-chunk map calls -- never mutates `schema`
+ * itself (nor any nested subschema object within it), which the caller
+ * still needs afterward, `required` intact at every level, to validate the
+ * final merged result (see `extractContent`'s doc comment): every object
+ * copied here (the top level, and each rebuilt `properties` map/subschema
+ * and `items` subschema) is a fresh shallow copy, not a mutation in place.
+ * Exported for `chunking.test.ts`'s direct-unit-test coverage of the
+ * recursive strip, alongside the black-box `extractContent` coverage that
+ * asserts on the structured-output `format` actually sent to Ollama.
+ * `depth` guards recursion (see `MAX_STRIP_REQUIRED_DEPTH`) -- callers
+ * should not normally pass it; it's incremented on each recursive call into
+ * a nested `properties`/`items` subschema.
  */
-function withoutRequiredForChunkMap(schema: JsonSchema): JsonSchema {
+export function withoutRequiredForChunkMap(schema: JsonSchema, depth = 0): JsonSchema {
   const { required: _required, ...rest } = schema;
+  if (depth > MAX_STRIP_REQUIRED_DEPTH) {
+    return rest;
+  }
+
+  if (rest.properties !== null && typeof rest.properties === "object" && !Array.isArray(rest.properties)) {
+    const properties: Record<string, unknown> = {};
+    for (const [key, subschema] of Object.entries(rest.properties as Record<string, unknown>)) {
+      properties[key] =
+        subschema !== null && typeof subschema === "object" && !Array.isArray(subschema)
+          ? withoutRequiredForChunkMap(subschema as JsonSchema, depth + 1)
+          : subschema;
+    }
+    rest.properties = properties;
+  }
+
+  if (rest.items !== null && typeof rest.items === "object" && !Array.isArray(rest.items)) {
+    rest.items = withoutRequiredForChunkMap(rest.items as JsonSchema, depth + 1);
+  }
+
   return rest;
 }
 

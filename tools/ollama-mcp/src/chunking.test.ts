@@ -37,6 +37,7 @@ import {
   readFileSlice,
   splitIntoChunks,
   summarizeContent,
+  withoutRequiredForChunkMap,
 } from "./index.js";
 import type { JsonSchema } from "./validate.js";
 
@@ -493,6 +494,93 @@ test("extractContent: the final merged result is still validated against the cal
 
   assert.equal(outcome.ok, false);
   assert.match(!outcome.ok ? outcome.error : "", /total_price/);
+});
+
+test("extractContent: a nested required field (properties.address.required) is also relaxed for per-chunk map calls (bead claude-417)", () => {
+  // Pins withoutRequiredForChunkMap's recursive strip: before claude-417,
+  // only the schema's top-level `required` was omitted from per-chunk map
+  // calls -- a nested subschema's own `required` (here, `address.required:
+  // ["zip"]`) was still sent to Ollama on every chunk, reintroducing the
+  // same hallucination pressure claude-d8u relieved at the top level, one
+  // level down.
+  const addressSchema: JsonSchema = {
+    type: "object",
+    properties: {
+      city: { type: "string" },
+      zip: { type: "string" },
+    },
+    required: ["zip"],
+  };
+  const schemaWithNestedRequired: JsonSchema = {
+    type: "object",
+    properties: {
+      title: { type: "string" },
+      address: addressSchema,
+    },
+    required: ["address"],
+  };
+
+  const stripped = withoutRequiredForChunkMap(schemaWithNestedRequired);
+
+  assert.ok(!("required" in stripped), "top-level `required` is still stripped");
+  const strippedProperties = stripped.properties as Record<string, JsonSchema>;
+  assert.ok(
+    !("required" in strippedProperties.address!),
+    "the nested `address` subschema's own `required` is also stripped",
+  );
+  // The original schema (and its nested `address` subschema object) must be
+  // left untouched -- `extractContent` still needs `required` intact, at
+  // every level, to validate the final merged result afterward.
+  assert.deepEqual(addressSchema.required, ["zip"]);
+  assert.deepEqual(schemaWithNestedRequired.required, ["address"]);
+});
+
+test("extractContent: chunks with only a partial nested-required object are merged into one that satisfies it, without any one chunk being pressured to fabricate it", async () => {
+  const lockPath = await scratchLockPath();
+  const content = "a".repeat(MAX_INPUT_CHARS + 500); // 2 chunks
+  const schemaWithNestedRequired: JsonSchema = {
+    type: "object",
+    properties: {
+      title: { type: "string" },
+      address: {
+        type: "object",
+        properties: {
+          city: { type: "string" },
+          zip: { type: "string" },
+        },
+        required: ["zip"],
+      },
+    },
+    required: ["address"],
+  };
+  const { fetchImpl, formats } = fakeFetchSequence([
+    // Chunk 1's excerpt has the city but not the zip -- omits the nested
+    // `address.required` field entirely, which would fail validation if
+    // the per-chunk map call still enforced it (the bug claude-417 fixes).
+    JSON.stringify({ title: "Invoice", address: { city: "Springfield" } }),
+    // Chunk 2's excerpt is where the zip actually lives.
+    JSON.stringify({ address: { zip: "12345" } }),
+  ]);
+
+  const outcome = await extractContent(content, schemaWithNestedRequired, undefined, undefined, fetchImpl, {
+    lockPath,
+  });
+
+  for (const format of formats) {
+    assert.ok(typeof format === "object" && format !== null && !("required" in format));
+    const address = (format as Record<string, unknown>).properties as Record<string, unknown> | undefined;
+    const addressSchema = address?.address as Record<string, unknown> | undefined;
+    assert.ok(
+      addressSchema !== undefined && !("required" in addressSchema),
+      "per-chunk map calls must not send the nested `address.required` as part of the structured-output format",
+    );
+  }
+  assert.deepEqual(outcome, {
+    ok: true,
+    data: { title: "Invoice", address: { city: "Springfield", zip: "12345" } },
+    chunked: true,
+    chunkCount: 2,
+  });
 });
 
 test("mergeExtractedChunks: nested object fields are merged recursively per sub-field", () => {
