@@ -274,6 +274,25 @@ WORKTREE_BASE="${WORKTREE_BASE:-$PROJECT_DIR/.overnight-worktrees}"
 _OVERNIGHT_INTERRUPT_COUNT=0
 _OVERNIGHT_GRACEFUL_STOP=0
 _OVERNIGHT_PGIDS=()
+# claude-7po (item 1, pgid-recycle guard): pgid -> /proc start time recorded
+# at register_pgid() time, so _overnight_kill_registered_pgids() can re-check
+# immediately before each kill that the pid it's about to signal is still the
+# SAME process it registered — not some unrelated new group leader the kernel
+# recycled the pgid to after the original fully exited and was reaped. See
+# _proc_start_time()/_pgid_start_time_matches() (defined near register_pgid,
+# below) for the mechanism, and _overnight_kill_registered_pgids()'s docstring
+# for why this matters at BOTH kill sites (initial SIGTERM and the later
+# SIGKILL escalation), in both of the nested layers this function runs in
+# (main's own registry of worker-leader pgids, and each worker leader's own
+# registry of its nested claude/timeout pgid).
+declare -A _OVERNIGHT_PGID_STARTTIME=()
+# claude-7po review round 1 (non-blocking security note): set the first time
+# register_pgid() can't read a pid's /proc start time at all (no /proc on
+# this platform, or some other unexpected failure) — guards against exactly
+# ONE loud WARNING for the whole run rather than one per registration, while
+# still surfacing (rather than silently no-opping) that the pgid-recycle
+# guard has degraded to always-fail-open on this platform/environment.
+_OVERNIGHT_PROC_STARTTIME_UNAVAILABLE_WARNED=0
 # claude-23n review F3: guards finalize() against a double-append if a 2nd
 # Ctrl+C lands during the normal end-of-script tail (which already called
 # finalize() once) — see finalize()'s docstring.
@@ -374,7 +393,36 @@ SUMMARY="$LOG_DIR/summary.log"
 # rather than silently indistinguishable from a clean one.
 _OVERNIGHT_STOP_FLAG_FILE="$LOG_DIR/.graceful-stop"
 
-WORKER_BUDGET="$(python3 -c "print(round($MAX_TOTAL_COST_USD / $PARALLEL_WORKERS, 2))")"
+# claude-7po (item 2): compute this ONCE. A worker re-sourcing this file
+# (_OVERNIGHT_IS_WORKER=1 — see PROJECT_DIR/RUN_ID above for the same
+# pattern) reuses the value main already computed and exported (see the
+# parallel launch block below) instead of re-forking python3 for the
+# identical result on every worker relaunch; falling back to the same
+# computation only as a defensive default (e.g. a future caller that sets
+# _OVERNIGHT_IS_WORKER without also exporting WORKER_BUDGET), not because a
+# worker is ever expected to disagree with main. A normal top-level
+# invocation (main) is never _OVERNIGHT_IS_WORKER, so it always computes
+# fresh — same "don't trust a generic inherited name" reasoning as
+# PROJECT_DIR/RUN_ID's own docstrings, just for a var whose whole purpose
+# here is a deliberate, exported worker handoff rather than an accident.
+#
+# claude-7po review round 1 (non-blocking perf/quality note): if this
+# fallback path is ever actually exercised, it's worth knowing — either
+# WORKER_BUDGET genuinely wasn't exported to this worker (a bug in the
+# parallel launch block below), or it was exported but MAX_TOTAL_COST_USD/
+# PARALLEL_WORKERS weren't inherited with the same values main used, in
+# which case this recompute could silently disagree with main's figure.
+# `log()`/$SUMMARY aren't defined yet at this point in the file, so this
+# uses the same plain `echo >&2` fallback the RUN_ID validation above this
+# point in the file already uses for the same reason.
+if [ "${_OVERNIGHT_IS_WORKER:-0}" = "1" ]; then
+  if [ -z "${WORKER_BUDGET:-}" ]; then
+    echo "run-overnight.sh: WARNING: WORKER_BUDGET was not inherited from main (expected export) — recomputing from this worker's own MAX_TOTAL_COST_USD=$MAX_TOTAL_COST_USD / PARALLEL_WORKERS=$PARALLEL_WORKERS. If those weren't inherited with the same values main used either, this worker's budget share may silently disagree with main's." >&2
+  fi
+  WORKER_BUDGET="${WORKER_BUDGET:-$(python3 -c "print(round($MAX_TOTAL_COST_USD / $PARALLEL_WORKERS, 2))")}"
+else
+  WORKER_BUDGET="$(python3 -c "print(round($MAX_TOTAL_COST_USD / $PARALLEL_WORKERS, 2))")"
+fi
 
 log() { echo "[$(date +%H:%M:%S)] $*" >> "$SUMMARY"; echo "[$(date +%H:%M:%S)] $*"; }
 wlog() { # wlog <worker-summary-file> <msg>
@@ -976,22 +1024,89 @@ except Exception:
   fi
 }
 
+# _proc_start_time <pid> — claude-7po (item 1). Prints the process's start
+# time (field 22 of /proc/<pid>/stat, in clock ticks since boot) to stdout,
+# or prints nothing and returns 1 if it can't be determined (already exited,
+# no /proc on this platform, or a `comm` field this naive split can't handle
+# — anything unexpected fails closed to "unknown", never to a wrong number).
+# Used as a cheap, Linux-specific liveness fingerprint: the kernel can only
+# recycle a pid once it's fully exited and reaped, and a recycled pid's start
+# time will essentially never coincide with the one recorded when this
+# script first registered it — so comparing the two lets the escalation loop
+# notice "this isn't the same process I registered anymore" before sending a
+# stray signal to whatever unrelated new group leader happens to have
+# inherited the pid.
+#
+# `comm` (field 2) is parenthesized but can itself contain spaces or even
+# ')' characters, so split on the LAST ') ' in the line (the same trick
+# ps/htop use) rather than assume comm has none. Everything after that point
+# is state(1) ppid(2) session(3) ... starttime(20) — field 22 overall, minus
+# the pid+comm fields already stripped — in safely space-delimited tokens.
+_proc_start_time() { # _proc_start_time <pid>
+  local pid="$1" line rest
+  [ -r "/proc/$pid/stat" ] || return 1
+  line="$(cat "/proc/$pid/stat" 2>/dev/null)" || return 1
+  rest="${line##*) }"
+  [ -n "$rest" ] && [ "$rest" != "$line" ] || return 1
+  # shellcheck disable=SC2086  # intentional word-splitting: $rest is a
+  # single-space-delimited run of /proc/stat fields at this point (the
+  # pid/comm prefix was already stripped above), not user input.
+  set -- $rest
+  [ -n "${20:-}" ] || return 1
+  printf '%s\n' "${20}"
+}
+
+# _pgid_start_time_matches <pgid> — claude-7po (item 1). Returns 0 (safe to
+# signal) unless BOTH the start time recorded at registration AND the pid's
+# start time right now are non-empty AND they differ. An indeterminate
+# reading on either side (already reaped, no /proc, an unparseable stat line)
+# is not evidence of anything and must not block a signal that would
+# otherwise fire — this is a best-effort, fail-open mitigation (same spirit
+# as assert_pgroup_invariant/assert_worker_pgroup_invariant: verify, don't
+# just trust, but never let the check itself break the hard-kill path). Only
+# a DEFINITE mismatch counts as "this pid has been recycled since I
+# registered it."
+_pgid_start_time_matches() { # _pgid_start_time_matches <pgid>
+  local pgid="$1" recorded now
+  recorded="${_OVERNIGHT_PGID_STARTTIME[$pgid]:-}"
+  [ -n "$recorded" ] || return 0
+  now="$(_proc_start_time "$pgid")" || return 0
+  [ "$now" = "$recorded" ]
+}
+
 # register_pgid <pgid> — adds a process-group id to the registry the
 # INT/TERM trap (installed in main, inside the BASH_SOURCE guard) hard-kills
 # on a second Ctrl+C. Called by run_in_pgroup() right after launch; callers
 # must deregister_pgid() once the iteration returns normally (nothing left to
-# hard-kill for it).
+# hard-kill for it). claude-7po: also snapshots the pid's current /proc start
+# time (best-effort; empty/absent on a platform with no /proc) so a later
+# kill against this same pgid can be checked against pid recycling — see
+# _pgid_start_time_matches(). Review round 1 (non-blocking security note):
+# an empty snapshot means the recycle guard silently fails open (always
+# "matches") for THIS pgid — log that loudly, once per run (not once per
+# registration — this would otherwise repeat every iteration/worker launch
+# on a platform with no /proc), so a guard that's degraded to a no-op for
+# the whole run is visible rather than silently indistinguishable from one
+# that's actually checking.
 register_pgid() { # register_pgid <pgid>
   _OVERNIGHT_PGIDS+=("$1")
+  local st; st="$(_proc_start_time "$1")"
+  _OVERNIGHT_PGID_STARTTIME["$1"]="$st"
+  if [ -z "$st" ] && [ "$_OVERNIGHT_PROC_STARTTIME_UNAVAILABLE_WARNED" != "1" ]; then
+    _OVERNIGHT_PROC_STARTTIME_UNAVAILABLE_WARNED=1
+    log "WARNING: could not read /proc/$1/stat to fingerprint this process's start time — the pgid-recycle guard (claude-7po) is degraded to fail-open (a no-op) for this pgid, and likely every other one registered by this same process, for the rest of the run. Expected on a platform with no /proc; on Linux, this would be unusual and worth investigating."
+  fi
 }
 
-# deregister_pgid <pgid> — removes a process-group id from the registry.
+# deregister_pgid <pgid> — removes a process-group id (and its recorded
+# start time, claude-7po) from the registry.
 deregister_pgid() { # deregister_pgid <pgid>
   local pgid="$1" kept=() p
   for p in "${_OVERNIGHT_PGIDS[@]}"; do
     [ "$p" = "$pgid" ] || kept+=("$p")
   done
   _OVERNIGHT_PGIDS=("${kept[@]}")
+  unset -- "_OVERNIGHT_PGID_STARTTIME[$pgid]"
 }
 
 # run_in_pgroup <pgid-outvar> <logfile> -- <command...> — launches
@@ -999,7 +1114,12 @@ deregister_pgid() { # deregister_pgid <pgid>
 # `setsid`, so it becomes the leader of a brand-new session + process group
 # (pgid == its own pid) that the INT/TERM trap can hard-kill as a single
 # unit on a second Ctrl+C. Stdout+stderr of the launched command are
-# redirected to <logfile>.
+# redirected to <logfile> — UNLESS <logfile> is the empty string "", in
+# which case the launched command's stdout/stderr are left exactly as
+# inherited (no redirection at all). claude-7po (item 4): that empty-string
+# sentinel is what lets run_worker_in_pgroup(), below, delegate here directly
+# instead of duplicating this function's setsid+register_pgid+printf body —
+# see its docstring for why a worker leader specifically needs no redirect.
 #
 # Verified empirically in this sandbox (util-linux 2.38 setsid, GNU
 # coreutils 9.1 `timeout`/`env`): under `setsid env --chdir=DIR VAR=VAL
@@ -1019,39 +1139,38 @@ deregister_pgid() { # deregister_pgid <pgid>
 run_in_pgroup() { # run_in_pgroup <pgid-outvar> <logfile> -- <command...>
   local __pgid_var="$1" __logfile="$2"
   shift 2
-  setsid "$@" >"$__logfile" 2>&1 &
+  if [ -n "$__logfile" ]; then
+    setsid "$@" >"$__logfile" 2>&1 &
+  else
+    setsid "$@" &
+  fi
   local pid=$!
   register_pgid "$pid"
   printf -v "$__pgid_var" '%s' "$pid"
 }
 
-# run_worker_in_pgroup <pgid-outvar> <command...> — claude-14w. Same
-# `setsid ... &` + register_pgid() mechanism as run_in_pgroup() above (same
-# verified invariant: launching a non-job-controlled background child under
-# `setsid` makes the captured $! itself the new session/process-group
-# leader, with no extra fork layer in between — see run_in_pgroup's
-# docstring), used here to give each PARALLEL_WORKERS>1 worker LEADER its own
-# killable process group instead of the plain `run_worker ... & ` this
-# replaces (which left the worker in main's own pgid, immune to a targeted
-# `kill -TERM -- -<pgid>` and to the terminal's Ctrl+C alike — the exact
-# POSIX-async-list bug this bead exists to fix).
+# run_worker_in_pgroup <pgid-outvar> <command...> — claude-14w. A thin
+# wrapper over run_in_pgroup() (claude-7po, item 4: factored out to share its
+# setsid+register_pgid+printf body instead of duplicating those 3 lines),
+# passing an empty logfile so nothing is redirected — used here to give each
+# PARALLEL_WORKERS>1 worker LEADER its own killable process group instead of
+# the plain `run_worker ... &` this replaces (which left the worker in
+# main's own pgid, immune to a targeted `kill -TERM -- -<pgid>` and to the
+# terminal's Ctrl+C alike — the exact POSIX-async-list bug this bead exists
+# to fix).
 #
-# Deliberately does NOT redirect stdout/stderr to a logfile the way
-# run_in_pgroup does: a worker leader's own output is just its wlog() calls
-# echoing to the terminal (each line is ALSO durably written to
+# Deliberately does NOT redirect stdout/stderr to a logfile the way a normal
+# run_in_pgroup call does: a worker leader's own output is just its wlog()
+# calls echoing to the terminal (each line is ALSO durably written to
 # worker-<N>.log by wlog itself), and pre-claude-14w that output was already
 # visible live on the terminal (plain `run_worker ... &` inherits the
-# parent's stdout). Forcing it through run_in_pgroup's logfile redirection
-# would silently take that live visibility away with no behavior upside —
-# so this is intentionally a separate, narrower helper rather than a second
-# call site reusing run_in_pgroup with a throwaway logfile.
+# parent's stdout). Forcing it through a logfile redirect would silently
+# take that live visibility away with no behavior upside — hence the empty
+# logfile rather than a throwaway one.
 run_worker_in_pgroup() { # run_worker_in_pgroup <pgid-outvar> <command...>
   local __pgid_var="$1"
   shift 1
-  setsid "$@" &
-  local pid=$!
-  register_pgid "$pid"
-  printf -v "$__pgid_var" '%s' "$pid"
+  run_in_pgroup "$__pgid_var" "" "$@"
 }
 
 # assert_pgroup_invariant <leaderpid> <wsum> — claude-23n review F1. The
@@ -1174,18 +1293,43 @@ _overnight_interrupted_during() { # _overnight_interrupted_during <pre-call-flag
 # — without confirming death and escalating, a survivor is silently orphaned
 # after the caller exits (still burning tokens, nothing watching the budget)
 # even though the operator was told "aborting now".
+#
+# claude-7po (item 1): this fires in two nested layers — main's own registry
+# (worker-leader pgids, or claude/timeout pgids directly in single-worker
+# mode) and, recursively, each worker leader's own registry of its nested
+# claude/timeout pgid. A fully-exited-and-reaped pgid could in theory be
+# recycled by the kernel before this function's next `kill -0` check on it,
+# sending a stray signal to an unrelated new group leader. Immediately before
+# EACH kill below (both the initial SIGTERM and the later SIGKILL), re-verify
+# via _pgid_start_time_matches() that the pid still has the /proc start time
+# recorded when register_pgid() first saw it — skip (and log) rather than
+# signal if it doesn't match.
+#
+# claude-7po review round 1 (quality finding 1): the poll loop below must
+# only track pgids this call actually SIGTERM'd (`signaled_pgids`), NOT the
+# full `_OVERNIGHT_PGIDS` registry. A pgid skipped above as recycled is, by
+# definition, alive as some unrelated NEW process — `kill -0` against it
+# always succeeds, so polling the full registry would keep that stray
+# survivor in `alive_pgids` for the ENTIRE grace period even after every
+# legitimately-signaled process has already exited, needlessly delaying
+# shutdown by up to the full grace window before the (correct) second
+# start-time check below skips it again at the SIGKILL stage.
 _overnight_kill_registered_pgids() { # _overnight_kill_registered_pgids <grace_secs>
   local grace_secs="${1:-$_OVERNIGHT_KILL_GRACE_SECS}" pgid waited=0
-  local -a alive_pgids=()
+  local -a signaled_pgids=() alive_pgids=()
   for pgid in "${_OVERNIGHT_PGIDS[@]}"; do
     [ -n "$pgid" ] || continue
+    if ! _pgid_start_time_matches "$pgid"; then
+      log "WARNING: pgid $pgid's /proc start time no longer matches what was recorded at registration — the original process is gone and this pgid may have been recycled by an unrelated new group leader. Skipping SIGTERM rather than risk signaling a stray process."
+      continue
+    fi
+    signaled_pgids+=("$pgid")
     kill -TERM -- "-$pgid" 2>/dev/null \
       || { kill -0 -- "-$pgid" 2>/dev/null && log "WARNING: kill -TERM -- -$pgid failed even though the group is still alive — will still attempt SIGKILL below."; }
   done
   while [ "$waited" -lt "$grace_secs" ]; do
     alive_pgids=()
-    for pgid in "${_OVERNIGHT_PGIDS[@]}"; do
-      [ -n "$pgid" ] || continue
+    for pgid in "${signaled_pgids[@]}"; do
       kill -0 -- "-$pgid" 2>/dev/null && alive_pgids+=("$pgid")
     done
     [ "${#alive_pgids[@]}" -eq 0 ] && break
@@ -1193,6 +1337,10 @@ _overnight_kill_registered_pgids() { # _overnight_kill_registered_pgids <grace_s
     waited=$((waited + 1))
   done
   for pgid in "${alive_pgids[@]}"; do
+    if ! _pgid_start_time_matches "$pgid"; then
+      log "WARNING: pgid $pgid's /proc start time no longer matches what was recorded at registration — skipping SIGKILL rather than risk signaling a recycled, unrelated group leader."
+      continue
+    fi
     log "WARNING: pgid $pgid still alive ${grace_secs}s after SIGTERM — escalating to SIGKILL."
     kill -KILL -- "-$pgid" 2>/dev/null \
       || log "WARNING: kill -KILL -- -$pgid failed — it may already be gone, or this identity lacks permission to kill it. Check for an orphaned claude/timeout process manually."
@@ -1604,8 +1752,13 @@ else
   # worker subprocess recognizes _OVERNIGHT_IS_WORKER=1 and adopts
   # _OVERNIGHT_WORKER_PROJECT_DIR/_OVERNIGHT_WORKER_RUN_ID instead of
   # recomputing its own (RUN_ID) or mis-computing one from the wrapper's own
-  # unrelated $1 (PROJECT_DIR).
-  export _OVERNIGHT_IS_WORKER=1 _OVERNIGHT_WORKER_PROJECT_DIR="$PROJECT_DIR" _OVERNIGHT_WORKER_RUN_ID="$RUN_ID"
+  # unrelated $1 (PROJECT_DIR). claude-7po (item 2): also export the already-
+  # computed WORKER_BUDGET here — unlike RUN_ID/PROJECT_DIR, this one IS
+  # meant to be reused as-is (main and every worker must agree on the same
+  # per-worker budget share), so no distinctly-named handoff var is needed;
+  # WORKER_BUDGET's own top-of-file computation already only trusts an
+  # inherited value when _OVERNIGHT_IS_WORKER=1.
+  export _OVERNIGHT_IS_WORKER=1 _OVERNIGHT_WORKER_PROJECT_DIR="$PROJECT_DIR" _OVERNIGHT_WORKER_RUN_ID="$RUN_ID" WORKER_BUDGET
 
   pids=()
   for w in $(seq 1 "$PARALLEL_WORKERS"); do
@@ -1618,12 +1771,28 @@ else
     # spinning up brand-new worker-leader subprocesses, each of which only
     # self-halts AFTER running its own (potentially expensive) baseline
     # verify() + mcp_trust_gate() in run_worker(). That contradicts the
-    # documented "1st Ctrl+C: stop launching new work" semantics. Written as
-    # a single `if` with an explicit `||`-combined condition (not two
-    # separate `&&`-chained one-liners) so precedence can't accidentally
-    # make the break unconditional.
-    if [ "$_OVERNIGHT_GRACEFUL_STOP" = "1" ] || [ -f "$_OVERNIGHT_STOP_FLAG_FILE" ]; then
-      log "Graceful interrupt received — not launching worker $w or any further workers."
+    # documented "1st Ctrl+C: stop launching new work" semantics.
+    #
+    # claude-7po (item 5): split into if/elif rather than one `||`-folded
+    # message, mirroring run_worker's own loop-top check above — for the
+    # SAME reason it matters there. _OVERNIGHT_GRACEFUL_STOP=1 here is only
+    # ever set by THIS process's (main's) own INT/TERM trap — a genuine
+    # operator Ctrl+C/SIGTERM. The stop-flag-FILE case is different: it is
+    # same-UID writable by any already-launched worker's own headless
+    # `claude -p` agent (see _OVERNIGHT_STOP_FLAG_FILE's definition for why,
+    # and why that's an accepted residual limitation), so main observing the
+    # file rather than its own in-process flag cannot tell "an operator
+    # signaled main" apart from "an already-running worker's agent touched
+    # this file itself" during the `sleep 3` stagger between launches. Log
+    # that case LOUDLY and distinguishably, same as run_worker's loop does,
+    # so a sibling-triggered (potentially griefing) halt of the whole launch
+    # sequence is visible as such rather than indistinguishable from a clean
+    # operator-requested stop.
+    if [ "$_OVERNIGHT_GRACEFUL_STOP" = "1" ]; then
+      log "Graceful interrupt received (operator signal) — not launching worker $w or any further workers."
+      break
+    elif [ -f "$_OVERNIGHT_STOP_FLAG_FILE" ]; then
+      log "GRACEFUL STOP FLAG OBSERVED — not launching worker $w or any further workers. This process's OWN in-process operator-signal flag was NOT set, so this stop was observed via $_OVERNIGHT_STOP_FLAG_FILE rather than a direct Ctrl+C/SIGTERM to main. That file is same-UID writable by any already-launched worker's own agent (accepted residual limitation, documented at its definition) — if this run was not intentionally interrupted by the operator, treat this as a possible worker-triggered stop and inspect each worker-*.log before trusting the rest of tonight's results."
       break
     fi
     WT="$WORKTREE_BASE/w$w"
@@ -1670,6 +1839,13 @@ else
       kill -0 "$p" 2>/dev/null && still_alive+=("$p")
     done
     remaining_pids=("${still_alive[@]}")
+    # claude-7po (item 3): this loop is correct today because bash's
+    # multi-pid `wait` only returns early on a trapped signal (see the
+    # comment above) — it should never spin. But if that assumption is ever
+    # wrong on some bash version/platform and `wait` returns without any
+    # tracked pid having actually exited, this keeps the loop from becoming a
+    # busy-loop; it degrades to bounded polling instead.
+    [ "${#remaining_pids[@]}" -gt 0 ] && sleep 0.2
   done
   for p in "${pids[@]}"; do
     deregister_pgid "$p"

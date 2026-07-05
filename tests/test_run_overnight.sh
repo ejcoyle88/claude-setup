@@ -803,6 +803,136 @@ test_check_telemetry_health_loki_ready_down() {
     "grep -q 'TELEMETRY HEALTH WARNING: Loki (http://test-loki:3100/ready) did not respond ready at end of run.' '$LOG_DIR_TEST/summary.log'"
 }
 
+# --- pgid-recycle guard: register_pgid/deregister_pgid start-time bookkeeping,
+# _overnight_kill_registered_pgids, run_in_pgroup's empty-logfile branch
+# (claude-7po) ---
+# These exercise real, short-lived background processes (via `setsid`, same
+# as the actual run_in_pgroup/run_worker_in_pgroup call sites — a plain `cmd &`
+# without setsid stays in THIS shell's own process group, so `kill -TERM --
+# -$pid` against it would signal the wrong group entirely and silently not
+# work, which is not what these tests are meant to exercise). Every test here
+# is responsible for reaping/deregistering whatever it starts so later tests
+# in this same sourced process don't inherit a stale entry in the shared
+# _OVERNIGHT_PGIDS/_OVERNIGHT_PGID_STARTTIME registries.
+
+test_register_pgid_records_start_time_and_deregister_clears_it() {
+  # Round-1 review, quality finding 2: a regression here (e.g. forgetting to
+  # unset the starttime entry on deregister, or an off-by-one in the
+  # /proc/stat field split inside _proc_start_time) is exactly the class of
+  # bug this test guards against.
+  setsid sleep 5 &
+  local pid=$!
+  register_pgid "$pid"
+  local recorded="${_OVERNIGHT_PGID_STARTTIME[$pid]:-}"
+  assert "register_pgid records a non-empty numeric /proc start time for a real, running process" \
+    "[ -n '$recorded' ] && case '$recorded' in ''|*[!0-9]*) false;; *) true;; esac"
+  deregister_pgid "$pid"
+  assert "deregister_pgid clears the recorded start time (no stale entry left behind)" \
+    "[ -z \"\${_OVERNIGHT_PGID_STARTTIME[$pid]:-}\" ]"
+  kill -- "-$pid" 2>/dev/null
+  wait "$pid" 2>/dev/null
+}
+
+test_kill_registered_pgids_signals_pgid_with_matching_start_time() {
+  # (a) matching start time -> the kill proceeds normally.
+  setsid sleep 30 &
+  local pid=$!
+  register_pgid "$pid"
+  _overnight_kill_registered_pgids 3 >/dev/null 2>&1
+  # Give the SIGTERM a brief moment to actually land before checking.
+  sleep 0.3
+  assert "a pgid whose recorded start time still matches is actually signaled and dies" \
+    "! kill -0 '$pid' 2>/dev/null"
+  deregister_pgid "$pid"
+}
+
+test_kill_registered_pgids_skips_pgid_with_mismatched_start_time() {
+  # (b) a deliberately mismatched start time -> the kill is skipped (and
+  # logged), simulating a recycled pgid: register a real, alive process,
+  # then corrupt its recorded start time to a value that can never match —
+  # _overnight_kill_registered_pgids must treat it as "not the process I
+  # registered" and refuse to signal it.
+  #
+  # Also covers round-1 review finding 1's fix directly: skipping a
+  # never-actually-signaled pgid must NOT consume the full grace period
+  # polling it (that pgid is alive as an unrelated process, so a naive
+  # `kill -0` poll against the full registry would spin for the whole grace
+  # window). Asserts the call returns promptly instead.
+  setsid sleep 30 &
+  local pid=$!
+  register_pgid "$pid"
+  _OVERNIGHT_PGID_STARTTIME["$pid"]="999999999"
+
+  local before after elapsed
+  before="$(date +%s)"
+  _overnight_kill_registered_pgids 5 >/dev/null 2>&1
+  after="$(date +%s)"
+  elapsed=$((after - before))
+
+  assert "a pgid with a mismatched recorded start time is left alive (SIGTERM was skipped)" \
+    "kill -0 '$pid' 2>/dev/null"
+  assert "a WARNING naming the mismatched pgid is logged" \
+    "grep -q \"pgid $pid's /proc start time no longer matches\" '$SUMMARY'"
+  assert "round-1 finding 1 fix: skipping the mismatched pgid returns promptly (elapsed=${elapsed}s), not after the full 5s grace period" \
+    "[ '$elapsed' -lt 3 ]"
+
+  kill -- "-$pid" 2>/dev/null
+  wait "$pid" 2>/dev/null
+  deregister_pgid "$pid"
+}
+
+test_run_in_pgroup_redirects_stdout_to_a_real_logfile() {
+  # (c), real-logfile half: run_in_pgroup's normal (non-empty <logfile>)
+  # branch still redirects stdout+stderr there. A short `sleep` before the
+  # `echo` keeps the child alive long enough for register_pgid's /proc
+  # start-time snapshot to reliably succeed (a near-instant `echo` alone can
+  # exit and be reaped before that read happens) — not load-bearing for this
+  # specific assertion, just avoids incidental flakiness shared with the
+  # other tests in this section.
+  local logfile="$LOG_DIR_TEST/rip-redirect.log"
+  local pgid=""
+  run_in_pgroup pgid "$logfile" -- bash -c 'sleep 0.2; echo hello-redirected'
+  wait "$pgid" 2>/dev/null
+  deregister_pgid "$pgid"
+  assert "run_in_pgroup with a real logfile redirects the launched command's stdout there" \
+    "grep -q 'hello-redirected' '$logfile'"
+}
+
+test_run_in_pgroup_empty_logfile_leaves_stdout_uninherited() {
+  # (c), empty-logfile half (claude-7po item 4's new branch): passing "" as
+  # <logfile> must leave stdout exactly as inherited, not redirect it
+  # anywhere. Captured via command substitution (the only thing that DOES
+  # redirect stdout here is the test itself, not run_in_pgroup) — `wait`
+  # inside the same subshell before it exits is required so the
+  # command substitution's read end sees EOF promptly instead of hanging on
+  # the backgrounded child's still-open copy of the write end.
+  local output
+  output="$(
+    pgid=""
+    run_in_pgroup pgid "" -- bash -c 'sleep 0.2; echo hello-not-redirected'
+    wait "$pgid" 2>/dev/null
+    deregister_pgid "$pgid"
+  )"
+  assert "run_in_pgroup with an empty logfile leaves the launched command's stdout inherited (captured here), not redirected to a file" \
+    "[ '$output' = 'hello-not-redirected' ]"
+}
+
+test_run_worker_in_pgroup_also_leaves_stdout_uninherited() {
+  # Same empty-logfile property, exercised through run_worker_in_pgroup
+  # itself (claude-7po item 4: it now delegates to run_in_pgroup "" instead
+  # of duplicating the setsid+register_pgid+printf body) rather than only
+  # through run_in_pgroup directly above.
+  local output
+  output="$(
+    pgid=""
+    run_worker_in_pgroup pgid bash -c 'sleep 0.2; echo hello-worker-pgroup'
+    wait "$pgid" 2>/dev/null
+    deregister_pgid "$pgid"
+  )"
+  assert "run_worker_in_pgroup's launched command's stdout is inherited (captured here), not redirected to a file" \
+    "[ '$output' = 'hello-worker-pgroup' ]"
+}
+
 run_test test_count_zero_with_no_worker_logs
 run_test test_count_single_worker
 run_test test_count_multi_worker_sum
@@ -845,6 +975,12 @@ run_test test_check_telemetry_health_selects_newest_in_window_marker
 run_test test_check_telemetry_health_no_candidates_in_window_is_not_flagged_as_drift
 run_test test_check_telemetry_health_loki_ready_ok
 run_test test_check_telemetry_health_loki_ready_down
+run_test test_register_pgid_records_start_time_and_deregister_clears_it
+run_test test_kill_registered_pgids_signals_pgid_with_matching_start_time
+run_test test_kill_registered_pgids_skips_pgid_with_mismatched_start_time
+run_test test_run_in_pgroup_redirects_stdout_to_a_real_logfile
+run_test test_run_in_pgroup_empty_logfile_leaves_stdout_uninherited
+run_test test_run_worker_in_pgroup_also_leaves_stdout_uninherited
 
 rm -rf "$SOURCE_SCRATCH_DIR"
 
