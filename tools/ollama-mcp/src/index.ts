@@ -627,16 +627,12 @@ server.registerTool(
       truncated = slice.truncated;
       truncatedChars = slice.truncatedChars;
     } else {
-      content = pathOrText;
-      // Same MAX_CHUNKABLE_CHARS-then-fall-back-to-MAX_INPUT_CHARS policy as
-      // readBounded/readLineRange use for the isPath branch above -- content
-      // up to MAX_CHUNKABLE_CHARS is left whole for classifyContent to chunk
-      // if needed; only content beyond that is hard-truncated here.
-      if (content.length > MAX_CHUNKABLE_CHARS) {
-        truncated = true;
-        truncatedChars = content.length - MAX_INPUT_CHARS;
-        content = content.slice(0, MAX_INPUT_CHARS);
-      }
+      // See resolveClassifyLiteralTextInput's doc comment for why this
+      // delegates rather than reimplementing the truncation logic inline.
+      const resolved = resolveClassifyLiteralTextInput(pathOrText);
+      content = resolved.content;
+      truncated = resolved.truncated;
+      truncatedChars = resolved.truncatedChars;
     }
 
     const outcome = await classifyContent(content, labels, makeProgressNotifier(extra), extra.signal);
@@ -1371,6 +1367,28 @@ function trimIncompleteUtf8Tail(buffer: Buffer, length: number): number {
   return leadIndex + seqLen <= length ? length : leadIndex;
 }
 
+/** Non-BMP characters (e.g. many emoji) are represented in a JS string as a
+ * surrogate pair -- two UTF-16 code units, a high surrogate (`0xd800`-
+ * `0xdbff`) followed by a low surrogate (`0xdc00`-`0xdfff`). `content.slice(0,
+ * length)` indexes by UTF-16 code unit, not codepoint, so if `length` lands
+ * exactly between such a pair, the slice ends in a lone high surrogate --
+ * technically malformed UTF-16 (not what a well-formed string boundary should
+ * ever produce), though not something `JSON.stringify`/`toString` will throw
+ * on. Mirrors `trimIncompleteUtf8Tail`'s role for the byte-level read path,
+ * but for UTF-16 string slicing instead of UTF-8 byte buffers: if `sliced`'s
+ * last code unit is a high surrogate, drop it so the result never ends
+ * mid-pair. */
+function trimIncompleteUtf16Tail(sliced: string): string {
+  if (sliced.length === 0) {
+    return sliced;
+  }
+  const lastCode = sliced.charCodeAt(sliced.length - 1);
+  if (lastCode >= 0xd800 && lastCode <= 0xdbff) {
+    return sliced.slice(0, -1);
+  }
+  return sliced;
+}
+
 /** Applies `MAX_CHUNK_COUNT`'s documented fallback to `raw`, which the
  * caller has already determined holds more than `MAX_CHUNKABLE_CHARS`
  * characters' worth of real content (i.e. more than chunked map-reduce is
@@ -1384,7 +1402,9 @@ function trimIncompleteUtf8Tail(buffer: Buffer, length: number): number {
  * byte cap) -- folded into the returned `truncatedChars` so the reported
  * count stays a lower-bound estimate of everything actually missing, same
  * accounting convention `readBounded`/`readLineRange` already used for
- * truncation before this bead. */
+ * truncation before this bead. The `MAX_INPUT_CHARS` slice itself goes
+ * through `trimIncompleteUtf16Tail` so it never ends on a lone surrogate
+ * (any trimmed unit is folded into `truncatedChars` too). */
 function applyChunkCapFallback(raw: string, extraTruncatedChars: number): SliceResult {
   if (raw.length <= MAX_INPUT_CHARS) {
     // Defensive only -- every real call site here already established
@@ -1393,12 +1413,45 @@ function applyChunkCapFallback(raw: string, extraTruncatedChars: number): SliceR
     // reachable in practice.
     return { ok: true, content: raw, truncated: extraTruncatedChars > 0, truncatedChars: extraTruncatedChars };
   }
+  const content = trimIncompleteUtf16Tail(raw.slice(0, MAX_INPUT_CHARS));
   return {
     ok: true,
-    content: raw.slice(0, MAX_INPUT_CHARS),
+    content,
     truncated: true,
-    truncatedChars: raw.length - MAX_INPUT_CHARS + extraTruncatedChars,
+    truncatedChars: raw.length - content.length + extraTruncatedChars,
   };
+}
+
+/** Applies `classify`'s isPath:false (literal-text, not a file) branch's
+ * MAX_CHUNKABLE_CHARS-then-fall-back-to-MAX_INPUT_CHARS truncation policy --
+ * the same one `readFileSlice`/`readBounded`/`readLineRange` apply for the
+ * isPath:true branch, just without a file read in front of it. Content up to
+ * MAX_CHUNKABLE_CHARS is left whole for `classifyContent` to chunk if
+ * needed; only content beyond that is hard-truncated, via
+ * `applyChunkCapFallback` (never reimplemented inline here) so this can't
+ * silently drift out of sync with the file-backed branch -- exactly the
+ * duplication that let the MAX_INPUT_CHARS-boundary surrogate-split bug
+ * (claude-z8s) escape this call site the first time. Exported (and used by
+ * the `classify` tool's handler below) purely so a test can exercise this
+ * literal-text entry point directly, the same way `readFileSlice`'s own
+ * tests exercise the isPath:true one. */
+export function resolveClassifyLiteralTextInput(pathOrText: string): {
+  content: string;
+  truncated: boolean;
+  truncatedChars: number;
+} {
+  if (pathOrText.length <= MAX_CHUNKABLE_CHARS) {
+    return { content: pathOrText, truncated: false, truncatedChars: 0 };
+  }
+  // applyChunkCapFallback's SliceResult return type is shared with its
+  // file-reading callers (which can fail before ever reaching it), but
+  // applyChunkCapFallback itself never produces `ok: false` -- it only ever
+  // transforms the `raw` string it's handed.
+  const fallback = applyChunkCapFallback(pathOrText, 0);
+  if (!fallback.ok) {
+    throw new Error("unreachable: applyChunkCapFallback never returns ok: false");
+  }
+  return { content: fallback.content, truncated: fallback.truncated, truncatedChars: fallback.truncatedChars };
 }
 
 /** Reads up to enough bytes to cover `MAX_CHUNKABLE_CHARS` after UTF-8

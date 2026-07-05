@@ -35,6 +35,7 @@ import {
   MAX_INPUT_CHARS,
   mergeExtractedChunks,
   readFileSlice,
+  resolveClassifyLiteralTextInput,
   splitIntoChunks,
   summarizeContent,
   withoutRequiredForChunkMap,
@@ -239,6 +240,80 @@ test("readFileSlice: whole file read to true EOF with a corrupt/incomplete UTF-8
 // remainder) already covers -- and, per this run, still passes -- the
 // case this fix must not regress: only the bytesRead === fileSize +
 // droppedTailBytes > 0 case above changes behavior.
+
+test("readFileSlice: the MAX_INPUT_CHARS hard-truncation boundary never splits a surrogate pair (bead claude-z8s)", async () => {
+  const root = await scratchRoot();
+  // U+1F600 ("😀") as its two UTF-16 code units, positioned so that a naive
+  // content.slice(0, MAX_INPUT_CHARS) walk lands exactly between the high
+  // and low surrogate: MAX_INPUT_CHARS - 1 filler chars put the high
+  // surrogate at index MAX_INPUT_CHARS - 1 (the slice's last included
+  // index), with the low surrogate one past it (dropped by the slice
+  // either way). The trailing filler pushes total length past
+  // MAX_CHUNKABLE_CHARS so this exercises the applyChunkCapFallback path
+  // (same one readBounded/readLineRange both fall back to) rather than the
+  // "returned whole" one above.
+  const emoji = "😀";
+  const prefix = "a".repeat(MAX_INPUT_CHARS - 1);
+  const filler = "a".repeat(MAX_CHUNKABLE_CHARS);
+  const content = prefix + emoji + filler;
+  await writeFile(path.join(root, "surrogate-boundary.txt"), content);
+
+  const result = await readFileSlice("surrogate-boundary.txt", undefined, undefined, root);
+
+  assert.equal(result.ok, true);
+  if (result.ok) {
+    assert.equal(result.truncated, true);
+    const lastCode = result.content.charCodeAt(result.content.length - 1);
+    assert.ok(
+      lastCode < 0xd800 || lastCode > 0xdbff,
+      `truncated content must not end on a lone high surrogate: last code unit was ${lastCode.toString(16)}`,
+    );
+    assert.equal(result.content, prefix, "the split surrogate pair must be dropped entirely, not left dangling");
+    assert.equal(
+      result.truncatedChars,
+      content.length - result.content.length,
+      "truncatedChars must account for the extra trimmed surrogate unit, not just raw.length - MAX_INPUT_CHARS",
+    );
+  }
+});
+
+test("resolveClassifyLiteralTextInput: the MAX_INPUT_CHARS hard-truncation boundary never splits a surrogate pair, via the classify tool's literal-text (isPath:false) entry point (bead claude-z8s)", () => {
+  // Same construction as readFileSlice's identically-purposed surrogate-
+  // boundary test above, but exercised through classify's literal-text
+  // branch (resolveClassifyLiteralTextInput) instead of the file-backed
+  // isPath:true path -- this is the second of the two call sites the
+  // original bug could escape through, now routed through the same
+  // applyChunkCapFallback helper as the first (see resolveClassifyLiteralTextInput's
+  // and applyChunkCapFallback's doc comments) rather than a separate,
+  // possibly-drifting reimplementation.
+  const emoji = "😀";
+  const prefix = "a".repeat(MAX_INPUT_CHARS - 1);
+  const filler = "a".repeat(MAX_CHUNKABLE_CHARS);
+  const pathOrText = prefix + emoji + filler;
+
+  const result = resolveClassifyLiteralTextInput(pathOrText);
+
+  assert.equal(result.truncated, true);
+  const lastCode = result.content.charCodeAt(result.content.length - 1);
+  assert.ok(
+    lastCode < 0xd800 || lastCode > 0xdbff,
+    `truncated content must not end on a lone high surrogate: last code unit was ${lastCode.toString(16)}`,
+  );
+  assert.equal(result.content, prefix, "the split surrogate pair must be dropped entirely, not left dangling");
+  assert.equal(
+    result.truncatedChars,
+    pathOrText.length - result.content.length,
+    "truncatedChars must account for the extra trimmed surrogate unit, not just raw.length - MAX_INPUT_CHARS",
+  );
+});
+
+test("resolveClassifyLiteralTextInput: content within MAX_CHUNKABLE_CHARS is returned whole, untruncated", () => {
+  const pathOrText = "a".repeat(MAX_INPUT_CHARS + 500);
+
+  const result = resolveClassifyLiteralTextInput(pathOrText);
+
+  assert.deepEqual(result, { content: pathOrText, truncated: false, truncatedChars: 0 });
+});
 
 // --- summarizeContent (map-reduce) --------------------------------------
 
