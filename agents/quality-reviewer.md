@@ -7,17 +7,7 @@ description: >-
   changes public APIs or tests, or grows in complexity/duplication — but treat
   these as prioritization hints, not an exhaustive gate: when unsure, invoke it
   anyway (e.g. a subtly wrong data transform can be a quality bug without
-  touching control flow, tests, or a public API). This trigger is deliberately
-  broad, so it fires on nearly every diff by design; it runs on sonnet at
-  parity with security-reviewer and performance-reviewer — judging
-  correctness and concurrency across arbitrary languages needs reasoning
-  depth comparable to the other two dimensions, not a leftover default
-  (resolved in claude-58k; a downgrade to haiku would need a controlled
-  measurement showing findings quality holds, not just a cost-saving guess).
-  Invoked by the
-  /review orchestrator (or directly). Read-only — returns structured findings
-  for the orchestrator to format; does not produce the final review or edit
-  code.
+  touching control flow, tests, or a public API).
 tools: Read, Grep, Glob, Bash(~/.claude/scripts/git-ro.sh:*)
 model: sonnet
 hooks:
