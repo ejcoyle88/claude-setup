@@ -5,6 +5,23 @@ on:
     branches: [main]
   pull_request:
 
+# Least-privilege default: none of these jobs write to the repo, comment on
+# PRs, or otherwise need more than read access to source (the `changes` job
+# additionally needs `pull-requests: read` for its checkout-less
+# dorny/paths-filter step on pull_request events -- granted at the job level
+# below, since a job-level `permissions:` block replaces rather than extends
+# this default).
+permissions:
+  contents: read
+
+# Cancel a superseded run on the same ref (e.g. a new push to the same PR)
+# instead of letting it run to completion -- observability-smoke-tests alone
+# pays for a cold image pull + container bring-up, so a stale run finishing
+# after it's already moot is pure wasted cost.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   install-tests:
     strategy:
@@ -89,17 +106,33 @@ jobs:
     # unconditional; top-level `on.paths` isn't used here because it would
     # gate those too.
     runs-on: ubuntu-latest
+    # Job-level override of the workflow-default `contents: read` above --
+    # needed for the pull_request-only checkout-less mode below, where
+    # dorny/paths-filter calls the GitHub API to list changed files instead
+    # of diffing a real checkout.
+    permissions:
+      contents: read
+      pull-requests: read
     outputs:
       observability: ${{ steps.filter.outputs.observability }}
     steps:
-      # Full history: dorny/paths-filter diffs against github.event.before on
-      # push events, and a depth-1 checkout won't have that commit. The
-      # action can fetch missing history itself as a fallback, but relying on
-      # that silently is fragile -- if it ever fails quietly (shallow-history
-      # edge cases, force-pushes), the filter could resolve to `false` on a
-      # genuinely relevant .devcontainer/** push and silently skip
-      # observability-smoke-tests on the exact change it exists to catch.
-      - uses: actions/checkout@v4
+      # On pull_request events, dorny/paths-filter queries the GitHub API
+      # directly for the PR's changed-files list ("For pull requests it's
+      # not necessary to checkout the code" -- dorny/paths-filter docs), so
+      # this step is skipped entirely there.
+      #
+      # On push (this workflow's only other trigger), that API mode isn't
+      # available, so paths-filter falls back to git-based detection via
+      # `git merge-base` against github.event.before -- which does need a
+      # real checkout, and with full history: a depth-1 checkout won't have
+      # that commit. The action can fetch missing history itself as a
+      # fallback, but relying on that silently is fragile -- if it ever
+      # fails quietly (shallow-history edge cases, force-pushes), the filter
+      # could resolve to `false` on a genuinely relevant .devcontainer/**
+      # push and silently skip observability-smoke-tests on the exact change
+      # it exists to catch.
+      - if: github.event_name != 'pull_request'
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
@@ -120,6 +153,16 @@ jobs:
     needs: changes
     if: needs.changes.outputs.observability == 'true'
     runs-on: ubuntu-latest
+    # Bounds a hung docker pull/daemon to fail fast instead of running to
+    # GitHub's 6h default cap. Budget: checkout + version report (seconds) +
+    # cold pull of 3 images with no layer cache (usually well under a
+    # couple of minutes on a GitHub-hosted runner's network, but not
+    # bounded by this workflow) + the 90s --wait-timeout below + the 20s
+    # grafana-readiness retry loop + status/log/teardown steps (seconds
+    # each). 15 minutes leaves generous headroom over the ~3-4 minutes this
+    # job normally takes end-to-end for a slow registry pull, while still
+    # failing well short of the 6h default if the daemon itself hangs.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
