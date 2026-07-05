@@ -292,10 +292,16 @@ condition, not independent paths)
   bead.
 - All three reviewers are dispatched together every round regardless of their
   descriptions' "Use when" clauses — those are non-exhaustive prioritization
-  hints, not a filter this flow applies. `quality-reviewer` runs on sonnet with
-  a deliberately broad trigger (fires on nearly every diff); whether that cost
-  is warranted vs. a cheaper model or scope-based selective dispatch is an open
-  question tracked in claude-58k, not something to route around here.
+  hints, not a filter this flow applies. This is a deliberate, resolved
+  decision (claude-58k), not an open gap: a scope-based pre-filter risks
+  silently dropping a reviewer on exactly the diff it would have caught
+  something in — the failure mode claude-1d1 guards against — to save at most
+  two sonnet-tier calls per round (security and/or performance, on a diff that
+  triggers neither; quality-reviewer's own trigger is broad enough that a
+  filter would rarely catch it). `quality-reviewer` runs on sonnet at parity
+  with `security-reviewer`/`performance-reviewer`: judging correctness and
+  concurrency across arbitrary languages needs comparable reasoning depth, not
+  a leftover default from an earlier haiku setting.
 - This consumes the specialists' raw structured findings directly — it does not
   invoke the human-facing `/review` formatting, which is for a person reading a
   review, not an agent reacting to one.

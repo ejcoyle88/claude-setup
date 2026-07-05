@@ -51,9 +51,17 @@ Note: fan-out here always dispatches all three reviewers together — it does no
 select individual reviewers by matching their descriptions' "Use when" clauses.
 Those clauses are prioritization hints for a reviewer's own judgment and for any
 other dispatcher considering whether to invoke one reviewer alone; they are not
-an exhaustive filter. `quality-reviewer`'s broad trigger plus sonnet model is an
-always-on cost whose justification is an open question tracked in claude-58k,
-not a routing condition to shrink in the meantime.
+an exhaustive filter. This is a deliberate, resolved decision (claude-58k), not
+an open gap: a keyword-based pre-filter risks silently skipping a reviewer on
+exactly the diff its own description says not to skip (an auth-free IDOR, a
+quality bug with no control-flow/test footprint) — the failure mode claude-1d1
+exists to guard against — to save at most two sonnet-tier calls per round
+(security and/or performance, on a diff that triggers neither; quality-reviewer's
+own trigger is broad enough that a filter would rarely catch it).
+`quality-reviewer` runs on sonnet intentionally, at parity with its siblings:
+judging correctness and concurrency across arbitrary languages needs
+comparable reasoning depth to security/performance review, not a leftover
+default from an earlier haiku setting.
 
 ## Review dimensions (inline path)
 
