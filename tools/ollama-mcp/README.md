@@ -136,15 +136,19 @@ even to chunk:
     summarized into one final, cohesive summary — kept comparable in
     size/shape to a single-shot summary rather than growing with the chunk
     count.
-  - **`extract`**: each chunk is extracted against the same caller-supplied
-    `schema` independently, then merged: array-typed fields union across
-    chunks (duplicates removed, first-occurrence order kept); object-typed
-    fields merge recursively field-by-field; every other (scalar) field
-    takes the first chunk with a non-null value. See
-    `mergeExtractedChunks`'s doc comment in `src/index.ts` for the full
-    policy and a known limitation (a `required` field's real value may only
-    live in one chunk, and a small model may hallucinate a placeholder for
-    the others rather than fail validation).
+  - **`extract`**: each chunk is extracted against the caller-supplied
+    `schema` independently -- with its `required` array relaxed for these
+    per-chunk calls specifically (bead claude-d8u), since a required field's
+    real value may live in only one chunk and enforcing `required` on every
+    chunk invited a small model to hallucinate a placeholder on the chunks
+    that genuinely lack that data -- then merged: array-typed fields union
+    across chunks (duplicates removed, first-occurrence order kept);
+    object-typed fields merge recursively field-by-field; every other
+    (scalar) field takes the first chunk with a non-null value. The merged
+    result is then validated against the caller's *original* `schema`
+    (`required` intact), so the tool still errors if no chunk ever actually
+    supplied a required field's data. See `mergeExtractedChunks`'s and
+    `extractContent`'s doc comments in `src/index.ts` for the full policy.
   - **`classify`**: unlike the other two, this does *not* run every chunk
     through the model — a single classification label is usually
     well-determined by a representative sample, so this samples up to 3
@@ -879,14 +883,6 @@ Left open by that bead:
   on every opted-in live-test run for behavior the mocked tests already
   cover at the orchestration level. Worth adding if a live sidecar becomes
   more routinely available in this repo's CI/dev environment.
-- **`extract`'s per-chunk `required` fields.** Each chunk is extracted
-  against the caller's exact `schema`, `required` fields included, even
-  though a required field's real value may live in only one chunk — on the
-  others, a small model may hallucinate a placeholder to satisfy the
-  constraint rather than fail validation, and the current "first non-null
-  wins" merge policy can't distinguish a real value from a hallucinated one.
-  A follow-up could relax `required` for the per-chunk map calls (validating
-  it only against the final merged result instead).
 - **No empirical latency data for a chunked call.** `MAX_CHUNK_COUNT` (6) is
   sized from the same CPU-only-sidecar per-call latency estimate
   (`benchmark-concurrency.mjs`) claude-lp5 used for the unchunked worst case,

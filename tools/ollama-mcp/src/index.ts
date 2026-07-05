@@ -30,7 +30,7 @@ import {
   type ProgressNotifier,
   withPeriodicProgress,
 } from "./progress.js";
-import { type JsonSchema, parseAndValidateJson } from "./validate.js";
+import { type JsonSchema, parseAndValidateJson, validateAgainstSchema } from "./validate.js";
 
 /** The `extra` argument every `server.registerTool` handler callback
  * receives as its second parameter (per `@modelcontextprotocol/sdk/server/
@@ -2314,15 +2314,19 @@ const MAX_MERGE_DEPTH = 20;
  *   as `parseAndValidateJson`'s existing validation already tolerates for
  *   any non-required field.
  *
- * Known limitation (not fixed by this bead -- see the final report's
- * follow-ups): each chunk is extracted against the *exact same* `schema`,
- * `required` fields included, even though a required field's real value may
- * only actually appear in one chunk -- on the other chunks, a small model
- * may hallucinate a placeholder value to satisfy the constraint rather than
- * fail validation. This merge policy's "first non-null wins" rule doesn't
- * distinguish a real value from a hallucinated placeholder, so an unlucky
- * chunk ordering can occasionally let a placeholder win over a later chunk's
- * real value.
+ * `required` fields (bead claude-d8u): a required field's real value may only
+ * actually appear in one chunk, so `extractContent`'s per-chunk map calls
+ * deliberately extract each chunk against a *relaxed* variant of `schema`
+ * with `required` stripped (see `withoutRequiredForChunkMap`) -- a chunk
+ * that genuinely lacks a required field's data simply omits it rather than
+ * a small model hallucinating a placeholder value to satisfy the
+ * constraint. This merge policy's "first non-null wins" rule then has only
+ * genuine (or absent) per-chunk values to choose between, never a
+ * hallucinated placeholder. The caller's original `schema`, `required`
+ * fields included, is still enforced once -- against the final merged
+ * result returned by this function -- so the tool's overall contract (a
+ * result satisfying the caller's required fields, once real data across all
+ * chunks is combined) is unchanged; see `extractContent`'s doc comment.
  */
 export function mergeExtractedChunks(
   schema: JsonSchema,
@@ -2424,12 +2428,24 @@ type ExtractOutcome =
 /**
  * `extract`'s map-reduce pipeline (bead claude-xg9): content that fits in one
  * chunk is extracted with a single `generateStructured` call, exactly as
- * before this bead. Longer content is mapped -- `schema` extracted
- * independently from each chunk, in order, with a note telling the model
- * it's looking at one part of a larger file and to only extract what's
- * actually present in that part -- then reduced via `mergeExtractedChunks`
- * (see its doc comment for the merge policy and a known limitation around
- * `required` fields).
+ * before this bead -- `schema`, `required` fields included, is enforced on
+ * that one call same as always. Longer content is mapped -- each chunk
+ * extracted independently, in order, with a note telling the model it's
+ * looking at one part of a larger file and to only extract what's actually
+ * present in that part -- then reduced via `mergeExtractedChunks`.
+ *
+ * Per-chunk map calls use `withoutRequiredForChunkMap(schema)`, not `schema`
+ * itself (bead claude-d8u): a required field's real value may live in only
+ * one chunk, so forcing every chunk's call to satisfy `required` invited a
+ * small model to hallucinate a placeholder on the chunks that genuinely
+ * lack that data -- see `mergeExtractedChunks`'s doc comment for how that
+ * placeholder could then win the merge over a later chunk's real value.
+ * Once every chunk's result is merged, the combined result is validated
+ * against the caller's *original* `schema` (`required` intact) -- so the
+ * tool's overall contract is unchanged: the caller still gets an error
+ * (rather than a partial result) if no chunk ever actually supplied a
+ * required field's data, but a chunk that simply doesn't cover that field
+ * is no longer pressured to fabricate one.
  *
  * `fetchImpl`/`lockOptions`/`delayFn` are threaded through purely for test
  * injection, same as `summarizeContent`'s (`delayFn` controls the pause
@@ -2461,6 +2477,7 @@ export async function extractContent(
     return { ok: true, data: generated.value, chunked: false, chunkCount: 1 };
   }
 
+  const chunkSchema = withoutRequiredForChunkMap(schema);
   const perChunk: Array<Record<string, unknown>> = [];
   for (let i = 0; i < chunks.length; i++) {
     const partNote =
@@ -2468,7 +2485,7 @@ export async function extractContent(
       "actually present in this part.";
     const generated = await generateStructuredWithLockBusyRetry(
       buildExtractPrompt(chunks[i]!, partNote),
-      schema,
+      chunkSchema,
       notify,
       signal,
       fetchImpl,
@@ -2481,7 +2498,34 @@ export async function extractContent(
     perChunk.push(generated.value);
   }
 
-  return { ok: true, data: mergeExtractedChunks(schema, perChunk), chunked: true, chunkCount: chunks.length };
+  const merged = mergeExtractedChunks(schema, perChunk);
+  // Per-chunk calls above were validated only against `chunkSchema`
+  // (`required` stripped), so unlike the single-chunk branch above, nothing
+  // has yet confirmed the caller's actual required fields are present --
+  // check that once, here, against the real merged result (bead claude-d8u).
+  const mergedValidation = validateAgainstSchema(schema, merged);
+  if (!mergedValidation.ok) {
+    return {
+      ok: false,
+      error: `merged result across all ${chunks.length} chunks did not satisfy the required schema (${mergedValidation.error})`,
+    };
+  }
+  return { ok: true, data: merged, chunked: true, chunkCount: chunks.length };
+}
+
+/**
+ * Returns a shallow copy of `schema` with its top-level `required` array
+ * omitted, for `extractContent`'s per-chunk map calls (bead claude-d8u) --
+ * never mutates `schema` itself, which the caller still needs afterward to
+ * validate the final merged result (see `extractContent`'s doc comment).
+ * Only the top-level `required` is stripped: the schemas this tool actually
+ * sees are flat-ish and one level deep (see `validate.ts`'s header comment),
+ * so a nested `properties[...].required` isn't a case this bead's fix needs
+ * to cover.
+ */
+function withoutRequiredForChunkMap(schema: JsonSchema): JsonSchema {
+  const { required: _required, ...rest } = schema;
+  return rest;
 }
 
 function buildClassifyPrompt(content: string, labels: string[], partNote?: string): string {

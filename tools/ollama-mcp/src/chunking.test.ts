@@ -71,23 +71,29 @@ async function writeLockFile(lockPath: string, acquiredAt: number = Date.now()):
  * generate.test.ts's `fakeFetchResolving`), so a test can script a distinct
  * model response per chunk/reduce call and assert on call order/count.
  * Also records every outbound request's `prompt` (parsed from the request
- * body) in `prompts`, in call order, so a test can inspect exactly what was
- * sent to Ollama for a given call (e.g. the reduce step's prompt). */
+ * body) in `prompts`, and the exact `format` (the structured-output schema
+ * sent to Ollama) in `formats`, in call order, so a test can inspect exactly
+ * what was sent to Ollama for a given call (e.g. the reduce step's prompt,
+ * or whether a per-chunk map call's `format` still carries `required` --
+ * bead claude-d8u). */
 function fakeFetchSequence(responses: string[]): {
   fetchImpl: typeof fetch;
   callCount: { count: number };
   prompts: string[];
+  formats: unknown[];
 } {
   const callCount = { count: 0 };
   const prompts: string[] = [];
+  const formats: unknown[] = [];
   const queue = [...responses];
   const fetchImpl = (async (_url: string, init?: RequestInit) => {
     const text = queue.shift();
     assert.ok(text !== undefined, `fakeFetchSequence: more calls made (${callCount.count + 1}) than responses queued (${responses.length})`);
     callCount.count++;
     if (typeof init?.body === "string") {
-      const parsed = JSON.parse(init.body) as { prompt?: unknown };
+      const parsed = JSON.parse(init.body) as { prompt?: unknown; format?: unknown };
       prompts.push(typeof parsed.prompt === "string" ? parsed.prompt : "");
+      formats.push(parsed.format);
     }
     return {
       ok: true,
@@ -97,7 +103,7 @@ function fakeFetchSequence(responses: string[]): {
       text: async () => "",
     } as unknown as Response;
   }) as typeof fetch;
-  return { fetchImpl, callCount, prompts };
+  return { fetchImpl, callCount, prompts, formats };
 }
 
 // --- splitIntoChunks --------------------------------------------------
@@ -420,6 +426,73 @@ test("extractContent: oversized content is mapped per chunk then merged (array u
     assert.deepEqual(outcome.data.tags, ["a", "b", "c"], "array fields union in chunk order with duplicates removed");
     assert.equal(outcome.data.title, "Title From Chunk 1", "the first chunk with a non-null scalar value wins");
   }
+});
+
+test("extractContent: a required field missing from one chunk's data does not force that chunk to hallucinate, and a later chunk's real value survives the merge", async () => {
+  const lockPath = await scratchLockPath();
+  const content = "a".repeat(MAX_INPUT_CHARS + 500); // 2 chunks
+  const requiredTotalPriceSchema: JsonSchema = {
+    type: "object",
+    properties: {
+      title: { type: "string" },
+      total_price: { type: "number" },
+    },
+    required: ["total_price"],
+  };
+  const { fetchImpl, callCount, formats } = fakeFetchSequence([
+    // Chunk 1's excerpt never mentions the total -- omits the schema's
+    // `required` field entirely, which would fail validation if the
+    // per-chunk map call still enforced `required` (the bug this bead
+    // fixes).
+    JSON.stringify({ title: "Invoice" }),
+    // Chunk 2's excerpt is where the real total actually lives.
+    JSON.stringify({ total_price: 42 }),
+  ]);
+
+  const outcome = await extractContent(content, requiredTotalPriceSchema, undefined, undefined, fetchImpl, {
+    lockPath,
+  });
+
+  assert.equal(callCount.count, 2, "extract's merge step is local, not an extra generate call");
+  for (const format of formats) {
+    assert.ok(
+      typeof format === "object" && format !== null && !("required" in format),
+      "per-chunk map calls must not send `required` as part of the structured-output format",
+    );
+  }
+  assert.deepEqual(outcome, {
+    ok: true,
+    data: { title: "Invoice", total_price: 42 },
+    chunked: true,
+    chunkCount: 2,
+  });
+});
+
+test("extractContent: the final merged result is still validated against the caller's full schema, erroring if no chunk ever supplied a required field's value", async () => {
+  const lockPath = await scratchLockPath();
+  const content = "a".repeat(MAX_INPUT_CHARS + 500); // 2 chunks
+  const requiredTotalPriceSchema: JsonSchema = {
+    type: "object",
+    properties: {
+      title: { type: "string" },
+      total_price: { type: "number" },
+    },
+    required: ["total_price"],
+  };
+  const { fetchImpl } = fakeFetchSequence([
+    // Neither chunk's excerpt ever mentions the total -- the merged result
+    // genuinely lacks the required field's data, which should still be
+    // reported as an error rather than silently returned.
+    JSON.stringify({ title: "Invoice part 1" }),
+    JSON.stringify({ title: "Invoice part 2" }),
+  ]);
+
+  const outcome = await extractContent(content, requiredTotalPriceSchema, undefined, undefined, fetchImpl, {
+    lockPath,
+  });
+
+  assert.equal(outcome.ok, false);
+  assert.match(!outcome.ok ? outcome.error : "", /total_price/);
 });
 
 test("mergeExtractedChunks: nested object fields are merged recursively per sub-field", () => {
