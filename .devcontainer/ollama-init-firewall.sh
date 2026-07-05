@@ -58,6 +58,7 @@
 set -euo pipefail
 IFS=$'\n\t'
 
+# shellcheck source=firewall-common.sh
 source /usr/local/bin/firewall-common.sh
 
 readonly IPSET_NAME="ollama-allowed-domains"

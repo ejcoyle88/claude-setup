@@ -39,20 +39,30 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # -S error only: a repo-wide run at the default `style` severity turned
-      # up a long tail of pre-existing warning/info/style findings (e.g.
-      # SC2155 in install.sh, SC2221/SC2222 in scripts/git-ro.sh, several
-      # SC2086/SC2016/SC2317 spots in tools/run-overnight.sh and
-      # tests/test_run_overnight.sh) that predate this gate and aren't fixed
-      # as part of claude-4qd. Starting at `error` keeps this job green today
-      # while still catching genuinely broken scripts, rather than adding a
-      # gate that's red on day one and gets ignored or disabled. Tracked by
-      # claude-vr8: fix the existing findings and raise this to `warning`.
+      # claude-vr8: the repo-wide pre-existing findings that justified
+      # starting this gate at `-S error` (SC2155 in install.sh, SC2221/SC2222
+      # in scripts/git-ro.sh, SC2086/SC2016/SC2181 in tools/run-overnight.sh,
+      # SC2317 in tests/test_run_overnight.sh's curl-stub helpers, SC1091 in
+      # .devcontainer/*.sh) are now fixed or covered by a narrowly-scoped
+      # inline `# shellcheck disable=` with a rationale comment. No `-S`
+      # (full default `style` severity) so the gate actually catches this
+      # class of issue going forward instead of only catching outright
+      # errors.
+      #
+      # -x -P SCRIPTDIR: .devcontainer/*.sh source shared helpers
+      # (firewall-common.sh, setpriv-drop-args.sh) from their /usr/local/bin
+      # install location (see each Dockerfile's COPY), not a path shellcheck
+      # can follow as-is from a repo checkout. `-x` allows following `source`
+      # targets outside the given file list; `-P SCRIPTDIR` (combined with
+      # each source line's `# shellcheck source=<file>` directive, resolved
+      # relative to the sourcing script's own directory) points shellcheck at
+      # the real, repo-checked-in copy instead of leaving this as SC1091
+      # path-resolution noise or a per-line disable.
       - name: Run shellcheck
         shell: bash
         run: |
           find . -type f -name '*.sh' -not -path './.git/*' -print0 \
-            | xargs -0 shellcheck -S error
+            | xargs -0 shellcheck -x -P SCRIPTDIR
 
   overnight-tests:
     # Linux-only: this test sources tools/run-overnight.sh (which shells out to

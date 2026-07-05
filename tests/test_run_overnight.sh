@@ -639,10 +639,13 @@ YAML
   # returns an empty Prometheus result vector for the config-drift query
   # (simulating "vanished"), and fails everything else (the /-/healthy probe)
   # since this test isn't exercising that path.
-  # shellcheck disable=SC2329  # it IS invoked — indirectly, by
+  # shellcheck disable=SC2317,SC2329  # it IS invoked — indirectly, by
   # check_telemetry_health() calling the bare `curl` command below, which
   # this function definition shadows; shellcheck can't see that dynamic
-  # dispatch statically.
+  # dispatch statically. The disable directive on a function definition
+  # covers the whole body, so this also silences the per-statement SC2317
+  # "unreachable" findings shellcheck would otherwise raise on every line
+  # inside (same false-positive cause: no static call site).
   curl() {
     local arg query=""
     for arg in "$@"; do
@@ -691,8 +694,10 @@ YAML
   local query_log="$TMPDIR_TEST/curl-queries-b.log"
   : > "$query_log"
 
-  # shellcheck disable=SC2329  # see the identical note on the other test's
-  # curl() shadow above — invoked indirectly via check_telemetry_health().
+  # shellcheck disable=SC2317,SC2329  # see the identical note on the other
+  # test's curl() shadow above — invoked indirectly via
+  # check_telemetry_health(); SC2317 covers the per-statement "unreachable"
+  # findings inside this function body for the same reason.
   curl() {
     # Should never be reached for the config-drift probe in this scenario —
     # if it is, this records it so the assertion below catches the regression.
@@ -744,10 +749,11 @@ YAML
 # or miswires the Loki branch fails CI instead of going unnoticed.
 
 test_check_telemetry_health_loki_ready_ok() {
-  # shellcheck disable=SC2329  # it IS invoked — indirectly, by
+  # shellcheck disable=SC2317,SC2329  # it IS invoked — indirectly, by
   # check_telemetry_health() calling the bare `curl` command, which this
   # function definition shadows; shellcheck can't see that dynamic dispatch
-  # statically.
+  # statically. SC2317 covers the per-statement "unreachable" findings inside
+  # this function body for the same reason.
   curl() {
     local arg
     for arg in "$@"; do
@@ -771,9 +777,10 @@ test_check_telemetry_health_loki_ready_ok() {
 }
 
 test_check_telemetry_health_loki_ready_down() {
-  # shellcheck disable=SC2329  # see the identical note on the previous
-  # test's curl() shadow above — invoked indirectly via
-  # check_telemetry_health().
+  # shellcheck disable=SC2317,SC2329  # see the identical note on the
+  # previous test's curl() shadow above — invoked indirectly via
+  # check_telemetry_health(); SC2317 covers the per-statement "unreachable"
+  # findings inside this function body for the same reason.
   curl() {
     local arg
     for arg in "$@"; do

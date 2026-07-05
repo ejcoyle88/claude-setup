@@ -109,11 +109,17 @@ for arg in "$@"; do
         --first-parent | --merges | --no-merges | --reverse | --no-walk | --no-walk=* | \
         --date=* | --since=* | --after=* | --until=* | --before=* | \
         --author=* | --committer=* | --grep=* | -i | -E | --regexp-ignore-case | \
-        --follow | --no-patch)
+        --follow)
+            # --no-patch is already matched by the output/patch-format group
+            # above (line ~80); listing it again here would be unreachable
+            # dead code (SC2222) since case falls through on first match.
             ;;
 
         # --- status / rev-parse display options (no file I/O) ---
-        --short | --porcelain | --porcelain=* | --branch | --no-renames | \
+        # --no-renames is already matched by the rename/copy-detection group
+        # above (line ~96); listing it again here would be unreachable dead
+        # code (SC2222) since case falls through on first match.
+        --short | --porcelain | --porcelain=* | --branch | \
         --verify | --quiet | -q | --abbrev-ref | --abbrev-ref=* | \
         --symbolic | --symbolic-full-name | --show-toplevel | \
         --is-inside-work-tree | --is-bare-repository | --show-prefix)

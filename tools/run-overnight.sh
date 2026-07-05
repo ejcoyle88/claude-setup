@@ -804,6 +804,9 @@ check_telemetry_health() {
     # here has no `health_check` extension configured, so there's no HTTP
     # health surface to probe instead -- this raw TCP connect is the only
     # option without adding a probe extension to the collector image.
+    # shellcheck disable=SC2016  # single quotes are intentional: $1/$2 are
+    # this bash -c subprocess's own positional params (see comment above),
+    # not meant to expand in the parent shell.
     if timeout 5 bash -c 'exec 3<>"/dev/tcp/$1/$2"' _ "$otlp_host" "$otlp_port" 2>/dev/null; then
       log "Telemetry health: otel-collector OTLP port ($otlp_host:$otlp_port) accepting connections."
     else
@@ -1454,9 +1457,9 @@ run_worker() { # run_worker <index> <workdir>
     spent="$(python3 -c "print(round($spent + $cost, 4))")"
     wlog "$wsum" "  exit=$status result=$rstate cost=\$$cost turns=$turns session=$session"
 
-    if [ $status -ne 0 ] || [ "$rstate" != "ok" ]; then
+    if [ "$status" -ne 0 ] || [ "$rstate" != "ok" ]; then
       consec=$((consec + 1))
-      [ $status -eq 124 ] && wlog "$wsum" "  TIMED OUT after $RUN_TIMEOUT."
+      [ "$status" -eq 124 ] && wlog "$wsum" "  TIMED OUT after $RUN_TIMEOUT."
       wlog "$wsum" "  Failure ($consec consecutive)."
       case "$PERMISSION_FLAGS" in *auto*)
         wlog "$wsum" "  (auto mode: headless classifier escalation terminates the run — if failures recur, inspect $ilog for denial messages)";;
@@ -1558,7 +1561,12 @@ fi
 # needs v2.1.83+, a Team/Enterprise plan, and the Anthropic API provider.
 if [ "${SKIP_PREFLIGHT:-0}" != "1" ]; then
   log "Preflight: probing claude with current permission flags..."
-  if ( cd "$PROJECT_DIR" && timeout 5m claude -p "Reply with exactly: OK" $PERMISSION_FLAGS --max-turns 1 ) >"$LOG_DIR/preflight.log" 2>&1; then
+  # $PERMISSION_FLAGS is deliberately word-split into an array (same idiom as
+  # perm_flags above) since it may hold multiple flags.
+  preflight_perm_flags=()
+  # shellcheck disable=SC2206  # intentional word-splitting, see above
+  preflight_perm_flags=($PERMISSION_FLAGS)
+  if ( cd "$PROJECT_DIR" && timeout 5m claude -p "Reply with exactly: OK" "${preflight_perm_flags[@]}" --max-turns 1 ) >"$LOG_DIR/preflight.log" 2>&1; then
     log "Preflight OK."
   else
     log "Preflight FAILED — see $LOG_DIR/preflight.log. If using auto mode, check plan/version/API-provider requirements, or override with PERMISSION_FLAGS='--dangerously-skip-permissions' (container advised). Aborting before the loop."
@@ -1638,6 +1646,9 @@ else
     # _OVERNIGHT_WORKER_PROJECT_DIR instead of consulting `$1` at all (see
     # PROJECT_DIR's docstring).
     worker_pgid=""
+    # shellcheck disable=SC2016  # single quotes are intentional: $1/$2/$3
+    # are this bash -c subprocess's own positional params (see comment
+    # above), not meant to expand in the parent shell.
     run_worker_in_pgroup worker_pgid \
       bash -c 'source "$1"; trap _overnight_worker_term_handler TERM; run_worker "$2" "$3"' \
       "run-overnight-worker-w$w" "$SELF_PATH" "$w" "$WT"
@@ -1701,13 +1712,17 @@ elif [ "$ANALYZE_TELEMETRY" = "1" ]; then
   elif [ "${completed_total:-0}" -gt 0 ]; then
     log "Analyzing telemetry for run $RUN_ID ($completed_total iteration(s) completed)..."
     ANALYZE_LOG="$LOG_DIR/analyze-telemetry.log"
-    ( cd "$PROJECT_DIR" && \
+    # $PERMISSION_FLAGS is deliberately word-split into an array (same idiom
+    # as perm_flags above) since it may hold multiple flags.
+    analyze_perm_flags=()
+    # shellcheck disable=SC2206  # intentional word-splitting, see above
+    analyze_perm_flags=($PERMISSION_FLAGS)
+    if ( cd "$PROJECT_DIR" && \
       PROM_URL="${PROM_URL:-http://prometheus:9090}" LOKI_URL="${LOKI_URL:-http://loki:3100}" \
       OTEL_RESOURCE_ATTRIBUTES="service.name=overnight-analyzer,run.id=$RUN_ID" \
       timeout "$ANALYZE_TIMEOUT" claude -p "/analyze-telemetry $RUN_ID" \
-        $PERMISSION_FLAGS --output-format stream-json --verbose --max-turns "$ANALYZE_MAX_TURNS" \
-    ) >"$ANALYZE_LOG" 2>&1
-    if [ $? -eq 0 ]; then
+        "${analyze_perm_flags[@]}" --output-format stream-json --verbose --max-turns "$ANALYZE_MAX_TURNS" \
+    ) >"$ANALYZE_LOG" 2>&1; then
       log "Telemetry analysis done. Filed beads: bd list --label token-efficiency"
       analyze_parsed="$(parse_result "$ANALYZE_LOG" "$ANALYZE_LOG.result.txt")"
       IFS='|' read -r _ analyze_cost _ _ <<< "$analyze_parsed"

@@ -11,6 +11,7 @@
 set -euo pipefail  # Exit on error, undefined vars, and pipeline failures
 IFS=$'\n\t'       # Stricter word splitting
 
+# shellcheck source=firewall-common.sh
 source /usr/local/bin/firewall-common.sh
 
 readonly IPSET_NAME="allowed-domains"
