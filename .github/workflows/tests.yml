@@ -17,9 +17,16 @@ permissions:
 # Cancel a superseded run on the same ref (e.g. a new push to the same PR)
 # instead of letting it run to completion -- observability-smoke-tests alone
 # pays for a cold image pull + container bring-up, so a stale run finishing
-# after it's already moot is pure wasted cost.
+# after it's already moot is pure wasted cost. Scoped so this only ever
+# cancels same-ref runs: on pull_request the group key is github.ref (the PR
+# branch), so a new push to that branch cancels the previous run for it; on
+# push (this workflow's other trigger, main only) the group key is
+# github.sha instead, which is unique per commit, so two merges landing on
+# main close together can never collide and cancel each other -- every
+# push-to-main run always completes and leaves a real pass/fail status on
+# its commit (claude-5ah).
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
   cancel-in-progress: true
 
 jobs:
