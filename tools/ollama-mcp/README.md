@@ -875,16 +875,18 @@ sample-and-vote for `classify`) was tracked as `claude-xg9` and is now built
 — see [Chunking for oversized files](#chunking-for-oversized-files) above.
 Left open by that bead:
 
-- **No live-sidecar coverage of a chunked call.** `src/chunking.test.ts`
-  covers the chunk-splitting logic and the map-reduce/merge/vote policies
-  against a mocked `fetchImpl`, matching this repo's existing
-  `generate.test.ts`/`glob.test.ts` conventions, but there's no live e2e test
-  (mirroring `live-e2e.test.ts`'s single-call pattern) exercising an actual
-  multi-chunk call against a real Ollama sidecar — a chunked call is several
-  minutes of real inference latency per run, which didn't seem worth paying
-  on every opted-in live-test run for behavior the mocked tests already
-  cover at the orchestration level. Worth adding if a live sidecar becomes
-  more routinely available in this repo's CI/dev environment.
+- **No live-sidecar coverage of a chunked call.** Tracked as `claude-do1` and
+  now built: `src/live-e2e.test.ts` has a second, `RUN_LIVE_OLLAMA_TESTS=1`-
+  gated test that runs a genuine 2-chunk `extract` map-reduce call against a
+  real Ollama sidecar (a generated-on-the-fly fixture just over
+  `MAX_INPUT_CHARS`, with one verbatim fact planted in each chunk, asserting
+  both facts survive the merge) — alongside the original single-call
+  `extract` test, `src/chunking.test.ts`'s existing mocked-`fetchImpl`
+  coverage of chunk-splitting and the map-reduce/merge/vote policies. Kept to
+  2 chunks (extract's chunked path pays no separate reduce call, unlike
+  `summarize_file`) rather than `MAX_CHUNK_COUNT`'s full 6, to keep a single
+  opted-in run's real-inference cost well under the documented "~7x90s+7x5s
+  ~11min worst case" for the full 6-chunk case.
 - **No empirical latency data for a chunked call.** `MAX_CHUNK_COUNT` (6) is
   sized from the same CPU-only-sidecar per-call latency estimate
   (`benchmark-concurrency.mjs`) claude-lp5 used for the unchunked worst case,

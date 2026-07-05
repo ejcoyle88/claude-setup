@@ -1,68 +1,74 @@
 /**
- * Live end-to-end test for an offload tool (`extract`) against a real,
- * reachable Ollama sidecar (bead claude-9sm, flagged as out of scope in
+ * Live end-to-end tests for the offload tools against a real, reachable
+ * Ollama sidecar (bead claude-9sm, flagged as out of scope in
  * health.test.ts's file header when this repo's sandbox had no live
  * sidecar). Unlike health.test.ts and lock.test.ts, which substitute a fake
- * `fetch`/pid to exercise index.ts's own functions in isolation, this test
- * makes NO substitution at all: it spawns the actual built `dist/index.js`
+ * `fetch`/pid to exercise index.ts's own functions in isolation, these tests
+ * make NO substitution at all: each spawns the actual built `dist/index.js`
  * entry point as a real child process -- the same way this repo's own
  * `.mcp.json` launches it -- connects a real `@modelcontextprotocol/sdk`
- * `Client` over a real stdio transport, and calls the `extract` tool
- * exactly as a caller would: MCP protocol -> tool handler -> real file read
- * (a small fixture under `test-fixtures/`) -> a real `callOllamaGenerate`
- * HTTP call to the live sidecar at OLLAMA_HOST -> real JSON parsing/schema
- * validation of the model's actual response (`parseAndValidateJson` inside
- * `generateStructured`) -> the compact `{ data, truncated }` result that
- * crosses back over the protocol to this test, which independently
+ * `Client` over a real stdio transport, and calls a tool exactly as a
+ * caller would: MCP protocol -> tool handler -> real file read -> a real
+ * `callOllamaGenerate` HTTP call to the live sidecar at OLLAMA_HOST -> real
+ * JSON parsing/schema validation of the model's actual response
+ * (`parseAndValidateJson` inside `generateStructured`) -> the compact result
+ * that crosses back over the protocol to this test, which independently
  * re-validates it against the schema via the exported
  * `validateAgainstSchema` rather than only trusting the server's own
  * internal check.
  *
  * Gated behind an explicit opt-in env var, `RUN_LIVE_OLLAMA_TESTS=1` --
- * without it, this test is skipped unconditionally, regardless of whether a
- * sidecar happens to be reachable. This suite's other ~41 tests run against
- * fakes/mocks in well under a second; this one test pays real inference
- * latency (tens of seconds to ~2 minutes, see LIVE_CALL_TIMEOUT_MS's doc
- * comment below) against a live, non-deterministic model, so it must never
- * run as a silent side effect of a normal `npm test` (`tsc && node --test
- * dist`) just because a sidecar happens to be reachable -- including in this
- * dev sandbox, where that's true every day. Set `RUN_LIVE_OLLAMA_TESTS=1` to
- * opt in.
+ * without it, every test in this file is skipped unconditionally, regardless
+ * of whether a sidecar happens to be reachable. This suite's other ~41 tests
+ * run against fakes/mocks in well under a second; these tests pay real
+ * inference latency (tens of seconds to several minutes, see
+ * `LIVE_CALL_TIMEOUT_MS`/`CHUNKED_LIVE_CALL_TIMEOUT_MS`'s doc comments below)
+ * against a live, non-deterministic model, so they must never run as a
+ * silent side effect of a normal `npm test` (`tsc && node --test dist`) just
+ * because a sidecar happens to be reachable -- including in this dev
+ * sandbox, where that's true every day. Set `RUN_LIVE_OLLAMA_TESTS=1` to opt
+ * in.
  *
  * Once opted in, reachability is still checked via the already-exported
  * `checkOllamaHealth` (the same reachability probe the `health` tool itself
  * uses) as a secondary safety net, not the sole gate: if the sidecar isn't
  * actually reachable (e.g. opted in locally but the sidecar is temporarily
  * down, or a future CI environment sets the env var without a live sidecar),
- * the test is skipped with a clear, distinct reason via `node:test`'s `skip`
- * option instead of failing opaquely deep inside a spawned child process.
+ * every test below is skipped with a clear, distinct reason via
+ * `node:test`'s `skip` option instead of failing opaquely deep inside a
+ * spawned child process.
  *
  * The live model's phrasing/exact values are not deterministic in general,
  * so assertions are primarily on shape (a schema-valid object; non-empty
- * strings) rather than exact wording -- except `version`, which is a
- * verbatim copy-out of a literal substring in the fixture (not a
- * summarization/paraphrase task), which a competent small model reproduces
- * reliably and is worth pinning as a stronger signal that extraction (not
- * just "the model returned *some* valid JSON") actually worked.
+ * strings) rather than exact wording -- except for verbatim-copy-out
+ * substrings planted in each fixture (not a summarization/paraphrase task),
+ * which a competent small model reproduces reliably and are worth pinning as
+ * a stronger signal that extraction (not just "the model returned *some*
+ * valid JSON") actually worked.
  *
- * Runs within a budget generously above this module's own GENERATE_TIMEOUT_MS
- * (60s) plus its possible ~30s RETRY_TIMEOUT_MS retry (see
- * `generateStructured`'s doc comment in index.ts) -- LIVE_CALL_TIMEOUT_MS
- * below adds headroom for spawning the child process and completing MCP
- * initialize on top of that combined ~90s worst case, rather than assuming
- * its own conflicting budget.
+ * The single-shot `extract` test below runs within a budget generously above
+ * this module's own GENERATE_TIMEOUT_MS (60s) plus its possible ~30s
+ * RETRY_TIMEOUT_MS retry (see `generateStructured`'s doc comment in
+ * index.ts) -- LIVE_CALL_TIMEOUT_MS below adds headroom for spawning the
+ * child process and completing MCP initialize on top of that combined ~90s
+ * worst case, rather than assuming its own conflicting budget. The chunked
+ * `extract` test (bead claude-do1, covering the map-reduce chunking
+ * `summarize_file`/`extract`/`classify` added by claude-xg9 -- see
+ * `CHUNKED_LIVE_CALL_TIMEOUT_MS`'s doc comment) budgets for multiple
+ * sequential generate calls instead of one.
  */
 import assert from "node:assert/strict";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
+import { unlink, writeFile } from "node:fs/promises";
 import { test, type TestContext } from "node:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { CallToolResultSchema, type CallToolResult } from "@modelcontextprotocol/sdk/types.js";
-import { checkOllamaHealth } from "./index.js";
+import { checkOllamaHealth, MAX_INPUT_CHARS } from "./index.js";
 import { validateAgainstSchema, type JsonSchema } from "./validate.js";
 
-/** Generous ceiling for the one live `extract` call this file makes: this
+/** Generous ceiling for the single-shot live `extract` call below: this
  * module's own GENERATE_TIMEOUT_MS (60s) plus a possible RETRY_TIMEOUT_MS
  * retry (~30s) plus headroom for spawning the child process and completing
  * MCP initialize. GENERATE_TIMEOUT_MS/RETRY_TIMEOUT_MS aren't (and don't
@@ -70,6 +76,21 @@ import { validateAgainstSchema, type JsonSchema } from "./validate.js";
  * ceiling layered on top of that budget, not a competing assumption about
  * it. */
 const LIVE_CALL_TIMEOUT_MS = 120_000;
+
+/** Generous ceiling for the chunked live `extract` call below (bead
+ * claude-do1): that test's fixture is sized for exactly 2 chunks (see
+ * `buildChunkedExtractFixtureContent`'s doc comment), and `extractContent`'s
+ * chunked path pays one `generateStructuredWithLockBusyRetry` round trip per
+ * chunk with no extra reduce call (unlike `summarize_file`, see
+ * `MAX_CHUNK_COUNT`'s doc comment in index.ts for why) -- so 2 chunks worst-
+ * cases at 2 x (GENERATE_TIMEOUT_MS + RETRY_TIMEOUT_MS) = 2 x ~90s = ~180s,
+ * same combined per-call budget `LIVE_CALL_TIMEOUT_MS` above is built on.
+ * This adds the same spawn/initialize headroom on top of that, generously
+ * rounded up rather than cut close -- well under the "~7x90s+7x5s ~11min
+ * worst case" `MAX_CHUNK_COUNT`'s doc comment documents for the full
+ * 6-chunk case, since this fixture deliberately stays at 2 chunks to keep a
+ * single opted-in test run's real-inference cost bounded. */
+const CHUNKED_LIVE_CALL_TIMEOUT_MS = 240_000;
 
 const distDir = path.dirname(fileURLToPath(import.meta.url));
 const packageRoot = path.resolve(distDir, "..");
@@ -82,27 +103,38 @@ const serverEntry = path.join(distDir, "index.js");
  * large one: this test pays real inference latency/cost every run. */
 const FIXTURE_RELATIVE_PATH = "test-fixtures/product-release.txt";
 
-/** Explicit opt-in gate for this entire live e2e test -- see this file's
- * header comment for why reachability alone isn't a sufficient gate. */
+/** Relative to `packageRoot`, same confinement rationale as
+ * `FIXTURE_RELATIVE_PATH` above -- but unlike that small, checked-in
+ * fixture, this one is generated on the fly by `buildChunkedExtractFixtureContent`
+ * (written just before the chunked test runs, removed just after) rather
+ * than checked into `test-fixtures/`: its content is mostly repeated filler
+ * needed purely to clear `MAX_INPUT_CHARS`, not a meaningful fixture a future
+ * reader would want to read as-is. `.gitignore`d as a safety net in case a
+ * crashed run ever skips the cleanup step. */
+const CHUNKED_FIXTURE_RELATIVE_PATH = "test-fixtures/live-e2e-chunked-fixture.generated.txt";
+
+/** Explicit opt-in gate for every live e2e test in this file -- see this
+ * file's header comment for why reachability alone isn't a sufficient
+ * gate. */
 const RUN_LIVE_TESTS_ENV_VAR = "RUN_LIVE_OLLAMA_TESTS";
 const optedIn = process.env[RUN_LIVE_TESTS_ENV_VAR] === "1";
 
 // Reachability is checked once, up front (top-level await -- this file
 // compiles to NodeNext ESM, same as index.ts's own module-level code, which
 // supports it) -- but only once opted in, so a normal, non-opted-in test run
-// never even makes a network call here. If the sidecar isn't reachable, the
-// test below is skipped with a clear, distinct reason via `node:test`'s
-// `skip` option, rather than failing with a confusing timeout/connection
-// error deep inside a spawned child process.
+// never even makes a network call here. If the sidecar isn't reachable,
+// every test below is skipped with a clear, distinct reason via
+// `node:test`'s `skip` option, rather than failing with a confusing
+// timeout/connection error deep inside a spawned child process.
 let skipReason: string | false = optedIn
   ? false
-  : `set ${RUN_LIVE_TESTS_ENV_VAR}=1 to opt in to this live e2e test against a real Ollama sidecar -- skipped by ` +
+  : `set ${RUN_LIVE_TESTS_ENV_VAR}=1 to opt in to these live e2e tests against a real Ollama sidecar -- skipped by ` +
     "default (even when a sidecar happens to be reachable) so `npm test` stays fast and deterministic";
 
 if (optedIn) {
   const health = await checkOllamaHealth();
   if (!health.reachable) {
-    skipReason = `ollama sidecar at ${health.host} is not reachable (${health.error ?? "unknown error"}) -- skipping live e2e test`;
+    skipReason = `ollama sidecar at ${health.host} is not reachable (${health.error ?? "unknown error"}) -- skipping live e2e tests`;
   }
 }
 
@@ -284,5 +316,168 @@ test(
     // model reproduces it reliably, so this is a meaningfully stronger
     // check than shape alone without depending on the model's phrasing.
     assert.match(parsed.data.version as string, /3\.2\.0/);
+  },
+);
+
+/** Verbatim substring planted in chunk 1 only (see
+ * `buildChunkedExtractFixtureContent`'s doc comment) -- a fabricated version
+ * string, distinct from `FIXTURE_RELATIVE_PATH`'s own `3.2.0` fixture above,
+ * so a false pass can't come from the wrong fixture file somehow being read. */
+const CHUNKED_FIXTURE_VERSION = "9.7.3";
+
+/** Verbatim substring planted in chunk 2 only (see
+ * `buildChunkedExtractFixtureContent`'s doc comment). */
+const CHUNKED_FIXTURE_INCIDENT_ID = "OPS-48213";
+
+/**
+ * Builds the content for the chunked live `extract` test's fixture (bead
+ * claude-do1): a two-paragraph "status report" with two verbatim, easy-to-
+ * copy-out facts -- `CHUNKED_FIXTURE_VERSION` in an intro paragraph at the
+ * very start, and `CHUNKED_FIXTURE_INCIDENT_ID` in a closing paragraph --
+ * separated by enough repeated filler prose to push the closing paragraph
+ * well past `MAX_INPUT_CHARS` (index.ts's per-chunk size budget).
+ *
+ * The padding loop stops only once comfortably *past* `MAX_INPUT_CHARS` (by
+ * 1,000 characters, not right at the boundary), so `splitIntoChunks`'s cut
+ * at exactly `MAX_INPUT_CHARS` is guaranteed to land somewhere inside the
+ * filler -- well before the intro paragraph's end and well after the closing
+ * paragraph's start -- regardless of the exact lengths of the literal
+ * strings above. That keeps this fixture's chunk 1/chunk 2 split robust to
+ * future edits here without needing an exact character count: the total
+ * length works out to a bit over `MAX_INPUT_CHARS + 1,000` characters --
+ * comfortably under `MAX_INPUT_CHARS * 2`, so `chunkContentForMapReduce`
+ * produces exactly 2 chunks (`Math.ceil(length / MAX_INPUT_CHARS)`), not 3+ --
+ * enough to exercise the real map-reduce path without paying more than 2
+ * sequential live generate calls' worth of latency (`extract`'s chunked path
+ * has no separate reduce call, unlike `summarize_file` -- see
+ * `MAX_CHUNK_COUNT`'s doc comment in index.ts).
+ *
+ * Because `extract`'s merge policy (`mergeExtractedChunks`) takes each
+ * field's first non-null value across chunks, and each chunk is extracted
+ * independently against a `required`-relaxed schema (see
+ * `withoutRequiredForChunkMap`), a chunk that doesn't mention a field simply
+ * omits it rather than hallucinating a placeholder -- so the merged result
+ * only ends up with *both* `version` and `incidentId` if the map-reduce path
+ * genuinely ran both chunks through the model and combined their results.
+ * If chunking weren't actually happening (e.g. a regression that fell back
+ * to single-shot truncation at `MAX_INPUT_CHARS`), `incidentId` -- planted
+ * well past that boundary -- would never reach the model at all and the
+ * merged result would be missing it, giving this test a real, non-mock
+ * signal that the chunked path executed, not just "it didn't throw."
+ */
+function buildChunkedExtractFixtureContent(): string {
+  const intro =
+    `Nimbus platform engineering status report -- software version ${CHUNKED_FIXTURE_VERSION}, ` +
+    "compiled by the platform reliability team.\n\n";
+  const filler =
+    "Routine monitoring throughout the week showed stable latency and no unusual error rates across " +
+    "any region; on-call engineers report nothing further to escalate at this time. ";
+  let padded = intro;
+  while (padded.length < MAX_INPUT_CHARS + 1_000) {
+    padded += filler;
+  }
+  const incidentParagraph =
+    `\n\nSeparately, on-call closed incident ticket ${CHUNKED_FIXTURE_INCIDENT_ID} after applying a ` +
+    "targeted patch to the caching layer; no customer-facing impact was recorded.\n";
+  return padded + incidentParagraph;
+}
+
+const chunkedExtractSchema: JsonSchema = {
+  type: "object",
+  properties: {
+    version: { type: "string" },
+    incidentId: { type: "string" },
+  },
+  required: ["version", "incidentId"],
+};
+
+test(
+  "extract (live, chunked): multi-chunk map-reduce against the real ollama sidecar merges facts from every chunk",
+  { skip: skipReason, timeout: CHUNKED_LIVE_CALL_TIMEOUT_MS },
+  async (t: TestContext) => {
+    const fixtureAbsolutePath = path.join(packageRoot, CHUNKED_FIXTURE_RELATIVE_PATH);
+    // Written just before the call and removed in the `finally` below --
+    // see `CHUNKED_FIXTURE_RELATIVE_PATH`'s doc comment for why this fixture
+    // is generated on the fly instead of checked in.
+    await writeFile(fixtureAbsolutePath, buildChunkedExtractFixtureContent(), "utf8");
+    try {
+      const result = (await withLiveClient(t.signal, (client) =>
+        client.callTool(
+          {
+            name: "extract",
+            arguments: { path: CHUNKED_FIXTURE_RELATIVE_PATH, schema: chunkedExtractSchema },
+          },
+          CallToolResultSchema,
+          // Same rationale as the single-shot test above for overriding the
+          // MCP client's default per-request timeout: CHUNKED_LIVE_CALL_TIMEOUT_MS
+          // already accounts for this test's larger worst-case combined
+          // server-side latency (2 chunked generate calls, no reduce call),
+          // and t.signal threads this test's own node:test timeout through
+          // to promptly tear down the spawned child on abort.
+          { timeout: CHUNKED_LIVE_CALL_TIMEOUT_MS, signal: t.signal },
+        ),
+      )) as CallToolResult;
+
+      if (result.isError) {
+        // Same cross-process generate-lock contention case documented on the
+        // single-shot test above -- not a functional failure of chunked
+        // extract itself.
+        const contentText = JSON.stringify(result.content);
+        if (contentText.includes("is busy serving another generate request")) {
+          t.skip(`ollama sidecar's generate lock was held by another session -- skipping: ${contentText}`);
+          return;
+        }
+      }
+
+      assert.equal(
+        result.isError,
+        undefined,
+        `chunked extract tool call reported an error: ${JSON.stringify(result.content)}`,
+      );
+      assert.equal(result.content.length, 1);
+      const [block] = result.content;
+      assert.ok(block, "expected at least one content block in the tool result");
+      if (block.type !== "text") {
+        assert.fail(`expected a text content block, got type '${block.type}'`);
+      }
+
+      const parsed = JSON.parse(block.text) as {
+        data: Record<string, unknown>;
+        truncated: boolean;
+        chunked: boolean;
+        chunkCount: number;
+      };
+
+      assert.equal(
+        parsed.truncated,
+        false,
+        "the fixture is well under MAX_CHUNKABLE_CHARS and must not trip truncation",
+      );
+      assert.equal(
+        parsed.chunked,
+        true,
+        "the fixture exceeds MAX_INPUT_CHARS and must take the chunked map-reduce path",
+      );
+      assert.equal(parsed.chunkCount, 2, "the fixture is sized (see buildChunkedExtractFixtureContent) for exactly 2 chunks");
+
+      // Shape/success assertion, same rationale as the single-shot test
+      // above: re-validated independently here, not just trusted from the
+      // server's own internal check.
+      const validation = validateAgainstSchema(chunkedExtractSchema, parsed.data);
+      assert.equal(validation.ok, true, validation.ok ? undefined : validation.error);
+
+      // Both fields are verbatim copy-outs of literal substrings, one
+      // planted in each chunk (see buildChunkedExtractFixtureContent's doc
+      // comment) -- a competent small model reproduces each reliably, and
+      // *both* being present in the merged result is a real signal the
+      // map-reduce path merged distinct per-chunk data rather than only
+      // ever covering (or falling back to truncating at) the first chunk.
+      assert.equal(typeof parsed.data.version, "string");
+      assert.match(parsed.data.version as string, /9\.7\.3/);
+      assert.equal(typeof parsed.data.incidentId, "string");
+      assert.match(parsed.data.incidentId as string, /OPS-48213/);
+    } finally {
+      await unlink(fixtureAbsolutePath).catch(() => {});
+    }
   },
 );
