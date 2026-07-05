@@ -26,6 +26,34 @@ jobs:
         shell: bash
         run: bash tests/test_install.sh
 
+  shellcheck:
+    # Lints every .sh file in the repo (.devcontainer/*.sh, scripts/*.sh,
+    # tools/run-overnight.sh, tests/*.sh, install.sh, etc.) so shell-script
+    # changes get an automated lint gate instead of relying on whoever
+    # touches a file to fetch shellcheck manually (claude-4qd). shellcheck is
+    # preinstalled on GitHub-hosted ubuntu runners (see actions/runner-images),
+    # same precedent as the `jq` comment on install-tests above, so no
+    # separate install step is needed; Linux-only since this is a lint pass,
+    # not something needing multi-OS coverage.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # -S error only: a repo-wide run at the default `style` severity turned
+      # up a long tail of pre-existing warning/info/style findings (e.g.
+      # SC2155 in install.sh, SC2221/SC2222 in scripts/git-ro.sh, several
+      # SC2086/SC2016/SC2317 spots in tools/run-overnight.sh and
+      # tests/test_run_overnight.sh) that predate this gate and aren't fixed
+      # as part of claude-4qd. Starting at `error` keeps this job green today
+      # while still catching genuinely broken scripts, rather than adding a
+      # gate that's red on day one and gets ignored or disabled. Tracked by
+      # claude-vr8: fix the existing findings and raise this to `warning`.
+      - name: Run shellcheck
+        shell: bash
+        run: |
+          find . -type f -name '*.sh' -not -path './.git/*' -print0 \
+            | xargs -0 shellcheck -S error
+
   overnight-tests:
     # Linux-only: this test sources tools/run-overnight.sh (which shells out to
     # python3 and awk with GNU-style regex quantifiers at source time, not just

@@ -5,7 +5,12 @@ ENV TZ="$TZ"
 
 ARG CLAUDE_CODE_VERSION=latest
 
-# Install basic development tools and iptables/ipset
+# Install basic development tools and iptables/ipset.
+# shellcheck: available here for interactive/manual linting of the .sh files
+# in this repo (.devcontainer/*.sh, scripts/*.sh, tools/run-overnight.sh,
+# etc.) inside the sandbox; CI also runs it non-interactively as its own
+# preinstalled-on-the-runner job (see .github/workflows/tests.yml) so this
+# copy isn't the only gate.
 RUN apt-get update && apt-get install -y --no-install-recommends \
   less \
   curl \
@@ -26,6 +31,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   jq \
   nano \
   vim \
+  shellcheck \
   && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # Ensure default node user has access to /usr/local/share
