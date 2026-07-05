@@ -77,6 +77,31 @@ COPY ollama-init-firewall.sh /usr/local/bin/ollama-init-firewall.sh
 COPY ollama-entrypoint.sh /usr/local/bin/ollama-entrypoint.sh
 RUN chmod +x /usr/local/bin/firewall-common.sh /usr/local/bin/ollama-init-firewall.sh /usr/local/bin/ollama-entrypoint.sh
 
+# claude-qje (Round 2, belt-and-suspenders for the REBORN_MARKER check --
+# see ollama-entrypoint.sh, which explains what that mechanism does and does
+# NOT defend against): ollama-entrypoint.sh treats
+# /run/ollama-entrypoint-reborn existing as proof it already took the
+# legitimate setpriv re-exec that drops NET_ADMIN/NET_RAW, and uses its
+# ABSENCE to detect a container that started with those caps already missing
+# (cap_add misconfigured) rather than legitimately dropped. If this exact
+# path were ever baked into this image's own build -- e.g. a future `RUN
+# touch`/COPY landing something at /run/ollama-entrypoint-reborn -- every
+# container from that image would start pre-forged into the "legitimately
+# reborn" state and silently skip the firewall with cap_add still missing.
+# /run is tmpfs and always empty at this point in a stock upstream layer, so
+# this should never actually trip; it exists to turn an accidental future
+# regression in THIS Dockerfile into a build failure instead of a silent
+# runtime hole. It can NOT catch a fork of this Dockerfile that removes or
+# reorders this very check, or a `docker commit`/out-of-band bind mount done
+# outside this build entirely -- see ollama-entrypoint.sh for why that tier
+# of access is out of scope for a runtime file check by construction.
+RUN bash -c ' \
+    set -euo pipefail; \
+    if [ -e /run/ollama-entrypoint-reborn ]; then \
+      echo "ERROR: /run/ollama-entrypoint-reborn already exists in this built image layer -- ollama-entrypoint.sh relies on this path being ABSENT until it writes it at runtime, right before its legitimate setpriv re-exec; baking it into the image would let a container start pre-forged into that state with cap_add still missing, silently skipping the egress firewall. Find and remove whatever RUN/COPY step created this path." >&2; \
+      exit 1; \
+    fi'
+
 # claude-r30.2: fallback default, only in effect if this image is ever run
 # directly without docker-compose.yml (e.g. `docker run`). The normal
 # override point is docker-compose.yml's `OLLAMA_MODEL: ${OLLAMA_MODEL:-...}`

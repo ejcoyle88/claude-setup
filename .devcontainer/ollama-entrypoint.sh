@@ -101,10 +101,74 @@ caps_already_dropped() {
   (( (0x$capbnd & 0x3000) == 0 ))
 }
 
+# claude-qje: see the argv-sentinel-forgery comment above caps_already_dropped()
+# for why a true result reflects real kernel state, not caller-suppliable
+# input. But real kernel state can ALSO look this way for a completely
+# different reason: if docker-compose.yml's `cap_add: [NET_ADMIN, NET_RAW]`
+# for this service is missing or misconfigured, the container starts with
+# those caps already absent from CapBnd on the VERY FIRST invocation -- before
+# this script has ever run ollama-init-firewall.sh or execed through setpriv
+# at all. In that case caps_already_dropped() is technically correct (the
+# caps really are unreachable) but the conclusion this branch exists to reach
+# -- "the firewall must already be up, safe to skip straight to WARM/serve"
+# -- is false: the firewall was never applied, and ollama serve is about to
+# start with NO egress restriction whatsoever.
+#
+# REBORN_MARKER, not OLLAMA_ENTRYPOINT_REEXEC_DEPTH, is what distinguishes
+# that misconfiguration from a legitimate reborn copy. An earlier version of
+# this gate used depth==0 for this: depth's shape-validation above only
+# guards the arithmetic-injection vector (see that comment), not its truth
+# value, so anything with plain `-e`/`environment:` access -- no
+# compose-file edit, no image rebuild -- could set
+# OLLAMA_ENTRYPOINT_REEXEC_DEPTH=1 and reach this branch with cap_add still
+# missing, reopening exactly the silent-skip gap this branch exists to
+# close. A marker FILE closes that: it's written to this container's own
+# filesystem (see below) immediately before the sole legitimate re-exec
+# further down, at a path nothing in this repo's docker-compose.yml mounts a
+# volume over (x-ollama-common's only `volumes:` entry is
+# ollama-models:/root/.ollama). An env override can set a variable but can't
+# place a file inside the container's rootfs before its entrypoint runs.
+#
+# Scope of what this actually defends against (Round 2 review, claude-qje):
+# this closes the "operator forgot (or fat-fingered) `cap_add:` in the
+# checked-in docker-compose.yml" case -- the file can't be forged by anything
+# short of a compose-file/image change, so a plain env var or `environment:`
+# entry can no longer fake the "already legitimately reborn" state. It does
+# NOT, and structurally cannot, defend against an adversary who already
+# controls image builds or arbitrary `docker run`/`docker compose run`
+# invocation flags: that tier can bake this exact marker into a forked/
+# rebuilt image (a one-line `RUN touch /run/ollama-entrypoint-reborn` in
+# Dockerfile.ollama, or `docker commit` of a legitimately-capped container
+# into a new tag) alongside a separately stripped `cap_add:`, reproducing
+# "firewall never applied" without touching any env var; or pre-place the
+# marker at invocation time via an out-of-band bind mount over `/run`
+# (`docker run -v`/`docker compose run --volume`, bypassing this repo's
+# checked-in `volumes:` entirely), no rebuild needed. Neither is a new hole
+# this marker opens -- that tier of access can already do strictly worse
+# things than plant a marker file, like editing `cap_add:` back in directly,
+# rewriting this script, or skipping the entrypoint altogether -- but this
+# mechanism does not, and cannot, catch that tier; it is scoped to the
+# checked-in-compose-misconfiguration case only. See Dockerfile.ollama for a
+# build-time assertion that guards the "bake it into this image's own build"
+# variant specifically (still not the "fork the Dockerfile itself" variant --
+# nothing running inside this file's own build can defend against an
+# adversary who edits this file).
+#
+# Path note: /run is tmpfs and normally empty at container start in this
+# image; this exact path is otherwise unused here, but nothing enforces that
+# for other processes -- if anything else in this container ever writes to
+# /run/ollama-entrypoint-reborn for an unrelated reason, treat that as a
+# collision with this security check, not a coincidence to ignore.
+REBORN_MARKER=/run/ollama-entrypoint-reborn
+
 if caps_already_dropped; then
+  if [[ ! -e "$REBORN_MARKER" ]]; then
+    echo "FATAL: caps_already_dropped() reports cap_net_admin/cap_net_raw already clear from CapBnd, but $REBORN_MARKER is absent, meaning this process was never re-exec'd through setpriv by this script. That combination means these capabilities were never granted to this container to begin with: cap_add: [NET_ADMIN, NET_RAW] is missing or misconfigured for this service in docker-compose.yml (setting OLLAMA_ENTRYPOINT_REEXEC_DEPTH in this environment does not change this diagnosis -- it is not a substitute for the marker). Refusing to silently skip ollama-init-firewall.sh and start 'ollama serve' with no egress firewall -- fix cap_add and restart." >&2
+    exit 1
+  fi
   # Already past the firewall + cap-drop below (this is the setpriv-reborn
-  # copy of this same script) -- fall through straight to the WARM/serve
-  # supervisor logic.
+  # copy of this same script, confirmed by REBORN_MARKER above, not just by
+  # depth) -- fall through straight to the WARM/serve supervisor logic.
   :
 else
   /usr/local/bin/ollama-init-firewall.sh
@@ -155,6 +219,19 @@ else
   # `: "${OLLAMA_ENTRYPOINT_REEXEC_DEPTH:=0}"` above only seeds a default --
   # it won't clobber a value already inherited from the environment.
   export OLLAMA_ENTRYPOINT_REEXEC_DEPTH=$(( OLLAMA_ENTRYPOINT_REEXEC_DEPTH + 1 ))
+
+  # Write REBORN_MARKER (declared/explained above) immediately before the
+  # one exec that legitimately reaches the caps_already_dropped()==true
+  # branch above, so its presence there reliably means "this process took
+  # this exact path" -- not just "some process claims depth>=1". `: >` (not
+  # `touch`, not append) creates/truncates it fresh on every run of this
+  # branch. A write failure here FATALs rather than proceeding into a
+  # re-exec whose reborn copy would then wrongly read as a cap_add
+  # misconfiguration.
+  if ! : > "$REBORN_MARKER" 2>/dev/null; then
+    echo "FATAL: could not create $REBORN_MARKER before the setpriv re-exec -- refusing to proceed, since the reborn copy of this script relies on this file to distinguish 'legitimately re-exec'd through setpriv' from 'cap_add missing' (see the caps_already_dropped() branch above)." >&2
+    exit 1
+  fi
   exec setpriv "${SETPRIV_DROP[@]}" "$0" "$@"
 fi
 
