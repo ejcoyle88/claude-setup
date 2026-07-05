@@ -24,20 +24,25 @@ save. Only the path goes in; only a summary/extracted-fields/label comes out.
   (optionally sliced to a 1-indexed inclusive `startLine`/`endLine` range),
   sends it to `OLLAMA_MODEL` via `POST /api/generate` (structured-output
   `format` constrained to `{ summary: string }`), and returns
-  `{ summary, truncated, truncatedChars? }`. `focus` optionally steers what
-  the summary emphasizes (e.g. `"security-relevant changes"`).
+  `{ summary, truncated, truncatedChars?, chunked, chunkCount? }`. `focus`
+  optionally steers what the summary emphasizes (e.g.
+  `"security-relevant changes"`). Content over 12,000 characters is
+  map-reduced across chunks rather than truncated — see
+  [Chunking for oversized files](#chunking-for-oversized-files).
 - **`extract(path, schema, startLine?, endLine?)`** — reads `path` (same
   slicing as above) and asks Ollama to return JSON matching the caller-supplied
   `schema` (a JSON-Schema-like object, e.g.
   `{ type: "object", properties: { title: { type: "string" } }, required: ["title"] }`),
   passed straight through to Ollama's structured-output `format`. Returns
-  `{ data, truncated, truncatedChars? }`. The response is validated against
-  `schema` (required fields present, declared types match — see
-  [Structured-output validation](#structured-output-validation)) rather than
-  just checked for valid JSON; on a parse or validation failure the
-  generation is retried once with the identical prompt before giving up. If
-  the retry also fails, this returns `isError: true` with a message
+  `{ data, truncated, truncatedChars?, chunked, chunkCount? }`. The response
+  is validated against `schema` (required fields present, declared types
+  match — see [Structured-output validation](#structured-output-validation))
+  rather than just checked for valid JSON; on a parse or validation failure
+  the generation is retried once with the identical prompt before giving up.
+  If the retry also fails, this returns `isError: true` with a message
   describing what was wrong, never a partially-parsed or best-guess result.
+  Content over 12,000 characters is map-reduced across chunks rather than
+  truncated — see [Chunking for oversized files](#chunking-for-oversized-files).
 
   `path` may also be a **glob pattern** — anything containing `*`, `?`, or
   `[` — matching several files at once (bead claude-1nx): `*` (any run of
@@ -60,23 +65,39 @@ save. Only the path goes in; only a summary/extracted-fields/label comes out.
   a third-party glob dependency was judged unnecessary for this repo's
   minimal, POSIX-glob-subset needs — see `matchGlob`'s doc comment in
   `src/index.ts` for the (dependency-free) matching implementation.
+
+  **Compounding with chunking:** matches are processed sequentially, and
+  since `claude-xg9` each matched file can itself cost up to 7 sequential
+  generate calls if it's large enough to chunk (see
+  [Chunking for oversized files](#chunking-for-oversized-files)) instead of
+  the 1 it cost before that bead — so a single glob-pattern call's worst case
+  is up to 20 × 7 = 140 sequential generate calls, several times slower than
+  before chunking existed, with no caller-facing way to opt out of chunking
+  for a glob batch. This is documented, not (yet) mitigated further — see
+  `MAX_GLOB_MATCHES`'s doc comment in `src/index.ts` for the reasoning behind
+  leaving the 20-file cap as-is despite this.
 - **`classify(pathOrText, labels, isPath?, startLine?, endLine?)`** — classifies
   content into exactly one of `labels` (min 2), returning `{ label, truncated,
-  truncatedChars? }`. Set `isPath: true` to have this server read `pathOrText`
-  as a file path (recommended for anything beyond a short snippet, so the
-  content stays out of Claude's context); when `isPath` is false/omitted,
-  `pathOrText` is treated as literal text and should stay short — passing bulk
-  file content directly here defeats the point of this server, use
-  `isPath: true` instead. `startLine`/`endLine` only apply when `isPath` is
-  true.
+  truncatedChars?, chunked, chunkCount? }`. Set `isPath: true` to have this
+  server read `pathOrText` as a file path (recommended for anything beyond a
+  short snippet, so the content stays out of Claude's context); when `isPath`
+  is false/omitted, `pathOrText` is treated as literal text and should stay
+  short — passing bulk file content directly here defeats the point of this
+  server, use `isPath: true` instead. `startLine`/`endLine` only apply when
+  `isPath` is true. Content over 12,000 characters samples a bounded subset
+  of chunks and majority-votes the label rather than truncating — see
+  [Chunking for oversized files](#chunking-for-oversized-files).
 
 All three offload tools:
 
-- Truncate file content to 12,000 characters (a crude proxy for staying well
-  inside a small model's context window) before sending it to Ollama.
-  Truncation is always reported back (`truncated`/`truncatedChars`), never
-  silent — a file needing more than that isn't chunked in this bead (see
-  Follow-ups). The read itself is bounded too: files over 8MiB on disk are
+- Read and fully cover up to 72,000 characters of file content
+  (`MAX_CHUNKABLE_CHARS`, a chunking budget built from `MAX_INPUT_CHARS` — a
+  crude proxy for staying well inside a small model's context window —
+  multiplied by up to 6 chunks); content beyond that falls back to a hard
+  truncation at 12,000 characters (`MAX_INPUT_CHARS`), reported via
+  `truncated`/`truncatedChars` and never silent. See
+  [Chunking for oversized files](#chunking-for-oversized-files) for the full
+  picture. The read itself is bounded too: files over 8MiB on disk are
   rejected outright (`fstat`-checked before any read), and reads are
   streamed/capped rather than always buffering the whole file, even when
   it's well under that limit.
@@ -91,8 +112,98 @@ All three offload tools:
   probe uses a much shorter 3s timeout — generation is slower); on a
   malformed/invalid response, the one retry (see
   [Structured-output validation](#structured-output-validation)) uses a
-  shorter 30s timeout, so a single tool call's worst-case latency before
-  returning `isError: true` is ~90s, not 60s.
+  shorter 30s timeout, so a single *unchunked* tool call's worst-case latency
+  before returning `isError: true` is ~90s, not 60s (a chunked call's
+  worst-case latency is correspondingly longer — see
+  [Chunking for oversized files](#chunking-for-oversized-files)).
+
+### Chunking for oversized files
+
+`claude-xg9` replaced claude-r30.4's original hard-truncation-at-12,000-
+characters behavior with map-reduce chunking for content that doesn't fit in
+one request, keeping truncation only as a last resort for content too large
+even to chunk:
+
+- Content up to **12,000 characters** (`MAX_INPUT_CHARS`, one chunk's budget)
+  is sent to Ollama in a single request, exactly as before this bead —
+  `chunked: false`, `chunkCount: 1`.
+- Content from 12,001 up to **72,000 characters** (`MAX_CHUNKABLE_CHARS` =
+  `MAX_INPUT_CHARS` × `MAX_CHUNK_COUNT`, 6 chunks) is split into
+  `MAX_INPUT_CHARS`-sized chunks (never splitting a UTF-16 surrogate pair —
+  see `splitIntoChunks`'s doc comment in `src/index.ts`) and map-reduced:
+  - **`summarize_file`**: each chunk is summarized independently (told it's
+    "part N of M of a larger file"), then the chunk summaries themselves are
+    summarized into one final, cohesive summary — kept comparable in
+    size/shape to a single-shot summary rather than growing with the chunk
+    count.
+  - **`extract`**: each chunk is extracted against the same caller-supplied
+    `schema` independently, then merged: array-typed fields union across
+    chunks (duplicates removed, first-occurrence order kept); object-typed
+    fields merge recursively field-by-field; every other (scalar) field
+    takes the first chunk with a non-null value. See
+    `mergeExtractedChunks`'s doc comment in `src/index.ts` for the full
+    policy and a known limitation (a `required` field's real value may only
+    live in one chunk, and a small model may hallucinate a placeholder for
+    the others rather than fail validation).
+  - **`classify`**: unlike the other two, this does *not* run every chunk
+    through the model — a single classification label is usually
+    well-determined by a representative sample, so this samples up to 3
+    evenly-spaced chunks (`CLASSIFY_MAX_SAMPLED_CHUNKS`) and majority-votes
+    the label (`majorityLabel`), bounding a chunked classify call to at most
+    3 generate calls regardless of how many chunks the content split into.
+  - The result reports `chunked: true` and `chunkCount` (the number of
+    chunks actually sent to the model — for `classify`, the sampled count,
+    not the total chunk count).
+- Content beyond 72,000 characters is more than chunking is willing to
+  cover — this server falls back to the pre-chunking behavior: a hard
+  truncation at 12,000 characters, reported via `truncated`/`truncatedChars`
+  exactly as before this bead, with `chunked: false`.
+
+`MAX_CHUNK_COUNT` (6) exists because each chunk pays its own full
+`generateStructured` round trip — up to ~90s worst case on this CPU-only
+sidecar with a retry (see `RETRY_TIMEOUT_MS`'s doc comment) — plus one more
+call for `summarize_file`/`extract`'s reduce step; 6 bounds a single chunked
+tool call to at most 7 sequential generate calls (mid-single-digit minutes
+worst case) rather than letting a pathologically large file grow that
+latency without bound. This latency estimate has not been measured against a
+live sidecar for an actual chunked call; the merge/vote policies and the
+chunk-splitting/chunk-cap-fallback logic are covered by
+`src/chunking.test.ts` against a mocked `fetchImpl`, not a real model — see
+this file's Follow-ups section.
+
+**Prompt-injection risk in `summarize_file`'s reduce step.** Each part
+summary above is model output derived from untrusted file content, and the
+reduce step feeds those part summaries back into a *new* `generateStructured`
+call to produce the final summary. A file crafted so that one chunk's own
+summary contains embedded directives could, in principle, get those
+directives "obeyed" by the reduce-step model rather than merely described.
+The reduce prompt mitigates this by explicitly labeling the enclosed part
+summaries as inert data to synthesize, not instructions to follow — but this
+is a prompt-level instruction, not a guarantee, and a sufficiently motivated
+or unusual model response could still fail to honor it. Treat a chunked
+`summarize_file` result at the same trust level as any other model output,
+not as sanitized input. `extract`/`classify`'s chunked paths don't have this
+exposure: their merge/vote steps (`mergeExtractedChunks`/`majorityLabel`)
+combine per-chunk results programmatically, without feeding chunk output
+back into another generate call.
+
+**All-or-nothing chunk failure.** The per-chunk map loops in
+`summarizeContent`/`extractContent`/`classifyContent` are sequential with no
+checkpointing: if any one chunk's generate call fails, the whole tool call
+returns `isError: true` and discards every already-completed chunk's result
+— potentially several minutes of real inference — with no way to resume
+partway through. The one failure mode in that path that's plausibly
+transient — the cross-process generate lock reporting "busy" because a
+different `ollama-mcp` session currently holds it (see
+[Concurrent-session contention](#concurrent-session-contention-claude-6ll))
+— gets one bounded, ~5s-delayed retry of that same chunk
+(`generateStructuredWithLockBusyRetry`) before giving up, so a short-lived
+contention window mid-sequence doesn't necessarily waste the whole
+operation's completed work. Any other failure (network/timeout, a
+still-malformed response after `generateStructured`'s own built-in retry, or
+lock contention that persists past this one extra retry) still discards the
+whole chunked operation with no resume — a caller that hits this must re-run
+the whole tool call from scratch.
 
 ### Structured-output validation
 
@@ -749,12 +860,35 @@ sometimes cost more than it saves.
 
 ## Follow-ups not built in this bead
 
-- **Chunking for oversized files.** Content beyond `MAX_INPUT_CHARS` (12,000
-  chars) is truncated, not chunked-and-summarized-per-chunk. Truncation is
-  reported (`truncated`/`truncatedChars`) rather than silent, but a genuinely
-  large file only gets a summary of its first ~12,000 characters. A follow-up
-  could add map-reduce-style chunking for `summarize_file` specifically.
-
 Schema validation + retry-on-malformed-JSON for `extract`/`classify`/
 `summarize_file` was tracked as `claude-r30.5` and is now built — see
 [Structured-output validation](#structured-output-validation) above.
+
+Chunking for oversized files (map-reduce for `summarize_file`/`extract`,
+sample-and-vote for `classify`) was tracked as `claude-xg9` and is now built
+— see [Chunking for oversized files](#chunking-for-oversized-files) above.
+Left open by that bead:
+
+- **No live-sidecar coverage of a chunked call.** `src/chunking.test.ts`
+  covers the chunk-splitting logic and the map-reduce/merge/vote policies
+  against a mocked `fetchImpl`, matching this repo's existing
+  `generate.test.ts`/`glob.test.ts` conventions, but there's no live e2e test
+  (mirroring `live-e2e.test.ts`'s single-call pattern) exercising an actual
+  multi-chunk call against a real Ollama sidecar — a chunked call is several
+  minutes of real inference latency per run, which didn't seem worth paying
+  on every opted-in live-test run for behavior the mocked tests already
+  cover at the orchestration level. Worth adding if a live sidecar becomes
+  more routinely available in this repo's CI/dev environment.
+- **`extract`'s per-chunk `required` fields.** Each chunk is extracted
+  against the caller's exact `schema`, `required` fields included, even
+  though a required field's real value may live in only one chunk — on the
+  others, a small model may hallucinate a placeholder to satisfy the
+  constraint rather than fail validation, and the current "first non-null
+  wins" merge policy can't distinguish a real value from a hallucinated one.
+  A follow-up could relax `required` for the per-chunk map calls (validating
+  it only against the final merged result instead).
+- **No empirical latency data for a chunked call.** `MAX_CHUNK_COUNT` (6) is
+  sized from the same CPU-only-sidecar per-call latency estimate
+  (`benchmark-concurrency.mjs`) claude-lp5 used for the unchunked worst case,
+  not from a chunked call actually measured end-to-end against a live
+  sidecar.
