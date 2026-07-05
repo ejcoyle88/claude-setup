@@ -535,6 +535,44 @@ test("extractContent: a nested required field (properties.address.required) is a
   assert.deepEqual(schemaWithNestedRequired.required, ["address"]);
 });
 
+test("withoutRequiredForChunkMap: a nested array-items required field (items.required) is also relaxed (bead claude-72l)", () => {
+  // Same recursive-strip coverage as the `properties.address.required` test
+  // above, but exercising the `items` branch instead of `properties` --
+  // before this test existed, only the `properties`-nesting recursion path
+  // was actually asserted on.
+  const itemSchema: JsonSchema = {
+    type: "object",
+    properties: {
+      name: { type: "string" },
+      quantity: { type: "number" },
+    },
+    required: ["quantity"],
+  };
+  const schemaWithArrayRequired: JsonSchema = {
+    type: "object",
+    properties: {
+      items: {
+        type: "array",
+        items: itemSchema,
+      },
+    },
+    required: ["items"],
+  };
+
+  const stripped = withoutRequiredForChunkMap(schemaWithArrayRequired);
+
+  assert.ok(!("required" in stripped), "top-level `required` is still stripped");
+  const strippedProperties = stripped.properties as Record<string, JsonSchema>;
+  const strippedItemsField = strippedProperties.items!;
+  const strippedItemSchema = strippedItemsField.items as JsonSchema;
+  assert.ok(!("required" in strippedItemSchema), "the nested `items` subschema's own `required` is also stripped");
+  // The original schema (and its nested `items` subschema object) must be
+  // left untouched -- `extractContent` still needs `required` intact, at
+  // every level, to validate the final merged result afterward.
+  assert.deepEqual(itemSchema.required, ["quantity"]);
+  assert.deepEqual(schemaWithArrayRequired.required, ["items"]);
+});
+
 test("extractContent: chunks with only a partial nested-required object are merged into one that satisfies it, without any one chunk being pressured to fabricate it", async () => {
   const lockPath = await scratchLockPath();
   const content = "a".repeat(MAX_INPUT_CHARS + 500); // 2 chunks

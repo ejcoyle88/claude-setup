@@ -30,7 +30,7 @@ import {
   type ProgressNotifier,
   withPeriodicProgress,
 } from "./progress.js";
-import { type JsonSchema, parseAndValidateJson, validateAgainstSchema } from "./validate.js";
+import { MAX_SCHEMA_DEPTH, type JsonSchema, parseAndValidateJson, validateAgainstSchema } from "./validate.js";
 
 /** The `extra` argument every `server.registerTool` handler callback
  * receives as its second parameter (per `@modelcontextprotocol/sdk/server/
@@ -2516,19 +2516,24 @@ export async function extractContent(
   return { ok: true, data: merged, chunked: true, chunkCount: chunks.length };
 }
 
-/** Upper bound on `withoutRequiredForChunkMap`'s recursion depth -- mirrors
+/** Upper bound on `withoutRequiredForChunkMap`'s recursion depth -- reuses
  * `validate.ts`'s own `MAX_SCHEMA_DEPTH` guard (same rationale: `extract`'s
- * `schema` argument is caller-supplied and otherwise open-ended). Past this
- * depth, a nested `properties`/`items` subschema is left as-is (its own
- * `required`, if any, is not stripped) rather than recursing further -- a
+ * `schema` argument is caller-supplied and otherwise open-ended) rather than
+ * an independent literal, so the two recursion-depth guards against this
+ * same threat model can't silently drift apart (bead claude-72l). The
+ * schema *at* the cutoff depth still has *its own* `required` stripped (it's
+ * destructured/removed unconditionally before this depth check runs) --
+ * only that schema's nested `properties`/`items` subschemas one level
+ * further down are left completely untouched (their own `required`, if
+ * any, is not stripped) rather than recursing further -- a
  * pathologically/maliciously deep schema falls back to under-relaxing
- * `required` at the deepest levels, not a `RangeError: Maximum call stack
- * size exceeded` crash. In practice every per-chunk result is still checked
- * by `parseAndValidateJson` against this same (relaxed) schema, and the
- * merged result is re-validated against the caller's original schema by
- * `extractContent` afterward, so this is defense in depth, not the primary
- * guard. */
-const MAX_STRIP_REQUIRED_DEPTH = 20;
+ * `required` one level past the deepest-stripped level, not a `RangeError:
+ * Maximum call stack size exceeded` crash. In practice every per-chunk
+ * result is still checked by `parseAndValidateJson` against this same
+ * (relaxed) schema, and the merged result is re-validated against the
+ * caller's original schema by `extractContent` afterward, so this is
+ * defense in depth, not the primary guard. */
+const MAX_STRIP_REQUIRED_DEPTH = MAX_SCHEMA_DEPTH;
 
 /**
  * Returns a copy of `schema` with `required` omitted at every nesting level

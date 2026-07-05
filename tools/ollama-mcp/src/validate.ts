@@ -38,8 +38,13 @@ export type ValidationResult = { ok: true } | { ok: false; error: string };
  * turn a pathologically/maliciously deep caller-supplied `schema` (see
  * `extract`'s `schema` argument in `index.ts`, which is otherwise
  * open-ended) into a clean `ok: false` validation result instead of a
- * `RangeError: Maximum call stack size exceeded` crash. */
-const MAX_SCHEMA_DEPTH = 20;
+ * `RangeError: Maximum call stack size exceeded` crash. Exported so
+ * `index.ts`'s `withoutRequiredForChunkMap` -- a second recursion-depth
+ * guard against this exact same threat model (the same caller-supplied
+ * `extract` schema, walked the same way) -- reuses this constant instead of
+ * maintaining an independent literal the two guards could silently drift
+ * apart from (bead claude-72l). */
+export const MAX_SCHEMA_DEPTH = 20;
 
 /** Human-readable type name for an error message, treating `null` and
  * arrays distinctly from generic "object" (matches JSON-Schema's own type
