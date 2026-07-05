@@ -32,6 +32,9 @@ x-ollama-common: &ollama-common
     - NET_ADMIN
     - NET_RAW
   volumes:
+    # claude-w1b: unbounded growth -- see the ollama-models volume
+    # declaration under the top-level `volumes:` block below for sizing
+    # notes and how to reclaim space.
     - ollama-models:/root/.ollama
   environment:
     # Domain/SNI-scoped egress: ollama's own firewall (ollama-init-firewall.sh)
@@ -463,12 +466,34 @@ services:
         reservations:
           devices:
             - driver: nvidia
-              count: all
+              # claude-w1b: default to a single GPU rather than reserving
+              # every GPU on the host (`count: all`) -- this stack only ever
+              # runs one model-serving sidecar at a time, so `all` just
+              # starves any other GPU workload on the host (or a future
+              # second ollama-gpu-style service here) for no benefit. If a
+              # later model-serving bead genuinely needs more than one GPU
+              # (e.g. a model too large for a single card), bump this value
+              # directly or override it via a `docker-compose.override.yml`
+              # (or `docker compose -f ... -f override.yml`) rather than
+              # reverting to `all`.
+              count: 1
               capabilities: [gpu]
 
 volumes:
   claude-code-bashhistory:
   claude-code-config:
+  # claude-w1b: no size cap -- Compose named volumes don't support a hard
+  # cap without driver_opts tied to a specific storage driver/filesystem,
+  # which isn't configured here, so this grows unbounded as `ollama pull`
+  # lands more model blobs into it (see x-ollama-common's OLLAMA_MODEL
+  # comment above for per-model sizes, e.g. llama3.2:3b ~2GB pull,
+  # qwen2.5:7b ~4.7GB pull -- each additional distinct model pulled adds to
+  # the total, nothing evicts). Check usage with
+  # `docker system df -v` (look for this volume under "Local Volumes"), and
+  # reclaim space either by removing just this volume
+  # (`docker volume rm claude-sandbox_ollama-models`, once the ollama/
+  # ollama-gpu containers using it are stopped) or by tearing down the whole
+  # stack's volumes with `docker compose down -v`.
   ollama-models:
 
 networks:
