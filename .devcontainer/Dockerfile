@@ -127,10 +127,13 @@ RUN set -eux; \
   bd version
 
 
-# Copy and set up firewall script
+# Copy and set up firewall script (firewall-common.sh is the shared skeleton
+# also used by Dockerfile.ollama/ollama-init-firewall.sh -- init-firewall.sh
+# sources it at runtime, so it must be present alongside it in the image).
+COPY firewall-common.sh /usr/local/bin/firewall-common.sh
 COPY init-firewall.sh /usr/local/bin/
 USER root
-RUN chmod +x /usr/local/bin/init-firewall.sh && \
+RUN chmod +x /usr/local/bin/firewall-common.sh /usr/local/bin/init-firewall.sh && \
   echo "node ALL=(root) NOPASSWD: /usr/local/bin/init-firewall.sh" > /etc/sudoers.d/node-firewall && \
   chmod 0440 /etc/sudoers.d/node-firewall
 USER node

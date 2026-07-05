@@ -1,15 +1,14 @@
 #!/bin/bash
 # Shared skeleton for the egress-allowlist firewalls in this directory.
-# Sourced (not executed directly) by ollama-init-firewall.sh, which supplies
-# its own ipset name, domain list, and verification targets and calls these
-# functions in sequence.
-#
-# NOTE: init-firewall.sh (the devcontainer service's firewall) does NOT yet
-# source this file. It predates this helper, is proven, security-critical,
-# and out of scope for the bead that introduced this file (claude-aso) --
-# migrating it to share this skeleton is a deliberate follow-up that needs
-# its own careful, isolated review (byte-for-byte rule-outcome diffing), not
-# something to fold in silently here. See claude-aso's return notes.
+# Sourced (not executed directly) by ollama-init-firewall.sh and
+# init-firewall.sh, each of which supplies its own ipset name, domain list,
+# and verification targets and calls these functions in sequence. Not every
+# function here is a drop-in fit for both callers -- e.g. init-firewall.sh
+# does NOT use firewall_common::allow_dns_and_loopback, because its
+# historical (and deliberately preserved) DNS/SSH rules are a genuinely
+# different rule set from this file's resolver-scoped DNS helper. See each
+# caller's own inline comments for exactly which shared functions it uses
+# and which it keeps inline, and why.
 set -euo pipefail
 IFS=$'\n\t'
 
@@ -90,10 +89,9 @@ firewall_common::allow_dns_and_loopback() {
 # residual "shares an IP with other CDN tenants" exposure is acceptable for
 # their domain, and prefer a domain/SNI-aware egress proxy instead when it
 # isn't. Every domain-allowlisting firewall in this repo today accepts that
-# residual exposure -- this function's caller (ollama-init-firewall.sh) and,
-# independently (it predates and doesn't source this file -- see the NOTE at
-# the top of this file), init-firewall.sh's own ipset-based allowlist for the
-# devcontainer service. See each caller's own comments for its specific
+# residual exposure -- both this function's callers, ollama-init-firewall.sh
+# and init-firewall.sh (the devcontainer service's own ipset-based
+# allowlist), share it. See each caller's own comments for its specific
 # domains and reasoning.
 firewall_common::build_domain_allowlist() {
   local ipset_name="$1"

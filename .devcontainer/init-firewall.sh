@@ -1,46 +1,65 @@
 #!/bin/bash
+# Deny-by-default egress firewall for the devcontainer service's OWN network
+# namespace. Run via `sudo /usr/local/bin/init-firewall.sh` (see
+# .devcontainer/Dockerfile's node-firewall sudoers entry). Shares the
+# skeleton in firewall-common.sh with ollama-init-firewall.sh (the sidecar's
+# equivalent firewall) so the two can't silently drift apart -- but this
+# script's ALLOWED destinations and a couple of rule details are genuinely
+# different from ollama's, and are NOT drop-in swaps for the shared
+# functions of the same shape. See the inline notes below for each place
+# this script deliberately does NOT call the "obvious" shared helper.
 set -euo pipefail  # Exit on error, undefined vars, and pipeline failures
 IFS=$'\n\t'       # Stricter word splitting
 
-# 1. Extract Docker DNS info BEFORE any flushing
-DOCKER_DNS_RULES=$(iptables-save -t nat | grep "127\.0\.0\.11" || true)
+source /usr/local/bin/firewall-common.sh
 
-# Flush existing rules and delete existing ipsets
-iptables -F
-iptables -X
-iptables -t nat -F
-iptables -t nat -X
-iptables -t mangle -F
-iptables -t mangle -X
-ipset destroy allowed-domains 2>/dev/null || true
+readonly IPSET_NAME="allowed-domains"
+readonly ALLOWED_DOMAINS=(
+    "registry.npmjs.org"
+    "api.anthropic.com"
+    "sentry.io"
+    "statsig.anthropic.com"
+    "statsig.com"
+    "marketplace.visualstudio.com"
+    "vscode.blob.core.windows.net"
+    "update.code.visualstudio.com"
+)
 
-# 2. Selectively restore ONLY internal Docker DNS resolution
-if [ -n "$DOCKER_DNS_RULES" ]; then
-    echo "Restoring Docker DNS rules..."
-    iptables -t nat -N DOCKER_OUTPUT 2>/dev/null || true
-    iptables -t nat -N DOCKER_POSTROUTING 2>/dev/null || true
-    echo "$DOCKER_DNS_RULES" | xargs -L 1 iptables -t nat
-else
-    echo "No Docker DNS rules to restore"
-fi
+firewall_common::flush_and_restore_dns "$IPSET_NAME"
 
-# First allow DNS and localhost before any restrictions
-# Allow outbound DNS
+# NOT firewall_common::allow_dns_and_loopback(): that helper scopes DNS to
+# the resolver(s) in /etc/resolv.conf and only opens UDP+TCP/53. This
+# script's historical, proven behavior is a blanket "any destination,
+# UDP/53" DNS rule plus its own SSH allowance (outbound tcp/22, and
+# established-only inbound tcp/22) that the shared helper has no equivalent
+# for at all. Preserving that exact rule set (not "fixing" it to the
+# tighter, resolver-scoped behavior) is what this migration bead requires --
+# byte-for-byte identical rule outcomes, not a security hardening. Kept
+# inline rather than folded into firewall-common.sh so the shared skeleton
+# doesn't normalize the wider DNS rule for future callers.
 iptables -A OUTPUT -p udp --dport 53 -j ACCEPT
-# Allow inbound DNS responses
 iptables -A INPUT -p udp --sport 53 -j ACCEPT
-# Allow outbound SSH
 iptables -A OUTPUT -p tcp --dport 22 -j ACCEPT
-# Allow inbound SSH responses
 iptables -A INPUT -p tcp --sport 22 -m state --state ESTABLISHED -j ACCEPT
-# Allow localhost
 iptables -A INPUT -i lo -j ACCEPT
 iptables -A OUTPUT -o lo -j ACCEPT
 
-# Create ipset with CIDR support
-ipset create allowed-domains hash:net
+# Resolve and add the plain-domain allowlist first. This also performs the
+# ipset creation (`ipset create allowed-domains hash:net`) -- deliberately
+# BEFORE the GitHub CIDR block below, not after, because
+# firewall_common::build_domain_allowlist does an unconditional `ipset
+# create` with no `-exist` guard; calling it after the ipset already has
+# entries (from creating it and adding CIDRs manually first, as the
+# pre-migration script order did) would fail outright ("set already
+# exists"). Reordering is safe: ipset is an unordered set for matching
+# purposes, so the final allowed set and every rule outcome are identical
+# either way -- only the historical add-order (GitHub ranges before
+# individual domains) changes to (individual domains before GitHub ranges).
+firewall_common::build_domain_allowlist "$IPSET_NAME" "${ALLOWED_DOMAINS[@]}"
 
-# Fetch GitHub meta information and aggregate + add their IP ranges
+# Fetch GitHub meta information and aggregate + add their IP ranges. No
+# equivalent in firewall-common.sh (ollama's firewall has no CIDR-range
+# allowlisting need), so this stays inline.
 echo "Fetching GitHub IP ranges..."
 gh_ranges=$(curl -s https://api.github.com/meta)
 if [ -z "$gh_ranges" ]; then
@@ -60,78 +79,17 @@ while read -r cidr; do
         exit 1
     fi
     echo "Adding GitHub range $cidr"
-    ipset add allowed-domains "$cidr"
+    ipset add "$IPSET_NAME" "$cidr"
 done < <(echo "$gh_ranges" | jq -r '(.web + .api + .git)[]' | aggregate -q)
 
-# Resolve and add other allowed domains
-for domain in \
-    "registry.npmjs.org" \
-    "api.anthropic.com" \
-    "sentry.io" \
-    "statsig.anthropic.com" \
-    "statsig.com" \
-    "marketplace.visualstudio.com" \
-    "vscode.blob.core.windows.net" \
-    "update.code.visualstudio.com"; do
-    echo "Resolving $domain..."
-    ips=$(dig +noall +answer A "$domain" | awk '$4 == "A" {print $5}')
-    if [ -z "$ips" ]; then
-        echo "ERROR: Failed to resolve $domain"
-        exit 1
-    fi
-    
-    while read -r ip; do
-        if [[ ! "$ip" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
-            echo "ERROR: Invalid IP from DNS for $domain: $ip"
-            exit 1
-        fi
-        echo "Adding $ip for $domain"
-        ipset add allowed-domains "$ip"
-    done < <(echo "$ips")
-done
+host_network=$(firewall_common::allow_host_network)
+echo "Host network detected as: $host_network"
 
-# Get host IP from default route
-HOST_IP=$(ip route | grep default | cut -d" " -f3)
-if [ -z "$HOST_IP" ]; then
-    echo "ERROR: Failed to detect host IP"
-    exit 1
-fi
-
-HOST_NETWORK=$(echo "$HOST_IP" | sed "s/\.[0-9]*$/.0\/24/")
-echo "Host network detected as: $HOST_NETWORK"
-
-# Set up remaining iptables rules
-iptables -A INPUT -s "$HOST_NETWORK" -j ACCEPT
-iptables -A OUTPUT -d "$HOST_NETWORK" -j ACCEPT
-
-# Set default policies to DROP first
-iptables -P INPUT DROP
-iptables -P FORWARD DROP
-iptables -P OUTPUT DROP
-
-# First allow established connections for already approved traffic
-iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
-iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
-
-# Then allow only specific outbound traffic to allowed domains
-iptables -A OUTPUT -m set --match-set allowed-domains dst -j ACCEPT
-
-# Explicitly REJECT all other outbound traffic for immediate feedback
-iptables -A OUTPUT -j REJECT --reject-with icmp-admin-prohibited
+firewall_common::lock_down "$IPSET_NAME"
 
 echo "Firewall configuration complete"
 echo "Verifying firewall rules..."
-if curl --connect-timeout 5 https://example.com >/dev/null 2>&1; then
-    echo "ERROR: Firewall verification failed - was able to reach https://example.com"
-    exit 1
-else
-    echo "Firewall verification passed - unable to reach https://example.com as expected"
-fi
-
-# Verify GitHub API access
-if ! curl --connect-timeout 5 https://api.github.com/zen >/dev/null 2>&1; then
-    echo "ERROR: Firewall verification failed - unable to reach https://api.github.com"
-    exit 1
-else
-    echo "Firewall verification passed - able to reach https://api.github.com as expected"
-fi
+firewall_common::verify_deny "https://example.com"
+# Hard fail (matches this script's pre-migration exit-1-on-failure behavior
+# for this specific check): hard_fail=1.
+firewall_common::verify_allow "https://api.github.com/zen" 1
