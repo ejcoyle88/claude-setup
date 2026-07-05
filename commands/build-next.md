@@ -148,17 +148,25 @@ beads in Step 4. If you genuinely can't tell, ask via `AskUserQuestion`.
 
 Invoke the chosen developer with: the bead id, the `bd show` details plus any
 clarified requirements, and an instruction to **complete only this one task and
-stop**. Dispatch it in the **foreground** (`run_in_background: false`) and wait
-for its result before proceeding to Step 3 — never background this call. In
-unattended mode there is no later turn in this process to pick up a
-backgrounded result at all (see "no async callback channel" above); even
-interactively, Step 3 needs this developer's diff, so the dispatch must
-resolve before you move on regardless of mode. Tell it to use its skills and
-Serena tools as needed. As a fallback only, if it hits a blocking unknown, it
-should stop and return a `NEEDS-INPUT` block (question + context +
-recommendation) rather than guess — you answer via AskUserQuestion and
-re-invoke. Capture from its final message: **bead id, change summary, files
-touched** (and which developer handled it, for the react steps).
+stop**. Dispatch it via a **fresh, foreground `Task` tool call**
+(`run_in_background: false`) and wait for its result before proceeding to
+Step 3 — never background this call, and never substitute a `SendMessage` to
+a previously-dispatched agent handle for it. `SendMessage` can resume a named
+agent, but it does so asynchronously and hands control back to you before the
+agent finishes — the opposite of what's needed here. This applies every time
+the flow needs the developer, not just this first call: the Round 1 and
+Round 2 fix dispatches in Step 3 are each a new foreground `Task` call too,
+even if it means re-stating context the developer already had, never a
+`SendMessage` continuation of this one. In unattended mode there is no later
+turn in this process to pick up a backgrounded (or asynchronously-resumed)
+result at all (see "no async callback channel" above); even interactively,
+Step 3 needs this developer's diff, so the dispatch must resolve before you
+move on regardless of mode. Tell it to use its skills and Serena tools as
+needed. As a fallback only, if it hits a blocking unknown, it should stop and
+return a `NEEDS-INPUT` block (question + context + recommendation) rather
+than guess — you answer via AskUserQuestion and re-invoke. Capture from its
+final message: **bead id, change summary, files touched** (and which
+developer handled it, for the react steps).
 
 ## Step 3 — Review cycles (at most two; the second is conditional)
 
@@ -222,11 +230,16 @@ put under git, since diff-based review and rollback both depend on it.
    not spend a second cycle.
 5. Otherwise, before invoking the developer, record a hash (or the literal
    text) of the diff you just reviewed — Round 2 below checks the fix against
-   this. Then invoke **the same developer that implemented the bead**, in the
-   foreground as in Step 2, with the bead id, the changed files, and the
-   blocking findings verbatim. Tell it to
+   this. Then invoke **the same developer that implemented the bead** via a
+   **new foreground `Task` call** (`run_in_background: false`), per Step 2's
+   rule — not `SendMessage` to the agent handle Step 2 dispatched, even
+   though it's still addressable that way. `SendMessage` would resume that
+   agent asynchronously and end your turn before it fixes anything, which is
+   the failure this rule exists to prevent. Pass the bead id, the changed
+   files, and the blocking findings verbatim. Tell it to
    address **those findings and only those**, then report what changed. (Same
-   NEEDS-INPUT escalation applies.) **Round 2 is reached only from here** —
+   NEEDS-INPUT escalation applies.) **Wait for this Task call to return
+   before doing anything else** — Round 2 is reached only from here,
    immediately after this developer-fix dispatch has returned — never merely
    because Round 1 had blocking findings.
 
@@ -240,12 +253,15 @@ condition, not independent paths)
    developer-fix dispatch did not produce a delta — do not re-dispatch the
    reviewers against a diff they already reviewed. Instead, treat it as a
    failed fix: log/report that the fix dispatch produced no diff change, then
-   re-invoke the same developer once more, foreground, with the same findings (first
-   occurrence for this bead), then re-resolve the diff and re-compare against
-   the same recorded hash/text before proceeding to item 2. If the diff still
-   hasn't changed (i.e., this branch is being entered a second time for this
-   bead), stop retrying and do not dispatch reviewers. Before escalating, commit
-   the abandoned diff using the WIP-commit convention from the Unattended mode
+   re-invoke the same developer once more via a new foreground `Task` call
+   (`run_in_background: false`) — again, not `SendMessage` to any earlier
+   agent handle, for the same reason as Round 1, item 5 — with the same
+   findings (first occurrence for this bead), then re-resolve the diff and
+   re-compare against the same recorded hash/text before proceeding to
+   item 2. If the diff still hasn't changed (i.e., this branch is being
+   entered a second time for this bead), stop retrying and do not dispatch
+   reviewers. Before escalating, commit the abandoned diff using the
+   WIP-commit convention from the Unattended mode
    section's "Commit per task" bullet — applied here **regardless of mode**, a
    deliberate carve-out from that section's "ignore this section entirely"
    scoping for interactive mode, because cross-bead diff contamination is a
@@ -266,9 +282,11 @@ condition, not independent paths)
    check, capped at one re-dispatch per reviewer regardless of which condition
    failed), strip any `FILES REVIEWED:` line, then merge and filter to
    blocking findings as before.
-4. If blocking findings remain, invoke **the same developer**, foreground, once
-   more to address them, and wait for it to return. Then **stop — do not run a
-   third review.**
+4. If blocking findings remain, invoke **the same developer** once more via a
+   new foreground `Task` call (`run_in_background: false`) — never
+   `SendMessage` to a prior handle, same rule as Round 1, item 5 — to address
+   them, and wait for it to return before doing anything else. Then **stop —
+   do not run a third review.**
 
 ## Step 4 — Close out and report
 
