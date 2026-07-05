@@ -933,6 +933,185 @@ test_run_worker_in_pgroup_also_leaves_stdout_uninherited() {
     "[ '$output' = 'hello-worker-pgroup' ]"
 }
 
+# --- prune_overnight_logs (claude-yyj) ---
+#
+# _mk_run_dir <root> <days_ago> <approx_kb> — fabricates a
+# YYYYMMDD-HHMMSS-named run directory under <root>, aged <days_ago> days in
+# the PAST relative to right now (name-derived, per the bead — never mtime),
+# containing a single file of roughly <approx_kb> KB (0 = no file, just the
+# directory itself). Prints the generated name on stdout so callers can
+# capture it (e.g. to pass as prune_overnight_logs's current_run_id, or to
+# assert on afterward). Distinct <days_ago> values are used across fixtures
+# within any one test below specifically so two calls can never collide on
+# the same YYYYMMDD-HHMMSS name.
+_mk_run_dir() { # _mk_run_dir <root> <days_ago> <approx_kb>
+  local root="$1" days_ago="$2" kb="$3" name
+  name="$(date -d "-${days_ago} days" +%Y%m%d-%H%M%S)"
+  mkdir -p "$root/$name"
+  [ "$kb" -gt 0 ] && head -c $((kb * 1024)) /dev/zero > "$root/$name/data.bin"
+  printf '%s' "$name"
+}
+
+test_prune_age_only() {
+  local root="$TMPDIR_TEST/prune-age"
+  local current old recent
+  current="$(_mk_run_dir "$root" 0 50)"
+  old="$(_mk_run_dir "$root" 20 50)"
+  recent="$(_mk_run_dir "$root" 2 50)"
+
+  # size cap disabled (0) — only the age knob is in play here.
+  prune_overnight_logs "$root" "$current" 14 0
+
+  assert "age-only: a run dir older than max_age_days is pruned" "[ ! -d '$root/$old' ]"
+  assert "age-only: a run dir within max_age_days survives" "[ -d '$root/$recent' ]"
+  assert "age-only: the current run dir survives" "[ -d '$root/$current' ]"
+}
+
+test_prune_size_only() {
+  local root="$TMPDIR_TEST/prune-size"
+  local current oldest_other newer_other
+  current="$(_mk_run_dir "$root" 0 2000)"
+  oldest_other="$(_mk_run_dir "$root" 4 800)"
+  newer_other="$(_mk_run_dir "$root" 3 800)"
+
+  # age cap disabled (0); ~800KB+800KB of non-current dirs comfortably
+  # exceeds a 1MB (1024KB) cap, so oldest-first deletion must kick in even
+  # though nothing is old enough to be age-pruned.
+  prune_overnight_logs "$root" "$current" 0 1
+
+  assert "size-only: the oldest non-current dir is pruned to get under the cap" \
+    "[ ! -d '$root/$oldest_other' ]"
+  assert "size-only: the newer non-current dir survives (cap satisfied after one deletion)" \
+    "[ -d '$root/$newer_other' ]"
+  assert "size-only: the current run dir survives (its size is never even counted)" \
+    "[ -d '$root/$current' ]"
+}
+
+test_prune_age_then_size_interaction() {
+  local root="$TMPDIR_TEST/prune-both"
+  local current very_old mid_old mid_new
+  current="$(_mk_run_dir "$root" 0 50)"
+  very_old="$(_mk_run_dir "$root" 20 50)"   # pruned by the AGE pass (>14 days)
+  mid_old="$(_mk_run_dir "$root" 5 800)"    # survives age; oldest size-pass survivor
+  mid_new="$(_mk_run_dir "$root" 3 800)"    # survives both passes
+
+  # Isolate this test's log() output from the shared global $SUMMARY (same
+  # pattern as test_check_telemetry_health_*: override SUMMARY for just this
+  # call) so the "exactly one summary line" assertion below counts only what
+  # THIS invocation logged, not every "triggered: age, size" line any test in
+  # this process has ever produced.
+  local summary_test="$TMPDIR_TEST/summary.log"
+  SUMMARY="$summary_test" prune_overnight_logs "$root" "$current" 14 1
+
+  assert "age-then-size: the too-old dir is pruned by the age pass" "[ ! -d '$root/$very_old' ]"
+  assert "age-then-size: the oldest age-survivor is then pruned by the size pass" \
+    "[ ! -d '$root/$mid_old' ]"
+  assert "age-then-size: the newest dir survives both passes" "[ -d '$root/$mid_new' ]"
+  assert "age-then-size: the current run dir survives both passes" "[ -d '$root/$current' ]"
+  assert "age-then-size: exactly one 'Log rotation:' summary line reports both knobs triggered" \
+    "[ \"\$(grep -c 'Log rotation:.*triggered: age, size' '$summary_test')\" = '1' ]"
+}
+
+test_prune_current_run_dir_always_kept() {
+  local root="$TMPDIR_TEST/prune-current-exempt"
+  local current other
+  # Deliberately old AND large enough to fail both checks on its own merits —
+  # proves exemption isn't just "happens to survive," it's never considered.
+  current="$(_mk_run_dir "$root" 30 5000)"
+  other="$(_mk_run_dir "$root" 2 50)"
+
+  prune_overnight_logs "$root" "$current" 14 1
+
+  assert "current run dir is never deleted, even though it alone would fail both the age and size checks" \
+    "[ -d '$root/$current' ]"
+  assert "an unrelated recent, small other dir still survives too" "[ -d '$root/$other' ]"
+}
+
+test_prune_non_matching_dir_names_untouched() {
+  local root="$TMPDIR_TEST/prune-nonmatch"
+  local current old
+  current="$(_mk_run_dir "$root" 0 50)"
+  old="$(_mk_run_dir "$root" 30 50)"
+  mkdir -p "$root/not-a-run-dir"
+  mkdir -p "$root/2026-07-05"
+
+  prune_overnight_logs "$root" "$current" 14 0
+
+  assert "a directory not matching YYYYMMDD-HHMMSS is left untouched" "[ -d '$root/not-a-run-dir' ]"
+  assert "a differently-formatted date-ish directory name is left untouched" "[ -d '$root/2026-07-05' ]"
+  assert "a genuine too-old candidate is still pruned alongside the untouched ones" "[ ! -d '$root/$old' ]"
+  assert "the current run dir survives" "[ -d '$root/$current' ]"
+}
+
+test_prune_both_knobs_zero_is_noop() {
+  local root="$TMPDIR_TEST/prune-noop"
+  local current old
+  current="$(_mk_run_dir "$root" 0 50)"
+  old="$(_mk_run_dir "$root" 100 5000)"
+
+  prune_overnight_logs "$root" "$current" 0 0
+
+  assert "both knobs disabled: an ancient, oversized dir is still not pruned" "[ -d '$root/$old' ]"
+  assert "both knobs disabled: the current run dir is untouched" "[ -d '$root/$current' ]"
+}
+
+test_prune_malformed_numeric_env_knobs_rejected_safely() {
+  # claude-yyj review round 1, finding 1: max_age_days/max_total_mb flow into
+  # `$(( ))` arithmetic, which bash recursively re-evaluates as a further
+  # expression — so a command-substitution-shaped value must never reach
+  # that arithmetic unvalidated. Prove it doesn't: pass a value shaped like
+  # `$(touch <canary>)` for BOTH knobs and confirm the canary is never
+  # created (no command execution), the malformed knob is neutralized (the
+  # ancient dir survives rather than crashing the function), and a WARNING
+  # names the bad value.
+  local root="$TMPDIR_TEST/prune-malformed"
+  local current old
+  current="$(_mk_run_dir "$root" 0 50)"
+  old="$(_mk_run_dir "$root" 100 5000)"
+
+  local canary="$TMPDIR_TEST/canary"
+  rm -f "$canary"
+  local mal="\$(touch $canary)"
+  local summary_test="$TMPDIR_TEST/summary-malformed.log"
+
+  SUMMARY="$summary_test" prune_overnight_logs "$root" "$current" "$mal" "$mal"
+  local status=$?
+
+  assert "a command-substitution-shaped knob never executes (no canary file created)" "[ ! -e '$canary' ]"
+  assert "prune_overnight_logs itself doesn't error out on malformed knobs" "[ '$status' -eq 0 ]"
+  assert "malformed max_age_days is neutralized (treated as 0): the ancient dir survives" "[ -d '$root/$old' ]"
+  assert "the current run dir still survives" "[ -d '$root/$current' ]"
+  # NOTE: deliberately NOT interpolating $mal into these grep patterns —
+  # `assert` runs its condition through `eval`, and re-embedding a
+  # command-substitution-shaped string as literal text in an eval'd command
+  # would execute it a second time (this bit the first draft of this test:
+  # it created the canary file itself). A fixed substring naming each env
+  # var is enough to confirm the WARNING identifies the right knob.
+  assert "a WARNING names OVERNIGHT_LOG_MAX_AGE_DAYS as the bad knob" \
+    "grep -q \"WARNING: OVERNIGHT_LOG_MAX_AGE_DAYS ('\" '$summary_test'"
+  assert "a WARNING names OVERNIGHT_LOG_MAX_TOTAL_MB as the bad knob" \
+    "grep -q \"WARNING: OVERNIGHT_LOG_MAX_TOTAL_MB ('\" '$summary_test'"
+}
+
+test_prune_missing_logs_root_is_noop_no_error() {
+  local root="$TMPDIR_TEST/does-not-exist"
+  local status
+  prune_overnight_logs "$root" "20260101-000000" 14 500
+  status=$?
+  assert "a missing logs root returns success (no error)" "[ '$status' -eq 0 ]"
+  assert "a missing logs root is not created as a side effect" "[ ! -d '$root' ]"
+}
+
+test_prune_empty_logs_root_is_noop_no_error() {
+  local root="$TMPDIR_TEST/prune-empty"
+  mkdir -p "$root"
+  local status
+  prune_overnight_logs "$root" "20260101-000000" 14 500
+  status=$?
+  assert "an empty logs root returns success (no error)" "[ '$status' -eq 0 ]"
+  assert "an empty logs root has nothing to prune and stays empty" "[ -z \"\$(ls -A '$root')\" ]"
+}
+
 run_test test_count_zero_with_no_worker_logs
 run_test test_count_single_worker
 run_test test_count_multi_worker_sum
@@ -981,6 +1160,15 @@ run_test test_kill_registered_pgids_skips_pgid_with_mismatched_start_time
 run_test test_run_in_pgroup_redirects_stdout_to_a_real_logfile
 run_test test_run_in_pgroup_empty_logfile_leaves_stdout_uninherited
 run_test test_run_worker_in_pgroup_also_leaves_stdout_uninherited
+run_test test_prune_age_only
+run_test test_prune_size_only
+run_test test_prune_age_then_size_interaction
+run_test test_prune_current_run_dir_always_kept
+run_test test_prune_non_matching_dir_names_untouched
+run_test test_prune_both_knobs_zero_is_noop
+run_test test_prune_malformed_numeric_env_knobs_rejected_safely
+run_test test_prune_missing_logs_root_is_noop_no_error
+run_test test_prune_empty_logs_root_is_noop_no_error
 
 rm -rf "$SOURCE_SCRATCH_DIR"
 

@@ -198,6 +198,24 @@
 #       claims -> duplicate work. Keep 1 unless that's configured.
 #   WORKTREE_BASE=<project>/.overnight-worktrees
 #
+#   OVERNIGHT_LOG_MAX_AGE_DAYS=14    (claude-yyj) at the start of each MAIN
+#       run (never a worker subprocess), prune .overnight-logs/<RUN_ID>/
+#       directories older than this many days — age is derived from each run
+#       directory's own YYYYMMDD-HHMMSS NAME, not its mtime (mtime is bumped
+#       by reads/rsync and isn't a reliable "how old is this run" signal).
+#       Set to 0 to disable this check specifically (OVERNIGHT_LOG_MAX_TOTAL_MB
+#       still applies independently). The current run's own directory is
+#       always exempt, no matter its age.
+#   OVERNIGHT_LOG_MAX_TOTAL_MB=500   (claude-yyj) after the age pass above, if
+#       the surviving run directories (measured via `du -sk`, excluding the
+#       current run) still total more than this many MB, delete oldest-first
+#       (by name/timestamp) until back under the cap. Set to 0 to disable
+#       this check specifically (OVERNIGHT_LOG_MAX_AGE_DAYS still applies
+#       independently). The current run's own directory is never deleted to
+#       satisfy this cap, even if it alone would exceed it.
+#       See prune_overnight_logs() for the full mechanism; any failure inside
+#       it is caught and logged as a WARNING rather than aborting the run.
+#
 # Logs: <project>/.overnight-logs/<timestamp>/w<N>-iter-NN.log (+ .result.txt),
 #       per-worker summary, merged summary.log
 
@@ -250,6 +268,8 @@ MAX_TURNS="${MAX_TURNS:-150}"
 MAX_TOTAL_COST_USD="${MAX_TOTAL_COST_USD:-50}"
 PARALLEL_WORKERS="${PARALLEL_WORKERS:-1}"
 WORKTREE_BASE="${WORKTREE_BASE:-$PROJECT_DIR/.overnight-worktrees}"
+OVERNIGHT_LOG_MAX_AGE_DAYS="${OVERNIGHT_LOG_MAX_AGE_DAYS:-14}"
+OVERNIGHT_LOG_MAX_TOTAL_MB="${OVERNIGHT_LOG_MAX_TOTAL_MB:-500}"
 
 # ── Signal handling (claude-23n / claude-14w): two-stage Ctrl+C cancel ──────
 # 1st Ctrl+C: stop launching new iterations, let the in-flight claude finish,
@@ -1651,6 +1671,234 @@ run_worker() { # run_worker <index> <workdir>
   wlog "$wsum" "Worker $idx complete: $completed successful iteration(s), \$$spent spent, remaining ready: $(ready_count "$workdir")."
 }
 
+# _prune_run_id_epoch <name> — claude-yyj internal helper for
+# prune_overnight_logs() below. Prints the epoch seconds a YYYYMMDD-HHMMSS
+# run-directory NAME parses to, or prints nothing and returns non-zero if
+# `name` doesn't match that shape or GNU `date` can't parse it. Deliberately
+# derived from the directory NAME, not its mtime: mtime is bumped by reads,
+# rsync, or anything else that touches the tree, and (per the bead) isn't
+# reliably fakeable in tests either — the timestamp baked into the run's own
+# directory name is the one source of truth for "when was this run".
+_prune_run_id_epoch() { # _prune_run_id_epoch <name>
+  local name="$1"
+  case "$name" in
+    [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9]) ;;
+    *) return 1 ;;
+  esac
+  date -d "${name:0:4}-${name:4:2}-${name:6:2} ${name:9:2}:${name:11:2}:${name:13:2}" +%s 2>/dev/null
+}
+
+# prune_overnight_logs <logs_root> <current_run_id> <max_age_days> <max_total_mb>
+# — claude-yyj. Keeps .overnight-logs/ from growing forever by deleting old
+# per-run directories, called once at the start of a MAIN run (see the
+# _OVERNIGHT_IS_WORKER-guarded call site in main, right after LOG_DIR is
+# created) — never by a worker subprocess re-sourcing this same file.
+#
+# ORDER (settled in the bead, not up for relitigating here): age first, then
+# size. Age-prune every candidate run dir older than max_age_days (parsed
+# from its YYYYMMDD-HHMMSS NAME, see _prune_run_id_epoch — NOT mtime, which
+# gets bumped by reads/rsync and isn't reliably fakeable in tests). Then, if
+# the surviving total (measured via `du -sk`, in KB) still exceeds
+# max_total_mb, delete oldest-first (by name/timestamp) until it's back under
+# the cap. Either knob set to "0" disables that specific check independently
+# — the other still applies.
+#
+# Candidates are restricted to directories whose NAME matches the
+# YYYYMMDD-HHMMSS shape only; anything else directly under logs_root
+# (stray files, differently-named directories) is left untouched.
+#
+# current_run_id is exempt from BOTH passes, unconditionally: it's excluded
+# from the age-prune candidate set outright, and — per the bead — the size
+# cap's total only ever counts *other* run dirs' sizes to begin with, so
+# there is no code path in this function that can ever `rm -rf` it, no
+# matter how old or how large it is. If pruning everything else still
+# leaves the cap technically unsatisfiable (current dir alone would be
+# over it), the loop simply runs out of deletable candidates and stops —
+# never touching current_run_id to "solve" that.
+#
+# FAILURE-ISOLATED BY THE CALLER, not internally: this function itself does
+# not swallow errors (an unreadable logs_root, a `du`/`rm` failure on one
+# directory, etc.) — the main-only call site wraps the call so `set -e`
+# can't abort the whole night's run over a cleanup hiccup; see that call
+# site's comment for the exact mechanism and why it belongs there instead of
+# in here (this function stays plainly testable/composable on its own).
+#
+# Emits exactly one log() summary line reporting how many directories were
+# pruned, how much total MB was freed, and which knob(s) actually triggered
+# a deletion (age, size, both, or neither) — regardless of which of the
+# no-op paths below returns early, so a caller grepping $SUMMARY always
+# finds exactly one "Log rotation:" line per invocation.
+#
+# Leading zeros in max_age_days/max_total_mb (e.g. an operator-set "07") are
+# forced to base-10 via `10#...` before arithmetic — same defensive
+# convention as _duration_to_seconds()'s docstring above, since bash's
+# `$(( ))` otherwise misreads a leading-zero numeral as octal.
+#
+# Both knobs are validated as plain non-negative integers BEFORE that `10#`
+# cast/any arithmetic: bash's `$(( ))` recursively re-evaluates a variable's
+# *value* as a further expression, so an env-derived value containing a
+# command substitution (e.g. OVERNIGHT_LOG_MAX_AGE_DAYS='$(...)') would
+# otherwise execute as part of the arithmetic expansion. A malformed value is
+# treated the same as "0" (that check disabled) with a log() WARNING naming
+# the bad value, rather than ever reaching `$(( ))` unchecked.
+prune_overnight_logs() { # prune_overnight_logs <logs_root> <current_run_id> <max_age_days> <max_total_mb>
+  local logs_root="$1" current_run_id="$2" max_age_days="$3" max_total_mb="$4"
+  local d name epoch now_epoch cutoff_epoch kb
+  local pruned_count=0 freed_kb=0 triggered_age=0 triggered_size=0
+
+  case "$max_age_days" in
+    ''|*[!0-9]*)
+      log "WARNING: OVERNIGHT_LOG_MAX_AGE_DAYS ('$max_age_days') is not a plain non-negative integer — disabling the age-based prune check for this run (treating it as 0)."
+      max_age_days=0
+      ;;
+  esac
+  case "$max_total_mb" in
+    ''|*[!0-9]*)
+      log "WARNING: OVERNIGHT_LOG_MAX_TOTAL_MB ('$max_total_mb') is not a plain non-negative integer — disabling the size-based prune check for this run (treating it as 0)."
+      max_total_mb=0
+      ;;
+  esac
+
+  if [ ! -d "$logs_root" ]; then
+    log "Log rotation: $logs_root does not exist — nothing to prune."
+    return 0
+  fi
+
+  local -a names=()
+  for d in "$logs_root"/*/; do
+    [ -d "$d" ] || continue
+    name="$(basename "$d")"
+    case "$name" in
+      [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9])
+        names+=("$name") ;;
+    esac
+  done
+
+  if [ "${#names[@]}" -eq 0 ]; then
+    log "Log rotation: no candidate run director(ies) matching YYYYMMDD-HHMMSS under $logs_root — nothing to prune."
+    return 0
+  fi
+
+  # --- Shared size measurement (one `du -sk`, up front, for both passes) -----
+  # A single `du -sk` call over every candidate directory (GNU du prints one
+  # "kb<TAB>path" line per argument), instead of forking `du`+`awk` once per
+  # directory the age pass deletes AND again once per directory the size pass
+  # measures. Neither pass modifies a *surviving* directory's contents (only
+  # whole directories are ever removed), so one up-front measurement safely
+  # serves both: the age pass's freed_kb accounting for what it deletes, and
+  # the size pass's total/per-directory accounting for whatever survives the
+  # age pass. sizes[] is pre-seeded with 0 for every candidate so a directory
+  # `du` can't stat (permission denied, etc. — no output line for it) still
+  # has a defined value, same fallback as the original per-directory
+  # `du ... || kb=0` behavior.
+  local -A sizes=()
+  if [ "${max_age_days:-0}" != "0" ] || [ "${max_total_mb:-0}" != "0" ]; then
+    for name in "${names[@]}"; do
+      sizes["$name"]=0
+    done
+    local -a du_paths=()
+    for name in "${names[@]}"; do
+      du_paths+=("$logs_root/$name")
+    done
+    local du_kb du_path du_name
+    while IFS=$'\t' read -r du_kb du_path; do
+      du_name="${du_path##*/}"
+      sizes["$du_name"]="${du_kb:-0}"
+    done < <(du -sk -- "${du_paths[@]}" 2>/dev/null)
+  fi
+
+  # --- Pass 1: age (by parsed NAME, not mtime) -------------------------------
+  if [ "${max_age_days:-0}" != "0" ]; then
+    now_epoch="$(date +%s)"
+    cutoff_epoch=$((now_epoch - 10#$max_age_days * 86400))
+    local -a survivors=()
+    # Batch the epoch lookup: build one "YYYY-MM-DD HH:MM:SS" line per
+    # non-current candidate (pure bash substring slicing — no fork) and feed
+    # all of them to a SINGLE `date -f -` call, instead of forking `date`
+    # once per candidate name (_prune_run_id_epoch). Names are already
+    # shape-validated as YYYYMMDD-HHMMSS above, so every line is expected to
+    # parse; if the batch call's output doesn't line up 1:1 with the input
+    # (defensive: would require a shape-valid but calendar-invalid name,
+    # which this script's own `date +%Y%m%d-%H%M%S` never produces), fall
+    # back to the original one-at-a-time helper rather than risk misaligning
+    # an epoch to the wrong candidate.
+    local -a age_candidates=() age_dates=() age_epochs=()
+    for name in "${names[@]}"; do
+      if [ "$name" = "$current_run_id" ]; then
+        survivors+=("$name")
+        continue
+      fi
+      age_candidates+=("$name")
+      age_dates+=("${name:0:4}-${name:4:2}-${name:6:2} ${name:9:2}:${name:11:2}:${name:13:2}")
+    done
+    if [ "${#age_candidates[@]}" -gt 0 ]; then
+      mapfile -t age_epochs < <(printf '%s\n' "${age_dates[@]}" | date -f - +%s 2>/dev/null)
+      if [ "${#age_epochs[@]}" -ne "${#age_candidates[@]}" ]; then
+        age_epochs=()
+        for name in "${age_candidates[@]}"; do
+          age_epochs+=("$(_prune_run_id_epoch "$name")")
+        done
+      fi
+      local i
+      for i in "${!age_candidates[@]}"; do
+        name="${age_candidates[$i]}"
+        epoch="${age_epochs[$i]:-}"
+        if [ -n "$epoch" ] && [ "$epoch" -lt "$cutoff_epoch" ]; then
+          kb="${sizes[$name]:-0}"
+          rm -rf -- "${logs_root:?}/${name:?}"
+          pruned_count=$((pruned_count + 1))
+          freed_kb=$((freed_kb + kb))
+          triggered_age=1
+        else
+          survivors+=("$name")
+        fi
+      done
+    fi
+    names=("${survivors[@]}")
+  fi
+
+  # --- Pass 2: total size, oldest-first, current_run_id never counted -------
+  if [ "${max_total_mb:-0}" != "0" ]; then
+    local cap_kb=$((10#$max_total_mb * 1024))
+    local total_kb=0
+    local -a others=()
+    # sizes[] was already populated once, up front, by the shared `du -sk`
+    # pass above (before the age pass ran) — no second `du` call needed here;
+    # just sum the survivors' already-known KB figures.
+    for name in "${names[@]}"; do
+      [ "$name" = "$current_run_id" ] && continue
+      others+=("$name")
+      total_kb=$((total_kb + ${sizes[$name]:-0}))
+    done
+    if [ "$total_kb" -gt "$cap_kb" ]; then
+      local -a sorted=()
+      mapfile -t sorted < <(printf '%s\n' "${others[@]}" | sort)
+      for name in "${sorted[@]}"; do
+        [ "$total_kb" -le "$cap_kb" ] && break
+        kb="${sizes[$name]}"
+        rm -rf -- "${logs_root:?}/${name:?}"
+        pruned_count=$((pruned_count + 1))
+        freed_kb=$((freed_kb + kb))
+        total_kb=$((total_kb - kb))
+        triggered_size=1
+      done
+    fi
+  fi
+
+  local freed_mb trigger
+  freed_mb="$(awk -v k="$freed_kb" 'BEGIN { printf "%.2f", k / 1024 }')"
+  if [ "$triggered_age" = "1" ] && [ "$triggered_size" = "1" ]; then
+    trigger="age, size"
+  elif [ "$triggered_age" = "1" ]; then
+    trigger="age"
+  elif [ "$triggered_size" = "1" ]; then
+    trigger="size"
+  else
+    trigger="none"
+  fi
+  log "Log rotation: pruned $pruned_count director(ies), freed ${freed_mb}MB under $logs_root (triggered: $trigger)."
+}
+
 # ── main ─────────────────────────────────────────────────────────────────────
 # Guarded so tests can `source` this file (to reuse count_completed_iterations /
 # total_worker_spend / parse_result etc. directly) without kicking off the
@@ -1664,6 +1912,27 @@ if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
 # BASH_SOURCE guard), NOT at top level, so sourcing this file for tests never
 # installs a trap in the sourcing (test-runner) shell.
 trap _overnight_interrupt_handler INT TERM
+
+# claude-yyj: prune old .overnight-logs/<RUN_ID>/ directories so they don't
+# grow forever — MAIN only (never a worker subprocess re-sourcing this same
+# file for its own run_worker() loop; a worker pruning mid-run could delete
+# directories another worker or main itself is still writing to). LOG_DIR
+# for THIS run already exists by this point (mkdir'd at top-of-file, before
+# either the worker/main branch is known), so prune_overnight_logs() finds
+# its own current-run directory already on disk and exempts it correctly
+# rather than mistaking a not-yet-created directory for something to skip.
+#
+# FAILURE-ISOLATED (per the bead): run in a subshell, not the current shell,
+# so a fatal error inside the function — an unbound-variable reference under
+# this script's `set -u` included — only kills that subshell and returns a
+# non-zero status here, rather than taking the whole night's run down over a
+# cleanup hiccup. `log()` (not `wlog`) is the right helper here: this runs
+# once for the whole night, not per-worker.
+if [ "${_OVERNIGHT_IS_WORKER:-0}" != "1" ]; then
+  if ! ( prune_overnight_logs "$PROJECT_DIR/.overnight-logs" "$RUN_ID" "$OVERNIGHT_LOG_MAX_AGE_DAYS" "$OVERNIGHT_LOG_MAX_TOTAL_MB" ); then
+    log "WARNING: log rotation (prune_overnight_logs) failed — continuing without pruning old .overnight-logs/ directories tonight. Inspect $PROJECT_DIR/.overnight-logs manually if it looks like it's grown unbounded."
+  fi
+fi
 
 # claude-o7u: _MCP_ANCHOR_WALK_ROOT_TEST_ONLY is an internal test-only seam
 # (see mcp_external_anchor_check()) that bounds the external-anchor
