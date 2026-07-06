@@ -26,9 +26,12 @@ description: >-
 - Clippy-clean (`-D warnings`) and `rustfmt`-formatted; treat clippy lints as the
   house style.
 
-## Review notes
+## Review checklist
 
-Flag needless `.clone()` / allocation on hot or common paths, manual loops where
-an iterator reads clearer, `match`-on-`Result` where `?` belongs, `unsafe`
-without a `SAFETY:` justification, and overly broad trait bounds or `dyn` where a
-generic would do. Treat clippy-clean idiomatic code as correct — don't bikeshed.
+- Needless `.clone()` / allocation on hot or common paths.
+- Manual loops where an iterator would read clearer.
+- `match`-on-`Result` where `?` belongs.
+- `unsafe` without a `SAFETY:` justification.
+- Overly broad trait bounds, or `dyn` used where a generic would do.
+
+Treat clippy-clean idiomatic code as correct — don't bikeshed.

@@ -7,7 +7,7 @@ description: >-
   access, durable workflows, caching, observability, resilience, and clean
   architecture. Does NOT cover mobile or desktop UI (MAUI / Blazor desktop) —
   hand those to a dedicated agent.
-tools: Read, Write, Edit, Bash, Glob, Grep, mcp__serena__*, mcp__microsoft-learn__*, mcp__nuget__*, mcp__context7__*
+tools: Read, Write, Edit, Bash, Glob, Grep, mcp__serena__*, mcp__claude_ai_Microsoft_Learn__*, mcp__context7__*
 model: sonnet
 skills: developer-workflow
 ---
@@ -55,7 +55,7 @@ that fit the task rather than carrying everything:
 - `dotnet-temporal` — durable workflows and the determinism rules.
 - `dotnet-testing` — the test stack, the TDD loop, coverage philosophy.
 - `dotnet-dependencies` — license-awareness, Central Package Management,
-  vulnerability/deprecation checks, the NuGet MCP.
+  vulnerability/deprecation checks, real-time package data sources.
 - `dotnet-performance` — measure-first optimization and hot-path techniques.
 - `dotnet-architecture` — repository / unit-of-work, Result pattern, Options,
   outbox in depth.

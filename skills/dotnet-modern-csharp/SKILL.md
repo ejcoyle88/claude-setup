@@ -47,6 +47,18 @@ floor, use the newest tagged at or below it and skip the rest.
 - Default to `Task`; use `ValueTask` only on hot paths that often complete
   synchronously.
 
+## Old patterns
+
+Superseded idioms to flag when seen in new or changed code:
+
+- `lock (object)` — superseded by `System.Threading.Lock` (.NET 9+), which is
+  purpose-built for locking and faster than the object-monitor pattern.
+- `.Result` / `.Wait()` (sync-over-async) — superseded by `await`; blocking on
+  async work risks deadlocks and thread-pool starvation.
+- Unconditional `ConfigureAwait(false)` — superseded by omitting it in
+  app/ASP.NET Core code; only reusable library code still needs it, since app
+  code has no `SynchronizationContext` to hop back to.
+
 ## Review notes
 
 When reviewing, treat the above as house idiom — flag legacy patterns where a

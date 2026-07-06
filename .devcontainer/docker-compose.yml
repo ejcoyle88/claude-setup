@@ -13,6 +13,72 @@
 
 name: claude-sandbox
 
+# Shared build/cap/volume posture for the ollama and ollama-gpu services
+# below (YAML anchor merged with `<<:` — a standard Compose "extension
+# fields" pattern). Keeps the OLLAMA_VERSION pin and the egress-hardening
+# cap_add in exactly one place instead of two that could drift apart. The
+# shared `image:` tag also means both services build to the SAME local
+# image (one physical build output, not two separately-tagged copies),
+# even though `docker compose up` still invokes the (cache-fast) build step
+# once per service that references it.
+x-ollama-common: &ollama-common
+  build:
+    context: .
+    dockerfile: Dockerfile.ollama
+    args:
+      OLLAMA_VERSION: "0.31.1"
+  image: claude-sandbox-ollama:0.31.1-hardened
+  cap_add:
+    - NET_ADMIN
+    - NET_RAW
+  volumes:
+    # claude-w1b: unbounded growth -- see the ollama-models volume
+    # declaration under the top-level `volumes:` block below for sizing
+    # notes and how to reclaim space.
+    - ollama-models:/root/.ollama
+  environment:
+    # Domain/SNI-scoped egress: ollama's own firewall (ollama-init-firewall.sh)
+    # no longer allowlists any external host directly -- it only allows
+    # reaching this proxy over the pinned compose subnet. The proxy enforces
+    # the actual registry.ollama.ai / R2-blob-host ACL (see
+    # squid-ollama-egress.conf). Only HTTPS_PROXY is set, not HTTP_PROXY --
+    # per ollama's own FAQ, `ollama pull` only ever uses HTTPS, and setting
+    # HTTP_PROXY too risks interfering with ollama serve's own HTTP server.
+    HTTPS_PROXY: http://ollama-egress-proxy:3128
+    # claude-r30.2: single overridable knob for the model ollama-entrypoint.sh
+    # warms (pulls + confirms present) before this container reports healthy
+    # -- see Dockerfile.ollama's HEALTHCHECK and ollama-entrypoint.sh's WARM
+    # section. Must match tools/ollama-mcp's OLLAMA_MODEL (README default:
+    # llama3.2:3b) -- that's the model the MCP will actually call.
+    #
+    # Default: llama3.2:3b -- ~2GB pull, ~2-3GB RAM at Q4_K_M, runs
+    # acceptably CPU-only (this is the *non*-GPU `ollama` service). Override
+    # by exporting OLLAMA_MODEL before `docker compose up`, e.g. to
+    # qwen2.5:7b (~4.7GB pull, ~5.5GB VRAM, wants the `ollama-gpu` profile --
+    # see that service below) for stronger accuracy at the cost of size/speed.
+    # See tools/ollama-mcp/README.md's Model section for the full tradeoff
+    # writeup.
+    OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3.2:3b}
+  depends_on:
+    # condition: service_healthy (not just container-started, the compose
+    # default) -- Compose's plain depends_on only orders container
+    # creation, not readiness; without this, a real `ollama pull` right
+    # after boot could hit connection-refused against a Squid that hasn't
+    # finished starting yet. See Dockerfile.egress-proxy's HEALTHCHECK.
+    ollama-egress-proxy:
+      condition: service_healthy
+  # Bounded, but generously so: ollama pull tracks partial blob downloads
+  # on disk and resumes rather than restarting from scratch on a fresh
+  # `ollama pull` (see ollama's own download code / FAQ) -- though
+  # real-world reports of that resume path being unreliable are common
+  # enough that a multi-GB pull surviving only a handful of restarts is
+  # still a real risk of permanently parking this sidecar as "exited"
+  # mid-pull. on-failure:10 gives noticeably more headroom for that than
+  # a plain fast-fail misconfiguration would need, while staying bounded
+  # so a genuinely broken build/config still surfaces as "exited" instead
+  # of restarting forever.
+  restart: on-failure:10
+
 services:
   devcontainer:
     build:
@@ -50,34 +116,221 @@ services:
     depends_on:
       - otel-collector
 
+  # claude-9tc: UNVERIFIED TAG WARNING -- the four pins below (otel-collector,
+  # prometheus, loki, grafana) were chosen from changelog/release-page reading
+  # without docker/direct-registry access in this sandbox to confirm they
+  # actually resolve on Docker Hub. WebSearch turned up corroborating
+  # evidence for each (release notes, Docker Hub search snippets, layer-detail
+  # pages) but none of it is an authoritative registry response, and one
+  # search pass for otel/opentelemetry-collector-contrib:0.155.0 specifically
+  # surfaced only nightly-build tags (e.g. 0.155.0-nightly.<sha>) alongside
+  # the plain 0.155.0 pull command, so that one in particular is NOT
+  # confirmed. Before/during first CI run or dev use, run
+  # `docker compose -f .devcontainer/docker-compose.yml pull` (or
+  # `docker manifest inspect <image>` per tag) and fix any tag that 404s --
+  # don't assume these are correct.
   otel-collector:
-    image: otel/opentelemetry-collector-contrib:latest # pin a version once happy
+    image: otel/opentelemetry-collector-contrib:0.155.0 # claude-9tc: pinned (was :latest); see contrib releases for changelog before bumping
     command: ["--config=/etc/otelcol/config.yaml"]
+    # claude-00p: this bind mount only gets the FILE onto disk in the running
+    # container -- otelcol reads config.yaml once at process start and does
+    # NOT hot-reload on change. Editing otel-collector-config.yaml after this
+    # container is already up does nothing until the process restarts: run
+    # `docker compose up -d --force-recreate otel-collector` (or otherwise
+    # restart/recreate this service) for the edit to actually take effect.
+    # A stale long-running container silently keeps executing its
+    # original in-memory config even though the on-disk file is correct --
+    # this bit claude-saz's metric_expiration fix (config on disk was right,
+    # but the container had been running since before the edit landed, so
+    # the fix was never actually exercised).
     volumes:
       - ./otel-collector-config.yaml:/etc/otelcol/config.yaml:ro
     depends_on:
-      - loki
+      # claude-saz: wait for loki to actually be ready to accept OTLP log
+      # ingest, not just for its container to have started (Compose's plain
+      # depends_on default) -- otherwise the collector can start shipping
+      # the logs pipeline's batches at loki before it's serving, and those
+      # exports drop silently (see observability-stack's silent-drop
+      # footgun; there's no retry-and-fail-loud here). No analogous
+      # dependency on prometheus: prometheus scrapes THIS service, so the
+      # ordering that matters runs the other way.
+      loki:
+        condition: service_healthy
     # No host ports needed for the sandbox→collector path. Uncomment to let
     # host-side (non-container) claude sessions export here too:
     # ports:
     #   - "4317:4317"
     #   - "4318:4318"
+    #
+    # claude-saz: this image is `scratch`-based (just the binary + CA certs,
+    # no shell/wget/curl -- see the opentelemetry-collector-contrib
+    # Dockerfile), so it can't run a Docker HEALTHCHECK the way loki/
+    # prometheus do below without adding a probe extension/tool to the
+    # image. Left unaddressed here as out of scope (primary ask is loki);
+    # candidate follow-up if the collector's own readiness ever needs
+    # gating.
+    #
+    # claude-saz: bounded alongside metric_expiration going 5m -> 24h
+    # (otel-collector-config.yaml) -- that change makes the prometheus
+    # exporter's internal series registry hold every distinct label-set
+    # seen over a full 24h window (up from 5 minutes) and re-serve each
+    # still-live series' last value on every 10s scrape for that whole
+    # window, instead of letting it drop after a few minutes. Correctness
+    # fix, but unbounded: a metric set with higher cardinality than
+    # expected, or a longer-than-anticipated run, would otherwise pressure
+    # host memory silently instead of failing loudly. 1g is generous for
+    # this sandbox's actual cardinality (per-session/iteration labels from
+    # one devcontainer, not a fleet) while still turning a genuine
+    # cardinality blow-up into a visible, restarted failure -- mirrors the
+    # ollama/ollama-gpu services' deploy.resources.limits.memory pattern
+    # above. on-failure:5 restarts it (metrics are recoverable/derived, not
+    # state to preserve) but won't loop forever against a real
+    # misconfiguration.
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+    restart: on-failure:5
 
   prometheus:
-    image: prom/prometheus:latest
+    # claude-9tc: pinned to the (default, no-suffix) busybox-based build --
+    # the v3.13.0 tag's own Dockerfile (not Dockerfile.distroless) still
+    # builds FROM quay.io/prometheus/busybox-${OS}-${ARCH} and labels the
+    # variant "busybox" -- distroless remains opt-in via a -distroless tag
+    # suffix -- so the wget-based healthcheck below keeps working. See
+    # https://github.com/prometheus/prometheus/blob/v3.13.0/Dockerfile.
+    image: prom/prometheus:v3.13.0
+    # claude-us6: explicit command overrides the image's default CMD
+    # (`--config.file=/etc/prometheus/prometheus.yml
+    # --storage.tsdb.path=/prometheus`, per the upstream Dockerfile's
+    # ENTRYPOINT/CMD), so both of those are carried over unchanged here
+    # alongside the new retention flag -- dropping them would silently
+    # revert config.file/storage.tsdb.path to... the same defaults, in this
+    # case, but that's incidental, not guaranteed, so keep them explicit
+    # rather than relying on it. --storage.tsdb.retention.time=2d bounds
+    # on-disk TSDB growth to match this stack's ~24h single-run design
+    # intent (metric_expiration in otel-collector-config.yaml, the 2g
+    # memory cap above -- both claude-saz) with a little headroom over
+    # exactly 24h, instead of the image's 15d default. Matters because the
+    # TSDB lives in the container's writable layer (no volume configured --
+    # ephemeral by design), so a devcontainer that survives across multiple
+    # overnight runs without recreation would otherwise keep accumulating
+    # on-disk data toward that 15d default.
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=2d
+    # claude-00p: same caveat as otel-collector's bind mount above --
+    # Prometheus reads prometheus.yml once at process start and does NOT
+    # hot-reload it just because the bind-mounted file on disk changed.
+    # (Prometheus *can* reload via SIGHUP or its `/-/reload` endpoint when
+    # started with `--web.enable-lifecycle`, but this service isn't
+    # configured with that flag, so neither applies here.) Editing
+    # prometheus.yml after this container is already up has no effect until
+    # you run `docker compose up -d --force-recreate prometheus` (or
+    # otherwise restart/recreate this service).
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
     ports:
       - "9090:9090" # optional: raw metric spelunking from the host browser
+    # claude-saz: prom/prometheus ships on a busybox base (has wget, not
+    # curl) -- added for consistency with loki's new healthcheck below, so
+    # grafana's depends_on can wait for real readiness instead of just
+    # container-started.
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:9090/-/healthy"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    # claude-saz: same rationale as otel-collector's cap above -- the
+    # collector now re-serves each still-live series' last value on every
+    # 10s scrape for up to 24h instead of ~5m (metric_expiration in
+    # otel-collector-config.yaml), which is ~8,640 redundant samples per
+    # stale series over a run instead of ~30. That inflates Prometheus's
+    # in-memory head block/WAL for the run's duration with no cap to catch
+    # a runaway. 2g gives Prometheus itself (TSDB head block, query
+    # working set) more headroom than the collector needs, since it's
+    # accumulating samples rather than just tracking label-sets, while
+    # still failing loudly instead of silently pressuring the host.
+    # Persistent volume for the TSDB isn't configured here (ephemeral by
+    # design for this dev stack), so an OOM-restart only costs in-flight
+    # scrape history, not durable state.
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+    restart: on-failure:5
 
   loki:
-    image: grafana/loki:latest
+    # claude-9tc: pinned to the latest 3.6.x patch (3.6.12); 3.6.0 is the
+    # earliest release in this minor line to ship the shell-free `loki
+    # -health` self-check the healthcheck below uses, so anything in the
+    # 3.6.x line satisfies it. A newer 3.7.x line is also out; if bumping
+    # past 3.6.x, re-verify grafana/loki#20313 (the -health flag) still
+    # applies before moving this pin.
+    image: grafana/loki:3.6.12
     # Image's default config; Loki 3.x accepts OTLP logs at /otlp out of the
     # box. If log ingest ever 400s, check `allow_structured_metadata` in the
     # Loki config.
+    #
+    # claude-saz: as of Loki 3.6, the image's base was switched to a
+    # distroless build with busybox (and so wget/curl/shell) removed
+    # entirely -- a wget/curl-based `/ready` healthcheck silently can't run
+    # at all on that image (see grafana/loki#20149, #19923). Loki 3.6 added
+    # a shell-free self-check specifically to replace that: `loki -health`
+    # hits its own `/ready` endpoint (default http://localhost:3100/ready)
+    # and exits 0/1 accordingly, with no external tool needed (see
+    # grafana/loki#20313). Since this service is pinned to grafana/loki:3.6.12
+    # (Loki 3.6+), use that native form rather than the wget one-liners still
+    # floating around in older docs/examples -- they'll silently never
+    # succeed on current images.
+    healthcheck:
+      test: ["CMD", "/usr/bin/loki", "-health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    # claude-906: follow-up from claude-saz's review -- otel-collector/
+    # prometheus/ollama/ollama-gpu above all have deploy.resources.limits.
+    # memory plus a bounded restart, but loki (and grafana below) had
+    # neither. Loki ingests the same OTLP log volume the collector forwards
+    # to it (see otel-collector's depends_on comment above) with no ceiling
+    # to catch unbounded growth -- a runaway ingest volume, or a genuinely
+    # bad config, could otherwise pressure the host silently via this
+    # service instead of otel-collector. No docker access in this sandbox to
+    # measure actual resident memory under this workload, so -- same
+    # precedent as otel-collector's 1g / prometheus's 2g above and the
+    # explicitly-"provisional" ollama 8g note -- 2g here is a
+    # reasoned-but-unmeasured provisional cap: loki buffers incoming log
+    # chunks in memory before flushing to its filesystem chunk store (no
+    # persistent volume configured here either, so an OOM-restart only costs
+    # in-flight/unflushed chunks, not durable state), and this stack's
+    # actual log volume is a single devcontainer's session output, not a
+    # fleet -- a comparable order of magnitude to prometheus's sample
+    # ingest rather than the collector's lighter label-set tracking. Revisit
+    # once a real overnight run's memory usage is known.
+    #
+    # Review follow-up: on-failure:5 is a BOUNDED restart budget, and
+    # otel-collector's depends_on: loki: condition: service_healthy above is
+    # only evaluated at container CREATION time -- compose does not
+    # continuously re-check it. So a genuine (non-buggy) log burst that
+    # exhausts all 5 restarts within Docker's quick-succession backoff window
+    # OOM-parks loki as "exited" for the rest of the run, and otel-collector
+    # does NOT stop or restart in response -- it just silently drops every
+    # subsequent log export. This is now caught, not silent: tools/
+    # run-overnight.sh's check_telemetry_health() (claude-906) probes loki's
+    # own /ready over the network at end-of-run (and on early Ctrl+C) and
+    # logs a WARNING if it's unreachable, the same pattern already used there
+    # for otel-collector/prometheus.
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+    restart: on-failure:5
 
   grafana:
-    image: grafana/grafana:latest
+    image: grafana/grafana:13.1.0 # claude-9tc: pinned (was :latest)
     environment:
       # Local-only convenience: no login. Don't expose this beyond localhost.
       GF_AUTH_ANONYMOUS_ENABLED: "true"
@@ -88,12 +341,160 @@ services:
     ports:
       - "3000:3000" # the morning dashboard: http://localhost:3000
     depends_on:
-      - prometheus
-      - loki
+      # claude-saz: tightened alongside loki/prometheus's new healthchecks
+      # above -- grafana's datasource provisioning otherwise races both
+      # backends right after `docker compose up`.
+      prometheus:
+        condition: service_healthy
+      loki:
+        condition: service_healthy
+    # claude-906: same follow-up as loki above -- grafana had neither a
+    # memory cap nor a bounded restart. Unlike loki, grafana doesn't ingest
+    # or store the log/metric volume itself; it only serves the UI/API and
+    # queries loki+prometheus on demand, so its own working set is
+    # comparatively small and doesn't scale with ingest volume the way
+    # loki's does -- sized independently rather than copying loki's number.
+    # No docker access in this sandbox to measure actual usage, so -- same
+    # "provisional" precedent as loki/otel-collector/prometheus/ollama above
+    # -- 512m is a reasoned-but-unmeasured cap: generous for Grafana's own
+    # process plus a handful of dashboard queries, while still turning a
+    # genuine leak/misconfiguration into a visible, restarted failure
+    # instead of silent host pressure. No persistent volume configured (no
+    # user/session state survives a recreate here either), so an
+    # OOM-restart only costs in-flight UI state. Revisit once a real
+    # overnight run's memory usage is known.
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+    restart: on-failure:5
+
+  # Domain/SNI-scoped forwarding proxy that fronts the ollama sidecars'
+  # egress to registry.ollama.ai and the *.r2.cloudflarestorage.com blob
+  # hosts `ollama pull` redirects to (see squid-ollama-egress.conf for the
+  # ACL and why: both hosts are Cloudflare-anycast, so iptables/ipset can
+  # only allowlist the shared edge IP, not the domain itself).
+  #
+  # No cap_add/NET_ADMIN here, deliberately: unlike the ollama service,
+  # this one enforces its egress restriction at the application layer (the
+  # squid ACL), not via its own iptables firewall -- see
+  # Dockerfile.egress-proxy. No host-exposed ports either: only reachable
+  # from other compose services, by service name (ollama-egress-proxy),
+  # on the pinned 172.28.0.0/24 subnet that ollama-init-firewall.sh's
+  # HOST_NETWORK rule already permits.
+  ollama-egress-proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile.egress-proxy
+    image: claude-sandbox-ollama-egress-proxy:hardened
+    # Bounded but generous -- see the matching comment on x-ollama-common's
+    # restart: a multi-GB blob pull spans a while, and this proxy dying
+    # mid-pull shouldn't cost more restart budget than it has to. See
+    # Dockerfile.egress-proxy for the HEALTHCHECK dependents key off.
+    restart: on-failure:10
+
+  ollama:
+    <<: *ollama-common
+    # No host ports: the devcontainer reaches this by service name,
+    # ollama:11434, over the pinned 172.28.0.0/24 network that
+    # init-firewall.sh's HOST_NETWORK rule already permits — same story as
+    # otel-collector above. Model select/pull/warm (claude-r30.2) now lives
+    # in ollama-entrypoint.sh's WARM section (OLLAMA_MODEL below) and
+    # Dockerfile.ollama's HEALTHCHECK; the MCP that talks to this sidecar is
+    # tools/ollama-mcp (a separate bead).
+    #
+    # Egress: unlike devcontainer's firewall, init-firewall.sh can't reach
+    # into this namespace (it only ever runs inside the devcontainer
+    # service). So this service gets its own deny-by-default firewall
+    # instead: cap_add (in the x-ollama-common anchor above) plus
+    # ollama-entrypoint.sh (baked into Dockerfile.ollama) run
+    # ollama-init-firewall.sh on every container start, before `ollama
+    # serve` — no unrestricted internet egress. That firewall now allows
+    # NO external host directly (DNS, loopback, and the pinned subnet
+    # only) -- all registry/blob traffic instead goes through the
+    # ollama-egress-proxy service above (HTTPS_PROXY, in the
+    # x-ollama-common anchor), which enforces a domain/SNI ACL for
+    # registry.ollama.ai and the R2 blob hosts that IP-allowlisting can't
+    # safely cover (see ollama-init-firewall.sh and
+    # squid-ollama-egress.conf). Right after the firewall is applied, the
+    # entrypoint re-execs ITSELF (not just `ollama serve`) via setpriv to
+    # drop NET_ADMIN/NET_RAW -- so nothing in this container from that point
+    # on (the entrypoint's own warm/pull supervisor logic, `ollama serve`,
+    # or anything either of them forks) ever holds the caps that could undo
+    # it. See ollama-entrypoint.sh for why a plain per-child setpriv wrap
+    # isn't enough on its own.
+    # CPU-only by default on every host, including Docker Desktop / Mac: a
+    # `deploy.resources.reservations.devices` block with `driver: nvidia`
+    # does NOT silently fall back to CPU when the NVIDIA Container Toolkit
+    # is missing — `docker compose up` fails container creation outright
+    # ("could not select device driver nvidia"), and once its bounded
+    # restart attempts (see x-ollama-common) are exhausted the service just
+    # sits exited. So the GPU reservation lives on the opt-in `ollama-gpu`
+    # service below instead of here, keeping the base stack working
+    # everywhere. For the GPU path on a Linux host with the NVIDIA
+    # Container Toolkit installed, bring that variant up instead:
+    #   docker compose --profile gpu up -d --scale ollama=0 ollama-gpu
+    deploy:
+      resources:
+        limits:
+          # claude-r30.2: default model is llama3.2:3b (~2-3GB resident at
+          # Q4_K_M) -- 8g leaves comfortable headroom above that on the
+          # shared stack (devcontainer + 5 sidecars) without giving an
+          # unbounded model load room to OOM the host and take the
+          # devcontainer down with it. Revisit if OLLAMA_MODEL is overridden
+          # to something meaningfully larger on this (CPU) service.
+          memory: 8g
+
+  # Opt-in GPU variant of the ollama service above (same build/volume/egress
+  # posture — see the comments there and the x-ollama-common anchor). Only
+  # takes effect on a Linux host with the NVIDIA Container Toolkit
+  # installed; gated behind the `gpu` profile so it never runs, and never
+  # breaks `docker compose up`, unless explicitly requested.
+  ollama-gpu:
+    <<: *ollama-common
+    profiles: ["gpu"]
+    deploy:
+      resources:
+        limits:
+          # Same provisional cap as the CPU service above. Sized for the
+          # stronger qwen2.5:7b alternative (~4.7GB pull, ~5.5GB VRAM --
+          # this limit bounds container RAM, not VRAM, but the two scale
+          # together for a 7b model) noted in tools/ollama-mcp/README.md's
+          # Model section -- set OLLAMA_MODEL=qwen2.5:7b when bringing this
+          # profile up if you want that instead of the llama3.2:3b default.
+          memory: 8g
+        reservations:
+          devices:
+            - driver: nvidia
+              # claude-w1b: default to a single GPU rather than reserving
+              # every GPU on the host (`count: all`) -- this stack only ever
+              # runs one model-serving sidecar at a time, so `all` just
+              # starves any other GPU workload on the host (or a future
+              # second ollama-gpu-style service here) for no benefit. If a
+              # later model-serving bead genuinely needs more than one GPU
+              # (e.g. a model too large for a single card), bump this value
+              # directly or override it via a `docker-compose.override.yml`
+              # (or `docker compose -f ... -f override.yml`) rather than
+              # reverting to `all`.
+              count: 1
+              capabilities: [gpu]
 
 volumes:
   claude-code-bashhistory:
   claude-code-config:
+  # claude-w1b: no size cap -- Compose named volumes don't support a hard
+  # cap without driver_opts tied to a specific storage driver/filesystem,
+  # which isn't configured here, so this grows unbounded as `ollama pull`
+  # lands more model blobs into it (see x-ollama-common's OLLAMA_MODEL
+  # comment above for per-model sizes, e.g. llama3.2:3b ~2GB pull,
+  # qwen2.5:7b ~4.7GB pull -- each additional distinct model pulled adds to
+  # the total, nothing evicts). Check usage with
+  # `docker system df -v` (look for this volume under "Local Volumes"), and
+  # reclaim space either by removing just this volume
+  # (`docker volume rm claude-sandbox_ollama-models`, once the ollama/
+  # ollama-gpu containers using it are stopped) or by tearing down the whole
+  # stack's volumes with `docker compose down -v`.
+  ollama-models:
 
 networks:
   default:

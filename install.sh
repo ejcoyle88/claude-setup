@@ -34,7 +34,8 @@ link_kind() {
     fi
 
     if [ -e "$target" ] || [ -L "$target" ]; then
-      local backup="$target.backup-$(date +%Y%m%d-%H%M%S)"
+      local backup
+      backup="$target.backup-$(date +%Y%m%d-%H%M%S)"
       mv "$target" "$backup"
       echo "Backed up $target -> $backup"
     fi
@@ -77,7 +78,8 @@ link_file() {
   fi
 
   if [ -e "$target" ] || [ -L "$target" ]; then
-    local backup="$target.backup-$(date +%Y%m%d-%H%M%S)"
+    local backup
+    backup="$target.backup-$(date +%Y%m%d-%H%M%S)"
     mv "$target" "$backup"
     echo "Backed up $target -> $backup"
   fi

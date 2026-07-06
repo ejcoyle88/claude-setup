@@ -1,0 +1,1 @@
+Please create a commit for the outstanding work following Conventional Commits (https://www.conventionalcommits.org/en/v1.0.0/#summary) syntax. If there is any more information you need, use AskUserQuestion to ask, where it makes sense with a recommendation.

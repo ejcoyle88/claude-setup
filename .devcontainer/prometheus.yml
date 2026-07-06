@@ -1,5 +1,14 @@
 global:
-  scrape_interval: 10s # matches the runner's 10s OTEL_METRIC_EXPORT_INTERVAL
+  # matches the runner's 10s OTEL_METRIC_EXPORT_INTERVAL. claude-saz: this
+  # also needs to stay comfortably under the collector's prometheus exporter
+  # metric_expiration (otel-collector-config.yaml, currently 24h) -- that
+  # setting is how long a series survives at the scrape endpoint after it
+  # stops updating, so scrape_interval only needs to be small enough to
+  # catch a series before it expires. 10s vs 24h has enormous headroom; if
+  # you ever raise scrape_interval, keep it well below whatever
+  # metric_expiration is set to, and vice versa if you ever lower
+  # metric_expiration.
+  scrape_interval: 10s
 
 scrape_configs:
   - job_name: otel-collector

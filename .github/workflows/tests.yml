@@ -5,6 +5,30 @@ on:
     branches: [main]
   pull_request:
 
+# Least-privilege default: none of these jobs write to the repo, comment on
+# PRs, or otherwise need more than read access to source (the `changes` job
+# additionally needs `pull-requests: read` for its checkout-less
+# dorny/paths-filter step on pull_request events -- granted at the job level
+# below, since a job-level `permissions:` block replaces rather than extends
+# this default).
+permissions:
+  contents: read
+
+# Cancel a superseded run on the same ref (e.g. a new push to the same PR)
+# instead of letting it run to completion -- observability-smoke-tests alone
+# pays for a cold image pull + container bring-up, so a stale run finishing
+# after it's already moot is pure wasted cost. Scoped so this only ever
+# cancels same-ref runs: on pull_request the group key is github.ref (the PR
+# branch), so a new push to that branch cancels the previous run for it; on
+# push (this workflow's other trigger, main only) the group key is
+# github.sha instead, which is unique per commit, so two merges landing on
+# main close together can never collide and cancel each other -- every
+# push-to-main run always completes and leaves a real pass/fail status on
+# its commit (claude-5ah).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: true
+
 jobs:
   install-tests:
     strategy:
@@ -25,3 +49,278 @@ jobs:
       - name: Run installer tests
         shell: bash
         run: bash tests/test_install.sh
+
+  shellcheck:
+    # Lints every .sh file in the repo (.devcontainer/*.sh, scripts/*.sh,
+    # tools/run-overnight.sh, tests/*.sh, install.sh, etc.) so shell-script
+    # changes get an automated lint gate instead of relying on whoever
+    # touches a file to fetch shellcheck manually (claude-4qd). shellcheck is
+    # preinstalled on GitHub-hosted ubuntu runners (see actions/runner-images),
+    # same precedent as the `jq` comment on install-tests above, so no
+    # separate install step is needed; Linux-only since this is a lint pass,
+    # not something needing multi-OS coverage.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # claude-vr8: the repo-wide pre-existing findings that justified
+      # starting this gate at `-S error` (SC2155 in install.sh, SC2221/SC2222
+      # in scripts/git-ro.sh, SC2086/SC2016/SC2181 in tools/run-overnight.sh,
+      # SC2317 in tests/test_run_overnight.sh's curl-stub helpers, SC1091 in
+      # .devcontainer/*.sh) are now fixed or covered by a narrowly-scoped
+      # inline `# shellcheck disable=` with a rationale comment. No `-S`
+      # (full default `style` severity) so the gate actually catches this
+      # class of issue going forward instead of only catching outright
+      # errors.
+      #
+      # -x -P SCRIPTDIR: .devcontainer/*.sh source shared helpers
+      # (firewall-common.sh, setpriv-drop-args.sh) from their /usr/local/bin
+      # install location (see each Dockerfile's COPY), not a path shellcheck
+      # can follow as-is from a repo checkout. `-x` allows following `source`
+      # targets outside the given file list; `-P SCRIPTDIR` (combined with
+      # each source line's `# shellcheck source=<file>` directive, resolved
+      # relative to the sourcing script's own directory) points shellcheck at
+      # the real, repo-checked-in copy instead of leaving this as SC1091
+      # path-resolution noise or a per-line disable.
+      - name: Run shellcheck
+        shell: bash
+        run: |
+          find . -type f -name '*.sh' -not -path './.git/*' -print0 \
+            | xargs -0 shellcheck -x -P SCRIPTDIR
+
+  overnight-tests:
+    # Linux-only: this test sources tools/run-overnight.sh (which shells out to
+    # python3 and awk with GNU-style regex quantifiers at source time, not just
+    # when invoked) and fabricates worker-*.log fixtures with bash-specific
+    # constructs. That mix isn't proven portable to the Windows Git Bash runner
+    # (e.g. plain `python3` on PATH is not guaranteed there), so this runs as
+    # its own ubuntu-only job rather than a step in the install-tests matrix,
+    # to avoid spurious failures on macos/windows unrelated to the actual bug
+    # this test guards against.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run overnight-runner tests
+        shell: bash
+        run: bash tests/test_run_overnight.sh
+
+  changes:
+    # Cheap up-front filter so observability-smoke-tests (cold image pulls +
+    # container bring-up) only runs when it could actually catch something --
+    # a docs-only or unrelated tests/** change shouldn't pay that cost on
+    # every push/PR. install-tests and overnight-tests intentionally stay
+    # unconditional; top-level `on.paths` isn't used here because it would
+    # gate those too.
+    runs-on: ubuntu-latest
+    # Job-level override of the workflow-default `contents: read` above --
+    # needed for the pull_request-only checkout-less mode below, where
+    # dorny/paths-filter calls the GitHub API to list changed files instead
+    # of diffing a real checkout.
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      observability: ${{ steps.filter.outputs.observability }}
+    steps:
+      # On pull_request events, dorny/paths-filter queries the GitHub API
+      # directly for the PR's changed-files list ("For pull requests it's
+      # not necessary to checkout the code" -- dorny/paths-filter docs), so
+      # this step is skipped entirely there.
+      #
+      # On push (this workflow's only other trigger), that API mode isn't
+      # available, so paths-filter falls back to git-based detection via
+      # `git merge-base` against github.event.before -- which does need a
+      # real checkout, and with full history: a depth-1 checkout won't have
+      # that commit. The action can fetch missing history itself as a
+      # fallback, but relying on that silently is fragile -- if it ever
+      # fails quietly (shallow-history edge cases, force-pushes), the filter
+      # could resolve to `false` on a genuinely relevant .devcontainer/**
+      # push and silently skip observability-smoke-tests on the exact change
+      # it exists to catch.
+      - if: github.event_name != 'pull_request'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706 # v4
+        id: filter
+        with:
+          filters: |
+            observability:
+              - '.devcontainer/**'
+              - '.github/workflows/tests.yml'
+
+  observability-smoke-tests:
+    # Linux-only: exercises .devcontainer/docker-compose.yml with the real
+    # `docker compose` CLI. GitHub-hosted ubuntu runners ship Docker Engine +
+    # the Compose v2 plugin preinstalled (see actions/runner-images), so no
+    # separate install step is needed here, and there's no macOS/Windows
+    # equivalent worth maintaining for a container-only check.
+    needs: changes
+    if: needs.changes.outputs.observability == 'true'
+    runs-on: ubuntu-latest
+    # Bounds a hung docker pull/daemon to fail fast instead of running to
+    # GitHub's 6h default cap. Budget: checkout + version report (seconds) +
+    # cold pull of 3 images with no layer cache (usually well under a
+    # couple of minutes on a GitHub-hosted runner's network, but not
+    # bounded by this workflow) + the 90s --wait-timeout below + the 20s
+    # grafana-readiness retry loop + status/log/teardown steps (seconds
+    # each). 15 minutes leaves generous headroom over the ~3-4 minutes this
+    # job normally takes end-to-end for a slow registry pull, while still
+    # failing well short of the 6h default if the daemon itself hangs.
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Report docker/compose versions
+        shell: bash
+        run: |
+          docker version
+          docker compose version
+
+      # claude-0w1: claude-saz added healthchecks + `condition:
+      # service_healthy` gates on the observability sidecars (otel-collector,
+      # prometheus, loki, grafana, ollama) -- a wrong assumption in any one
+      # of those commands (image drift, endpoint path changed, CLI flag
+      # renamed) now blocks devcontainer bring-up entirely instead of
+      # degrading one service, and until this job there was no test/CI
+      # evidence covering that at all.
+      #
+      # Deliberately narrow: only loki, prometheus, and grafana -- NOT the
+      # full stack. `docker compose up` auto-starts whatever depends_on
+      # requires (here: exactly loki + prometheus, since that's grafana's
+      # only conditioned dependency), so no other service gets created.
+      # devcontainer/otel-collector aren't needed to prove healthchecks
+      # work, and ollama/ollama-gpu need a real multi-GB model pull plus (for
+      # ollama-gpu) GPU device reservations that don't exist on a
+      # GitHub-hosted runner -- bringing those up here would make this job
+      # fail for reasons unrelated to what it's meant to guard against.
+      #
+      # Pulled separately from `up --wait` below so cold-pull time (no layer
+      # cache on a fresh runner, `:latest` tags) doesn't eat into the
+      # healthcheck retry budget -- a slow pull and a genuinely broken
+      # healthcheck command should fail loudly for different, distinguishable
+      # reasons, not race each other inside one timeout.
+      - name: docker compose pull (loki, prometheus, grafana)
+        shell: bash
+        working-directory: .devcontainer
+        run: docker compose pull loki prometheus grafana
+
+      # `--wait` (Compose v2.17+; this runner's Compose plugin is
+      # considerably newer -- see actions/runner-images) blocks until every
+      # started service reaches "healthy" (loki and prometheus both define a
+      # HEALTHCHECK) or "running" (grafana defines none of its own, so
+      # "running" is what actually gets confirmed for it here -- matching
+      # this bead's "healthy/running" wording) and exits non-zero if any of
+      # them doesn't get there within --wait-timeout. That non-zero exit is
+      # exactly the "an image bump silently broke a healthcheck command"
+      # failure this job exists to catch.
+      #
+      # 90s budget: images are already pulled above, so this is purely
+      # container-start + healthcheck-retry time. Worst case among the
+      # started services is loki's healthcheck (start_period: 15s + 5
+      # retries x interval: 10s ~= 65s); 90s leaves ~25s of headroom for
+      # container-start scheduling jitter on a shared runner without
+      # papering over a genuinely broken healthcheck for minutes.
+      - name: docker compose up (loki, prometheus, grafana)
+        shell: bash
+        working-directory: .devcontainer
+        run: docker compose up -d --wait --wait-timeout 90 loki prometheus grafana
+
+      # claude-wut: unlike loki/prometheus above, grafana defines no compose
+      # HEALTHCHECK, so `--wait` above only proves its container reached
+      # "running" -- not that its HTTP server actually answers, and not that
+      # datasource provisioning (grafana/provisioning/datasources/
+      # datasources.yml) succeeded. An image bump or a provisioning-YAML
+      # regression that leaves the grafana process running but its UI/API
+      # broken would pass the previous step silently -- exactly the failure
+      # mode this job exists to catch, just uncovered for grafana until now.
+      # Port 3000 is published to the host (`ports: ["3000:3000"]` on the
+      # grafana service), so plain localhost works from this runner.
+      #
+      # Two checks, retried together in one short, bounded loop (a cold
+      # grafana process can take a few seconds after "running" before its
+      # HTTP server actually answers):
+      #   - GET /api/health must return HTTP 200: confirms the web server
+      #     itself is up. NOTE: the bead suggested `?db=1` to also confirm
+      #     datasource wiring, but checked against current Grafana source
+      #     (pkg/api/http_server.go's apiHealthHandler): there is no `db`
+      #     query parameter, the endpoint always checks its database
+      #     unconditionally, and that "database" is Grafana's own internal
+      #     store (dashboards/users/orgs) -- NOT the provisioned
+      #     Prometheus/Loki datasources -- so it can't confirm provisioning
+      #     either way. Plain /api/health is used here instead.
+      #   - GET /api/datasources must list both "Prometheus" and "Loki":
+      #     this is what actually confirms provisioning succeeded, which
+      #     /api/health does not cover. Works unauthenticated here because
+      #     the grafana service sets GF_AUTH_ANONYMOUS_ENABLED=true with
+      #     GF_AUTH_ANONYMOUS_ORG_ROLE=Admin (listing datasources requires
+      #     the Admin role) -- fine for this local-only dev sandbox.
+      #
+      # 10 attempts x 2s = 20s max, on top of the 90s --wait-timeout above;
+      # a cold Grafana process is normally ready within a couple of seconds
+      # of "running", so this stays a smoke check, not a soak test, while
+      # still failing loudly (non-zero exit) if it never comes up.
+      - name: Verify grafana HTTP API and datasource provisioning
+        shell: bash
+        working-directory: .devcontainer
+        run: |
+          max_attempts=10
+          sleep_seconds=2
+          health_code="000"
+          health_body=""
+          datasources=""
+          for attempt in $(seq 1 "$max_attempts"); do
+            # `|| ...` fallbacks are load-bearing: this step runs under GitHub's
+            # default `bash -eo pipefail`, so a curl *transport* failure (e.g.
+            # exit 56 while grafana's HTTP server is still cold-starting after its
+            # container reached "running") in a `var=$(curl ...)` assignment would
+            # otherwise abort the whole step on attempt 1 -- defeating this retry
+            # loop, whose entire purpose is to wait that startup window out. curl
+            # exit 0 with an HTTP 5xx body already flows through fine (no -f); it's
+            # only the non-zero-exit transport errors that need catching here.
+            health_response=$(curl -s --max-time 5 -w '\n%{http_code}' http://localhost:3000/api/health) || health_response=""
+            health_code=$(echo "$health_response" | tail -n1)
+            health_body=$(echo "$health_response" | sed '$d')
+            datasources=$(curl -s --max-time 5 http://localhost:3000/api/datasources) || datasources=""
+            names=$(echo "$datasources" | jq -r '.[].name' 2>/dev/null || echo "")
+            if [ "$health_code" = "200" ] && echo "$names" | grep -qx "Prometheus" && echo "$names" | grep -qx "Loki"; then
+              echo "grafana HTTP API healthy and datasources provisioned after ${attempt} attempt(s):"
+              echo "$health_body"
+              echo "$datasources"
+              exit 0
+            fi
+            echo "grafana not fully ready yet (attempt ${attempt}/${max_attempts}, /api/health HTTP status: ${health_code}), retrying in ${sleep_seconds}s..."
+            sleep "$sleep_seconds"
+          done
+          echo "grafana did not become fully ready (HTTP API + datasource provisioning) within $((max_attempts * sleep_seconds))s" >&2
+          echo "last /api/health response (HTTP ${health_code}):" >&2
+          echo "$health_body" >&2
+          echo "last /api/datasources response:" >&2
+          echo "$datasources" >&2
+          exit 1
+
+      - name: Show final service status
+        if: always()
+        shell: bash
+        working-directory: .devcontainer
+        run: docker compose ps -a
+
+      # Runs before teardown so the logs are for the containers that just
+      # failed, not empty output from ones `down` already removed.
+      - name: Dump service logs on failure
+        if: failure()
+        shell: bash
+        working-directory: .devcontainer
+        run: docker compose logs
+
+      # Fail-safe cleanup: always tear the stack (and its volumes) down so a
+      # failed run doesn't leave zombie containers/volumes on the runner --
+      # though GitHub-hosted runners are ephemeral per-job anyway, this keeps
+      # the job self-contained if that ever changes (e.g. self-hosted).
+      - name: Tear down
+        if: always()
+        shell: bash
+        working-directory: .devcontainer
+        run: docker compose down -v
