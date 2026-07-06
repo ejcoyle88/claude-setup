@@ -272,10 +272,18 @@ jobs:
           health_body=""
           datasources=""
           for attempt in $(seq 1 "$max_attempts"); do
-            health_response=$(curl -s --max-time 5 -w '\n%{http_code}' http://localhost:3000/api/health)
+            # `|| ...` fallbacks are load-bearing: this step runs under GitHub's
+            # default `bash -eo pipefail`, so a curl *transport* failure (e.g.
+            # exit 56 while grafana's HTTP server is still cold-starting after its
+            # container reached "running") in a `var=$(curl ...)` assignment would
+            # otherwise abort the whole step on attempt 1 -- defeating this retry
+            # loop, whose entire purpose is to wait that startup window out. curl
+            # exit 0 with an HTTP 5xx body already flows through fine (no -f); it's
+            # only the non-zero-exit transport errors that need catching here.
+            health_response=$(curl -s --max-time 5 -w '\n%{http_code}' http://localhost:3000/api/health) || health_response=""
             health_code=$(echo "$health_response" | tail -n1)
             health_body=$(echo "$health_response" | sed '$d')
-            datasources=$(curl -s --max-time 5 http://localhost:3000/api/datasources)
+            datasources=$(curl -s --max-time 5 http://localhost:3000/api/datasources) || datasources=""
             names=$(echo "$datasources" | jq -r '.[].name' 2>/dev/null || echo "")
             if [ "$health_code" = "200" ] && echo "$names" | grep -qx "Prometheus" && echo "$names" | grep -qx "Loki"; then
               echo "grafana HTTP API healthy and datasources provisioned after ${attempt} attempt(s):"

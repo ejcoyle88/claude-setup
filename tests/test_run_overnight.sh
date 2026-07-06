@@ -103,28 +103,27 @@ test_count_zero_completed_worker() {
   assert "a worker with 0 completed iterations contributes 0, not skipped/erroring" "[ '$n' = '0' ]"
 }
 
-# Regression guard: prove the ORIGINAL pipeline
+# Regression guard for count_completed_iterations. The ORIGINAL end-of-night
+# telemetry pipeline was
 #   grep -ho 'complete: [0-9]* successful' ... | grep -o '[0-9]*' | paste -sd+ - | bc
-# actually fails to extract the count (grep's `[0-9]*` matches the empty
-# string at every non-digit position, so paste joins a run of stray `+`s that
-# bc can't parse — and bc isn't even installed in the target image), so
-# `completed_total` silently comes out as 0 via the `|| echo 0` fallback even
-# though iterations completed. This is the bug that made the end-of-night
-# telemetry analysis never run. Confirms this test would have caught it, and
-# that count_completed_iterations does not have the same failure mode.
-test_old_pipeline_was_broken_new_one_is_not() {
+# and silently produced 0 (via its `|| echo 0` fallback) on the target
+# devcontainer image because `bc` isn't installed there — so `completed_total`
+# came out 0 even when iterations had completed, and the end-of-night telemetry
+# analysis never ran. That defect was environment-specific (bc absent from that
+# one image), NOT a portable logic bug: on any host that ships bc — every
+# GitHub-hosted CI runner does — the same old pipeline returns the correct
+# count, so a "prove the old pipeline is broken" assertion can't hold portably
+# and would fail on CI (it did: `[ '3' != '3' ]`). What this test locks in
+# instead is the fix itself: the awk-based count_completed_iterations recovers
+# the count with no dependency on bc, on every environment.
+test_count_recovers_iterations_the_old_bc_pipeline_dropped() {
   echo "[12:00:00] Worker 1 complete: 3 successful iteration(s), \$1.2000 spent, remaining ready: 0." \
     > "$LOG_DIR_TEST/worker-1.log"
 
-  local old_result
-  old_result="$(grep -ho 'complete: [0-9]* successful' "$LOG_DIR_TEST"/worker-*.log 2>/dev/null \
-    | grep -o '[0-9]*' | paste -sd+ - | bc 2>/dev/null || echo 0)"
-  assert "the old grep+bc pipeline fails to recover the real count of 3 (proves the bug existed)" \
-    "[ '$old_result' != '3' ]"
-
   local new_result
   new_result="$(count_completed_iterations "$LOG_DIR_TEST")"
-  assert "the new awk-based helper correctly recovers 3" "[ '$new_result' = '3' ]"
+  assert "count_completed_iterations recovers 3 with no bc dependency (unlike the old grep+bc pipeline)" \
+    "[ '$new_result' = '3' ]"
 }
 
 # --- total_worker_spend ---
@@ -1116,7 +1115,7 @@ run_test test_count_zero_with_no_worker_logs
 run_test test_count_single_worker
 run_test test_count_multi_worker_sum
 run_test test_count_zero_completed_worker
-run_test test_old_pipeline_was_broken_new_one_is_not
+run_test test_count_recovers_iterations_the_old_bc_pipeline_dropped
 run_test test_spend_zero_with_no_worker_logs
 run_test test_spend_sums_multiple_workers
 run_test test_mcp_gate_passes_with_no_mcp_json
